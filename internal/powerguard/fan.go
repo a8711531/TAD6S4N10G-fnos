@@ -725,14 +725,22 @@ func (m *Manager) rpmToPWMEstimateLocked(id string, target int) int {
 		points = append(points, point{rpm, slot})
 	}
 	sort.Slice(points, func(i, j int) bool { return points[i].rpm < points[j].rpm })
+	if target <= 0 {
+		return 0
+	}
 	if target <= points[0].rpm {
-		return points[0].slot
+		// 表内最低档以下：(0,0)–最低档线性插值（与 pwmToRPMEstimateLocked 互逆）
+		return points[0].slot * target / points[0].rpm
 	}
 	last := points[len(points)-1]
 	if target >= last.rpm {
-		// 表外高转速：满转基准线性外推（255×目标/基准），钳 255
-		base := m.fanDebugRPMBaseLocked(id)
-		return clampInt((target*255+base/2)/base, 0, 255)
+		// 表外高转速：在 (最高档, 实测) 与 (255, 满转基准) 之间线性插值，
+		// 与 pwmToRPMEstimateLocked 用同一外推规则，表顶两侧连续
+		topRPM := max(m.fanDebugRPMBaseLocked(id), last.rpm)
+		if target >= topRPM || topRPM == last.rpm {
+			return 255
+		}
+		return clampInt(last.slot+((target-last.rpm)*(255-last.slot)+(topRPM-last.rpm)/2)/(topRPM-last.rpm), 0, 255)
 	}
 	for i := 1; i < len(points); i++ {
 		hi := points[i]
@@ -1713,8 +1721,10 @@ func (m *Manager) pwmToRPMEstimateLocked(id string, pwm int) int {
 	}
 	last := slots[len(slots)-1]
 	if pwm > last {
-		// 表外高档:取最高档实测与基准线性值中较大者,保证单调
-		return max(table[last], linear)
+		// 表外高档:在 (最高档, 实测) 与 (255, 满转基准) 之间线性插值,
+		// 与 rpmToPWMEstimateLocked 同一外推规则,表顶两侧连续
+		topRPM := max(base, table[last])
+		return table[last] + ((pwm-last)*(topRPM-table[last])+(255-last)/2)/(255-last)
 	}
 	for i := 1; i < len(slots); i++ {
 		lo, hi := slots[i-1], slots[i]

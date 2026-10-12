@@ -86,3 +86,62 @@ func TestConvertFanDebugValueRoundTrip(t *testing.T) {
 		t.Fatalf("0 rpm should be 0%%, got %d", got)
 	}
 }
+
+// 表顶(240 档 = 3500 RPM,满转 4000)以上两方向外推一致,互为反函数(CodeRabbit #31)
+func TestFanRPMExtrapolationAboveTableTopIsInverse(t *testing.T) {
+	m := newFanDebugTestManager(t)
+	seedFanCalibration(m, unitConvFanID, 4000, map[int]int{128: 2000, 240: 3500})
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if got := m.rpmToPWMEstimateLocked(unitConvFanID, 3500); got != 240 {
+		t.Fatalf("3500 rpm should map to slot 240, got %d", got)
+	}
+	if got := m.pwmToRPMEstimateLocked(unitConvFanID, 240); got != 3500 {
+		t.Fatalf("slot 240 should map to 3500 rpm, got %d", got)
+	}
+	if got := m.pwmToRPMEstimateLocked(unitConvFanID, 255); got != 4000 {
+		t.Fatalf("pwm 255 should map to full base 4000, got %d", got)
+	}
+	for pwm := 241; pwm <= 255; pwm++ {
+		rpm := m.pwmToRPMEstimateLocked(unitConvFanID, pwm)
+		if back := m.rpmToPWMEstimateLocked(unitConvFanID, rpm); back != pwm {
+			t.Fatalf("pwm %d -> %d rpm -> pwm %d, not inverse", pwm, rpm, back)
+		}
+	}
+	// 表顶两侧连续:3499/3501 RPM 不会跳到远离 240 的档位
+	for _, rpm := range []int{3499, 3501} {
+		if got := m.rpmToPWMEstimateLocked(unitConvFanID, rpm); got < 239 || got > 241 {
+			t.Fatalf("rpm %d should stay near slot 240, got %d", rpm, got)
+		}
+	}
+}
+
+// 切换单位后首个自动递增步进不跳变:94%(PWM 240)切 rpm 得 3500,再 +100 RPM
+// 写入的 PWM 应紧邻 240,而不是先回落再上升
+func TestFanDebugAutoFirstStepAfterUnitSwitchNoJump(t *testing.T) {
+	m := newFanDebugTestManager(t)
+	seedFanCalibration(m, unitConvFanID, 4000, map[int]int{128: 2000, 240: 3500})
+	if err := m.SetFanDebugTakeover(unitConvFanID, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SetFanDebugValue(unitConvFanID, 240, "pwm"); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SetFanDebugAuto(unitConvFanID, true, 100, 3600, "rpm"); err != nil {
+		t.Fatal(err)
+	}
+	defer m.SetFanDebugAuto(unitConvFanID, false, 0, 0, "")
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	base := m.fanDebugTakenOver[unitConvFanID]
+	if base != 3500 {
+		t.Fatalf("pwm 240 should convert to 3500 rpm, got %d", base)
+	}
+	if got := m.rpmToPWMEstimateLocked(unitConvFanID, base); got != 240 {
+		t.Fatalf("converted base must drive the same pwm 240, got %d", got)
+	}
+	next := m.rpmToPWMEstimateLocked(unitConvFanID, base+100)
+	if next < 240 || next > 245 {
+		t.Fatalf("first ramp step should move pwm slightly up from 240, got %d", next)
+	}
+}
