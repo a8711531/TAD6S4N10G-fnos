@@ -29,29 +29,76 @@ func (port *fakeGPIOPort) set(spec gpioButtonSpec, high bool) {
 	}
 }
 
-func TestDefaultGPIOConfigIsDisabledAndSafe(t *testing.T) {
+func TestDefaultGPIOConfigIsEnabledAndReadyToUse(t *testing.T) {
 	config := DefaultGPIOConfig()
-	if config.Enabled || config.Version != gpioConfigVersion || len(config.Buttons) != 3 {
+	if !config.Enabled || config.Version != gpioConfigVersion || len(config.Buttons) != 3 {
 		t.Fatalf("unexpected defaults: %+v", config)
 	}
 	if err := validateGPIOConfig(config); err != nil {
 		t.Fatal(err)
 	}
+	wantShort := map[string]string{
+		"copy":       GPIOActionNone,
+		"network":    GPIOActionRefreshSDCard,
+		"rear_reset": GPIOActionNone,
+	}
+	// 开箱即用只保留最常用的一下：网络键短按＝刷新SD卡（换卡后读卡器认不出卡时
+	// 随手按一下）。长按三档与其余按键一律留空，免得「按一下不知道会做什么」。
 	for _, button := range config.Buttons {
-		if button.Actions.Short != GPIOActionNone || button.Actions.Hold15S != GPIOActionNone {
-			t.Fatalf("default action is not safe: %+v", button)
+		if button.Actions.Short != wantShort[button.ID] {
+			t.Fatalf("default short action is unexpected: %+v", button)
 		}
+		if button.Actions.Hold3S != GPIOActionNone {
+			t.Fatalf("default hold_3s action should stay empty: %+v", button)
+		}
+		if button.Actions.Hold9S != GPIOActionNone || button.Actions.Hold15S != GPIOActionNone {
+			t.Fatalf("default long hold actions should stay empty: %+v", button)
+		}
+	}
+	if config.StorageNotify == nil || !*config.StorageNotify {
+		t.Fatal("存储设备插入提示音应当默认开启")
 	}
 }
 
-func TestNormalizeConfigClearsLegacyShortActions(t *testing.T) {
+func TestNormalizeConfigPreservesShortActions(t *testing.T) {
 	config := DefaultConfig(profiles[1])
 	config.GPIO.Buttons[0].Actions.Short = GPIOActionLog
-	if !normalizeConfig(&config) {
-		t.Fatal("legacy short action did not trigger config migration")
+	normalizeConfig(&config)
+	if config.GPIO.Buttons[0].Actions.Short != GPIOActionLog {
+		t.Fatalf("short action was cleared: %+v", config.GPIO.Buttons[0])
 	}
-	if config.GPIO.Buttons[0].Actions.Short != GPIOActionNone {
-		t.Fatalf("legacy short action was preserved: %+v", config.GPIO.Buttons[0])
+}
+
+func TestNormalizeConfigUpgradesUntouchedGPIOConfig(t *testing.T) {
+	config := DefaultConfig(profiles[1])
+	// 复刻旧版本的默认值：按键映射关闭且四个档位全为无动作。
+	config.GPIO.Enabled = false
+	for index := range config.GPIO.Buttons {
+		config.GPIO.Buttons[index].Actions = GPIOActions{}
+	}
+	if !normalizeConfig(&config) {
+		t.Fatal("untouched gpio config did not trigger migration")
+	}
+	if !config.GPIO.Enabled {
+		t.Fatalf("untouched gpio config was not upgraded: %+v", config.GPIO)
+	}
+	network, ok := gpioTestButton(config.GPIO, "network")
+	if !ok || network.Actions.Short != GPIOActionRefreshSDCard {
+		t.Fatalf("网络键短回应被补上刷新SD卡: %+v", network)
+	}
+	copyButton, _ := gpioTestButton(config.GPIO, "copy")
+	if !gpioActionIsEmpty(copyButton.Actions.Short) {
+		t.Fatalf("其余按键应保持无动作: %+v", copyButton)
+	}
+}
+
+func TestNormalizeConfigKeepsDeliberatelyDisabledGPIO(t *testing.T) {
+	config := DefaultConfig(profiles[1])
+	config.GPIO.Enabled = false
+	config.GPIO.Buttons[0].Actions.Hold15S = GPIOActionLog
+	normalizeConfig(&config)
+	if config.GPIO.Enabled || config.GPIO.Buttons[0].Actions.Hold15S != GPIOActionLog {
+		t.Fatalf("deliberate gpio config was overwritten: %+v", config.GPIO)
 	}
 }
 
@@ -63,14 +110,19 @@ func TestGPIOValidationRejectsUnknownAction(t *testing.T) {
 	}
 }
 
-func TestGPIOValidationPreservesLegacyShortActionWithoutExecutingIt(t *testing.T) {
+func TestGPIOValidationRejectsUnknownShortAction(t *testing.T) {
 	config := DefaultGPIOConfig()
 	config.Buttons[0].Actions.Short = "legacy_unsupported_action"
-	if err := validateGPIOConfig(config); err != nil {
-		t.Fatalf("legacy short action was rejected: %v", err)
+	if err := validateGPIOConfig(config); err == nil {
+		t.Fatal("unknown short action was accepted")
 	}
-	if stage, action := gpioActionForDuration(config.Buttons[0].Actions, 2*time.Second); stage != "" || action != GPIOActionNone {
-		t.Fatalf("short action is executable: stage=%q action=%q", stage, action)
+}
+
+func TestGPIOActionForDurationDispatchesShortPress(t *testing.T) {
+	actions := GPIOActions{Short: GPIOActionLog, Hold3S: "3", Hold9S: "9", Hold15S: "15"}
+	stage, action := gpioActionForDuration(actions, 1200*time.Millisecond)
+	if stage != "短按" || action != GPIOActionLog {
+		t.Fatalf("short press dispatch = %q/%q, want 短按/%q", stage, action, GPIOActionLog)
 	}
 }
 
@@ -109,7 +161,7 @@ func TestGPIOValidationRejectsInvalidScripts(t *testing.T) {
 	}
 }
 
-func TestGPIOPollIgnoresShortPress(t *testing.T) {
+func TestGPIOPollEmitsShortPressFeedbackAndAction(t *testing.T) {
 	config := DefaultGPIOConfig()
 	config.Enabled = true
 	config.Buttons[0].Actions.Short = GPIOActionLog
@@ -133,8 +185,15 @@ func TestGPIOPollIgnoresShortPress(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 0 {
-		t.Fatalf("short press produced GPIO events: %+v", events)
+	if len(events) != 2 {
+		t.Fatalf("short press produced %d GPIO events: %+v", len(events), events)
+	}
+	if !events[0].IsFeedback() || events[0].Stage != gpioStageShortPress ||
+		events[0].Feedback.Tones != gpioFeedbackTones || events[0].Feedback.Flashes != gpioFeedbackFlashes {
+		t.Fatalf("unexpected short press feedback: %+v", events[0])
+	}
+	if events[1].ButtonID != "copy" || events[1].Stage != gpioStageShortPress || events[1].Action != GPIOActionLog || events[1].Kind != GPIOEventAction {
+		t.Fatalf("unexpected short press action event: %+v", events[1])
 	}
 }
 
@@ -144,7 +203,7 @@ func TestGPIOActionThresholds(t *testing.T) {
 		duration time.Duration
 		want     string
 	}{
-		{2 * time.Second, GPIOActionNone}, {3 * time.Second, "3"},
+		{0, "s"}, {2 * time.Second, "s"}, {3 * time.Second, "3"},
 		{9 * time.Second, "9"}, {15 * time.Second, "15"},
 	} {
 		_, got := gpioActionForDuration(actions, test.duration)
@@ -174,7 +233,7 @@ func TestGPIOPollConfirmsThresholdOnceAndResolvesBoundScriptOnRelease(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(confirmations) != 1 || !confirmations[0].IsFeedback() || confirmations[0].Stage != "长按 3 秒" || confirmations[0].Feedback.Tones != 1 {
+	if len(confirmations) != 1 || !confirmations[0].IsFeedback() || confirmations[0].Stage != "长按 3 秒" || confirmations[0].Feedback.Tones != gpioFeedbackTones {
 		t.Fatalf("unexpected GPIO confirmation: %+v", confirmations)
 	}
 	confirmations, err = manager.PollGPIO(config, port, start.Add(3220*time.Millisecond))
@@ -195,17 +254,18 @@ func TestGPIOPollConfirmsThresholdOnceAndResolvesBoundScriptOnRelease(t *testing
 	}
 }
 
-func TestGPIOFeedbackThresholdsAreDistinct(t *testing.T) {
+func TestGPIOFeedbackThresholdsShareStandardPattern(t *testing.T) {
 	confirmations := gpioFeedbackForDuration(16*time.Second, 0)
 	if len(confirmations) != 3 {
 		t.Fatalf("got %d confirmations, want 3", len(confirmations))
 	}
-	for i, want := range []struct {
-		stage string
-		count int
-	}{{"长按 3 秒", 1}, {"长按 9 秒", 2}, {"长按 15 秒", 3}} {
-		if confirmations[i].stage != want.stage || confirmations[i].pattern.Tones != want.count || confirmations[i].pattern.Flashes != want.count {
-			t.Fatalf("confirmation %d = %+v, want %s/%d", i, confirmations[i], want.stage, want.count)
+	for i, want := range []string{"长按 3 秒", "长按 9 秒", "长按 15 秒"} {
+		if confirmations[i].stage != want {
+			t.Fatalf("confirmation %d stage = %q, want %q", i, confirmations[i].stage, want)
+		}
+		if confirmations[i].pattern.Tones != gpioFeedbackTones || confirmations[i].pattern.Flashes != gpioFeedbackFlashes {
+			t.Fatalf("confirmation %d pattern = %+v, want %d tones / %d flashes",
+				i, confirmations[i].pattern, gpioFeedbackTones, gpioFeedbackFlashes)
 		}
 	}
 	if got := gpioFeedbackForDuration(16*time.Second, 0x7); len(got) != 0 {
