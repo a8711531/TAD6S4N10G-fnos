@@ -674,6 +674,10 @@ func (s *Server) handleBackupStatus(w http.ResponseWriter, r *http.Request) {
 		methodNotAllowed(w)
 		return
 	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "只有管理员可以查看备份状态")
+		return
+	}
 	writeJSON(w, http.StatusOK, s.Manager.BackupStatus())
 }
 

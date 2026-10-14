@@ -233,3 +233,131 @@ func TestRunBackupJobMarkerGuardsWrongMedium(t *testing.T) {
 		t.Fatal("旧版标识文件同样不该被复制进备份")
 	}
 }
+
+// 两块打标卷 + 「打标卷 → NAS」规则的公共环境：两块可移动卷、一个已存在的
+// NAS 目标目录、配置落盘（打标记录要进 GPIO.AutoVolumes）。
+func autoBackupTwoVolumeManager(t *testing.T) (*Manager, string) {
+	t.Helper()
+	root := t.TempDir()
+	write := func(path, content string) {
+		backupWrite(t, filepath.Join(root, filepath.FromSlash(path)), content)
+	}
+	mkdir := func(path string) {
+		if err := os.MkdirAll(filepath.Join(root, filepath.FromSlash(path)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("proc/mounts", `/dev/sdb2 / ext4 rw,relatime 0 0
+/dev/mapper/trim_x-0 /vol1 btrfs rw,relatime 0 0
+/dev/sdc1 /media/usb0 ext4 rw,relatime 0 0
+/dev/sdd1 /media/usb1 ext4 rw,relatime 0 0
+`)
+	// 两块「USB 盘」。真实 sysfs 里 /sys/class/block/<dev> 是符号链接，测试里用
+	// 普通目录模拟（EvalSymlinks 对普通目录原样返回）；分区上溯整盘的拓扑由
+	// TestIsRemovableDeviceUsesSysfsSymlinkAndUsbPath 覆盖，这里直接给分区条目
+	// 写 removable。
+	write("sys/class/block/sdc/removable", "1\n")
+	write("sys/class/block/sdc1/removable", "1\n")
+	write("sys/class/block/sdd/removable", "1\n")
+	write("sys/class/block/sdd1/removable", "1\n")
+	mkdir("media/usb0")
+	mkdir("media/usb1")
+	mkdir("vol1/1000/导入")
+
+	manager := &Manager{Root: root, ConfigPath: filepath.Join(root, "config.json")}
+	if err := manager.saveConfigLocked(DefaultConfig(Profile{})); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.MarkAutoBackupVolume("/media/usb0", "盘A"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.MarkAutoBackupVolume("/media/usb1", "盘B"); err != nil {
+		t.Fatal(err)
+	}
+	return manager, root
+}
+
+// CodeRabbit 第二轮：「打标卷 → NAS」的多块卷共用同一个 NAS 目标（rule.Fixed）。
+// 逐卷清理会按「目标根下全部快照」计数，卷 B 的清理把卷 A 刚生成的快照删掉——
+// move_archive 下源文件已经删了，数据就从卡上和 NAS 上同时消失。
+// 修法：单卷执行不清理，全部跑完后统一清理一次，保留份数不小于本次新生成的
+// 快照数；sync 模式多卷同时在线时正式运行直接拒绝。
+func TestRunAutoBackupJobMultiVolumeSharedTargetKeepsSnapshots(t *testing.T) {
+	if _, err := exec.LookPath("rsync"); err != nil {
+		t.Skip("rsync 未安装，跳过自动备份端到端测试")
+	}
+	manager, root := autoBackupTwoVolumeManager(t)
+
+	rule := GPIOAutoBackup{
+		ID: "import", Name: "导入", Direction: BackupDirectionFromVolume,
+		Fixed: BackupLocation{Kind: "path", Path: "/vol1/1000/导入"},
+		Mode:  BackupModeMoveArchive, Keep: 1,
+	}
+	backupWrite(t, filepath.Join(root, "media", "usb0", "a.txt"), "A")
+	backupWrite(t, filepath.Join(root, "media", "usb1", "b.txt"), "B")
+
+	result, err := manager.RunAutoBackupJob(context.Background(), rule, false)
+	if err != nil {
+		t.Fatalf("双卷导入失败: %v", err)
+	}
+	target := "/vol1/1000/导入"
+	// 修前的行为：卷 B 的清理把卷 A 刚生成的快照删掉，只剩 1 份——而卷 A 的
+	// 源文件已被删，数据从卡上和 NAS 上同时消失。
+	if snapshots := manager.snapshotEntries(target); len(snapshots) != 2 {
+		t.Fatalf("两块卷共用目标时，保留份数应至少覆盖本次的 2 份快照，实际 %d: %v", len(snapshots), snapshots)
+	}
+	if result.Pruned != 0 {
+		t.Fatalf("本次新生成 2 份快照、Keep=1，统一清理不应删掉它们: pruned=%d", result.Pruned)
+	}
+	for _, name := range []string{"a.txt", "b.txt"} {
+		sub := "media/usb0/"
+		if name == "b.txt" {
+			sub = "media/usb1/"
+		}
+		if _, err := os.Stat(filepath.Join(root, sub, name)); !os.IsNotExist(err) {
+			t.Fatalf("转移归档应清空 %s: %v", name, err)
+		}
+	}
+
+	// 第二轮：目标根下已有 2 份旧快照，本轮又生成 2 份 → keep = max(1, 2) = 2，
+	// 最终应只剩本轮最新的 2 份。
+	backupWrite(t, filepath.Join(root, "media", "usb0", "a2.txt"), "A2")
+	backupWrite(t, filepath.Join(root, "media", "usb1", "b2.txt"), "B2")
+	second, err := manager.RunAutoBackupJob(context.Background(), rule, false)
+	if err != nil {
+		t.Fatalf("第二轮双卷导入失败: %v", err)
+	}
+	if snapshots := manager.snapshotEntries(target); len(snapshots) != 2 {
+		t.Fatalf("第二轮后应只剩 2 份快照，实际 %d: %v", len(snapshots), snapshots)
+	}
+	if second.Pruned != 2 {
+		t.Fatalf("第二轮应清理掉 2 份旧快照，实际 pruned=%d", second.Pruned)
+	}
+}
+
+// sync 模式的 --delete 会把前一块卷刚同步进 NAS 的文件删掉：多块打标卷同时
+// 在线时正式运行必须直接拒绝，且一个卷都不能动。
+func TestRunAutoBackupJobRejectsSyncWithMultipleVolumes(t *testing.T) {
+	if _, err := exec.LookPath("rsync"); err != nil {
+		t.Skip("rsync 未安装，跳过自动备份端到端测试")
+	}
+	manager, root := autoBackupTwoVolumeManager(t)
+
+	backupWrite(t, filepath.Join(root, "media", "usb0", "a.txt"), "A")
+	backupWrite(t, filepath.Join(root, "media", "usb1", "b.txt"), "B")
+	rule := GPIOAutoBackup{
+		ID: "synconly", Name: "同步导入", Direction: BackupDirectionFromVolume,
+		Fixed: BackupLocation{Kind: "path", Path: "/vol1/1000/导入"},
+		Mode:  BackupModeSync,
+	}
+	if _, err := manager.RunAutoBackupJob(context.Background(), rule, false); err == nil ||
+		!strings.Contains(err.Error(), "同步模式") {
+		t.Fatalf("多卷 + 同步模式应被拒绝并说明原因: %v", err)
+	}
+	// 拒绝发生在任何卷执行之前：卷上的文件必须原样保留。
+	for _, name := range []string{"media/usb0/a.txt", "media/usb1/b.txt"} {
+		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(name))); err != nil {
+			t.Fatalf("拒绝执行时不应动卷上的文件 %s: %v", name, err)
+		}
+	}
+}
