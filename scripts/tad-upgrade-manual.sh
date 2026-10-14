@@ -13,16 +13,23 @@
 #     · 不动：@appconf/tad-module/config.json（按键映射、备份任务、自动备份规则）
 #             @appdata/tad-module/（历史曲线数据）
 #
-# 用法：
-#   sudo sh /vol1/1000/222/tad-upgrade.sh
-#   sudo sh /vol1/1000/222/tad-upgrade.sh /别的路径/tad-module.fpk
+# 用法（必须给出安装包路径）：
+#   sudo sh tad-upgrade-manual.sh /路径/to/tad-module.fpk
+#
+# 不设默认值：原来写死的 /vol1/1000/222/tad-module.fpk 只是作者本机的路径，
+# 换台机器就不存在，还会让人以为不带参数也能跑。
 set -eu
 
-PKG=${1:-/vol1/1000/222/tad-module.fpk}
+if [ $# -lt 1 ]; then
+  echo "用法： sudo sh $0 /路径/to/tad-module.fpk" >&2
+  exit 1
+fi
+PKG=$1
 APPCENTER=/usr/local/apps/@appcenter/tad-module
 APPMETA=/var/apps/tad-module
 BAK=
 STAGE=
+STOPPED=0
 
 # check_archive_members：解包前先看成员名单，拒绝绝对路径与带 .. 的成员。
 # tar 以 root 解包，一旦包里混进这类成员就会写到 STAGE 之外（某些 tar / busybox
@@ -37,15 +44,19 @@ check_archive_members() {
   fi
 }
 
-# cleanup：无论怎么退出都要清掉临时暂存目录；只要还没走到最后一步就自动回滚，
-# 免得升级失败后服务停着、程序目录换了一半，用户还不知道怎么退回去。
+# cleanup：无论怎么退出都要清掉临时暂存目录；只要已经停过服务又没走到最后一步，
+# 就自动回滚，免得升级失败后服务停着、程序目录换了一半，用户还不知道怎么退回去。
 # 配置（@appconf）与历史数据（@appdata）全程没动过，回滚只涉及程序文件。
+#
+# trap 之所以挂在第 2 步之前：STAGE 是在第 1 步建的，早退（用法不对、包不存在、
+# 本机没装模块）也得把它清掉。但服务相关的动作必须由 STOPPED 门控——那些早退
+# 根本没停过服务，去调 cmd/main start 只会平白多一次无意义的重启。
 cleanup() {
   status=$?
   if [ -n "$STAGE" ] && [ -d "$STAGE" ]; then
     rm -rf "$STAGE"
   fi
-  if [ "$status" != "0" ]; then
+  if [ "$status" != "0" ] && [ "$STOPPED" = "1" ]; then
     if [ -n "$BAK" ] && [ -d "$BAK" ]; then
       echo "升级失败（退出码 $status），正在回滚程序目录到 $BAK …" >&2
       rm -rf "$APPCENTER" || true
@@ -53,7 +64,7 @@ cleanup() {
       sh "$APPMETA/cmd/main" restart >/dev/null 2>&1 || true
       echo "已回滚，配置与历史数据未受影响。" >&2
     else
-      # 还没动过程序目录：至少把刚才停掉的服务起回来。
+      # 已停服务但还没动过程序目录：至少把刚才停掉的服务起回来。
       sh "$APPMETA/cmd/main" start >/dev/null 2>&1 || true
     fi
   fi
@@ -95,6 +106,7 @@ echo "    包版本：$VER"
 
 echo "== 2/6 停止服务 =="
 sh "$APPMETA/cmd/main" stop || true
+STOPPED=1
 sleep 1
 rm -f "$APPCENTER/tad-module.sock"
 
