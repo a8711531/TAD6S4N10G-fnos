@@ -501,29 +501,83 @@ func unescapeUdevName(name string) (string, error) {
 	return builder.String(), nil
 }
 
-// isRemovableDevice 判断块设备是否可移动（USB 等）。sdc1 → 查 /sys/block/sdc/removable。
+// isRemovableDevice 判断块设备（整盘或分区）算不算可移动存储（USB 等）。
+// 不再用「去掉末尾数字」推父设备——nvme0n1p1、mmcblk0p1 这类名字去掉数字
+// 得到的不是父盘。改走 sysfs 符号链接：/sys/class/block/<name> 指向设备的
+// sysfs 目录，分区嵌在整盘目录下面一层（有 partition 属性文件可辨），取上级
+// 即整盘；判定规则与 storageBlockIsRemovable 完全一致：removable=1，或解析后
+// 的路径含 /usb——不少 USB 硬盘盒把 removable 报成 0，只能靠总线路径认出来。
 func (m *Manager) isRemovableDevice(device string) bool {
 	name := filepath.Base(device)
 	if name == "" {
 		return false
 	}
-	parent := name
-	for len(parent) > 0 {
-		last := parent[len(parent)-1]
-		if last >= '0' && last <= '9' {
-			parent = parent[:len(parent)-1]
-			continue
-		}
-		break
-	}
-	if parent == "" {
-		parent = name
-	}
-	data, err := os.ReadFile(m.rooted("/sys/block/" + parent + "/removable"))
-	if err != nil {
+	dir, ok := m.blockDiskSysDir(name)
+	if !ok {
 		return false
 	}
-	return strings.TrimSpace(string(data)) == "1"
+	return m.storageBlockIsRemovable(dir)
+}
+
+// blockDiskSysDir 解析块设备的 sysfs 目录并归一到整盘目录（分区上溯一层）。
+// 先试 /sys/class/block/<name>（真实内核的标准入口，各种命名都能正确归属），
+// 再退回 /sys/block/<name>（老内核与测试假根）；两者都没有时才按分区名推
+// 整盘名兜底——真实内核不需要走到这一步。
+func (m *Manager) blockDiskSysDir(name string) (string, bool) {
+	for _, candidate := range []string{"/sys/class/block/" + name, "/sys/block/" + name} {
+		resolved, err := filepath.EvalSymlinks(m.rooted(candidate))
+		if err != nil {
+			continue
+		}
+		resolved = filepath.ToSlash(resolved)
+		if _, err := os.Stat(filepath.Join(resolved, "partition")); err == nil {
+			// <name> 是分区：sysfs 里它嵌在整盘目录下面一层。
+			resolved = filepath.Dir(resolved)
+		}
+		return resolved, true
+	}
+	if disk := blockPartitionDiskName(name); disk != "" && disk != name {
+		if resolved, err := filepath.EvalSymlinks(m.rooted("/sys/block/" + disk)); err == nil {
+			return filepath.ToSlash(resolved), true
+		}
+	}
+	return "", false
+}
+
+// blockPartitionDiskName 从分区名推断整盘名：sdc1 → sdc、nvme0n1p1 → nvme0n1、
+// mmcblk0p1 → mmcblk0。只作 /sys/class/block 缺失时的兜底，且同时认
+// 「<整盘><数字>」与「<整盘>p<数字>」两种命名，避免老实现把 nvme0n1p1 猜成
+// nvme0n1p 的问题。
+func blockPartitionDiskName(name string) string {
+	if index := strings.LastIndexByte(name, 'p'); index > 0 && index < len(name)-1 {
+		if isAllDigits(name[index+1:]) && isASCIIDigit(name[index-1]) {
+			return name[:index]
+		}
+	}
+	index := len(name)
+	for index > 0 && isASCIIDigit(name[index-1]) {
+		index--
+	}
+	if index == 0 || index == len(name) {
+		return ""
+	}
+	return name[:index]
+}
+
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if !isASCIIDigit(s[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func isASCIIDigit(b byte) bool {
+	return b >= '0' && b <= '9'
 }
 
 // ListBackupVolumes 列出可用于备份的卷：过滤掉系统/boot 分区，保留数据卷与可移动介质。
@@ -1390,7 +1444,21 @@ func (m *Manager) WriteBackupMarker(job GPIOBackupJob) (marker string, written s
 }
 
 // RunBackupJob 同步执行一次备份任务。
+// backupRunOptions 控制单次备份执行的可选行为；零值即默认行为。
+type backupRunOptions struct {
+	// deferPruneTo：本次运行末尾不做快照清理，留给调用方统一清理。
+	// 「打标卷 → NAS」的多块卷共用同一个 NAS 目标，逐卷清理会按「目标根下
+	// 全部快照」计数，把别的卷刚生成的快照删掉——move_archive 下源文件已经
+	// 删了，数据就从卡上和 NAS 上同时消失（见 backup_auto.go 的 RunAutoBackupJob）。
+	deferPruneTo bool
+}
+
+// RunBackupJob 执行一条备份任务（图形化备份卡片与按键动作共用入口）。
 func (m *Manager) RunBackupJob(ctx context.Context, job GPIOBackupJob, dryRun bool) (BackupResult, error) {
+	return m.runBackupJobWithOptions(ctx, job, dryRun, backupRunOptions{})
+}
+
+func (m *Manager) runBackupJobWithOptions(ctx context.Context, job GPIOBackupJob, dryRun bool, opts backupRunOptions) (BackupResult, error) {
 	result := BackupResult{
 		JobID: job.ID, JobName: job.Name, Mode: job.Mode, DryRun: dryRun,
 		StartedAt: time.Now().Format(time.RFC3339),
@@ -1553,7 +1621,7 @@ func (m *Manager) RunBackupJob(ctx context.Context, job GPIOBackupJob, dryRun bo
 	}
 	// 两种「按日期归档」都会在目标根下生成时间戳快照目录，保留份数对它们都要生效，
 	// 否则转移归档的快照会一直堆下去。
-	if backupModeUsesSnapshots(job.Mode) && job.Keep > 0 && !dryRun && result.Snapshot != "" {
+	if backupModeUsesSnapshots(job.Mode) && job.Keep > 0 && !dryRun && result.Snapshot != "" && !opts.deferPruneTo {
 		pruned, err := m.pruneBackupSnapshots(targetRoot, job.Keep)
 		if err != nil {
 			result.Warning = strings.TrimSpace(result.Warning + "；清理旧快照失败：" + err.Error())

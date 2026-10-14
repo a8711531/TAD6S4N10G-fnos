@@ -244,9 +244,15 @@ func normalizeConfig(cfg *Config) bool {
 		changed = true
 	}
 	if cfg.GPIO.Version == 0 {
-		// 老得连版本号都没有：整份换成新默认值，但用户攒下的脚本、备份任务、
-		// 打标卷记录与提示音开关要原样带过去。
-		cfg.GPIO = preserveGPIOUserData(DefaultGPIOConfig(), cfg.GPIO)
+		// 老得连版本号都没有。只有确实没配置过的才整份换成新默认值（用户攒下的
+		// 脚本、备份任务、打标卷记录与提示音开关仍要原样带过去）；已经配置过的
+		// 一字不动地保留——只补版本号，否则后续 validateGPIOConfig 会拒绝
+		// version 0。
+		if gpioConfigLooksUnconfigured(cfg.GPIO) {
+			cfg.GPIO = preserveGPIOUserData(DefaultGPIOConfig(), cfg.GPIO)
+		} else {
+			cfg.GPIO.Version = gpioConfigVersion
+		}
 		changed = true
 	} else if gpioConfigLooksUnconfigured(cfg.GPIO) {
 		// 旧版本的默认值是「关闭 + 四个档位全为无动作」，从未配置过的机器

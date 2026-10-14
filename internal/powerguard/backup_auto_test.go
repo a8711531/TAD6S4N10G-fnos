@@ -1,6 +1,7 @@
 package powerguard
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io/fs"
@@ -830,7 +831,7 @@ func TestRunAutoBackupJobWithoutMarkedVolumeFails(t *testing.T) {
 		Fixed: BackupLocation{Kind: "path", Path: "/vol1/1000/导入"},
 		Mode:  BackupModeCopy,
 	}
-	result, err := manager.RunAutoBackupJob(nil, rule, false)
+	result, err := manager.RunAutoBackupJob(context.Background(), rule, false)
 	if err == nil {
 		t.Fatal("没有打标卷应当报错")
 	}

@@ -88,7 +88,7 @@ func TestNormalizeConfigUpgradesUntouchedGPIOConfig(t *testing.T) {
 	}
 	network, ok := gpioTestButton(config.GPIO, "network")
 	if !ok || network.Actions.Short != GPIOActionRefreshSDCard {
-		t.Fatalf("网络键短回应被补上刷新SD卡: %+v", network)
+		t.Fatalf("网络键短按应被补上刷新SD卡: %+v", network)
 	}
 	copyButton, _ := gpioTestButton(config.GPIO, "copy")
 	if !gpioActionIsEmpty(copyButton.Actions.Short) {
@@ -103,6 +103,37 @@ func TestNormalizeConfigKeepsDeliberatelyDisabledGPIO(t *testing.T) {
 	normalizeConfig(&config)
 	if config.GPIO.Enabled || config.GPIO.Buttons[0].Actions.Hold15S != GPIOActionLog {
 		t.Fatalf("deliberate gpio config was overwritten: %+v", config.GPIO)
+	}
+}
+
+// CodeRabbit 第二轮：Version==0 但已经配置过的旧配置不能被整份换成默认值——
+// 只凭「没有版本号」判断，会把用户的按键绑定、脚本、提示音开关一起换掉。
+// 正确做法是保留全部用户字段、只把版本号补上（validateGPIOConfig 不认 version 0）。
+func TestNormalizeConfigKeepsConfiguredGPIOWithoutVersion(t *testing.T) {
+	config := DefaultConfig(profiles[1])
+	config.GPIO.Version = 0
+	config.GPIO.Enabled = false
+	config.GPIO.Migrations = nil
+	config.GPIO.StorageNotify = nil
+	config.GPIO.Scripts = []GPIOScript{{ID: "s1", Name: "自检", Body: "echo ok"}}
+	config.GPIO.Buttons[0].Actions.Hold15S = GPIOActionLog
+	if !normalizeConfig(&config) {
+		t.Fatal("version 0 配置补版本号时应当算一次变更")
+	}
+	if config.GPIO.Version != gpioConfigVersion {
+		t.Fatalf("version 0 应迁移到 %d: %+v", gpioConfigVersion, config.GPIO)
+	}
+	if config.GPIO.Enabled {
+		t.Fatalf("用户主动关掉的按键映射不应被重置: %+v", config.GPIO)
+	}
+	if len(config.GPIO.Scripts) != 1 || config.GPIO.Scripts[0].Body != "echo ok" {
+		t.Fatalf("用户保存的脚本不应被删掉: %+v", config.GPIO.Scripts)
+	}
+	if config.GPIO.Buttons[0].Actions.Hold15S != GPIOActionLog {
+		t.Fatalf("用户配置的档位不应被改写: %+v", config.GPIO.Buttons[0])
+	}
+	if err := validateGPIOConfig(config.GPIO); err != nil {
+		t.Fatalf("只补版本号后的配置应通过校验: %v", err)
 	}
 }
 

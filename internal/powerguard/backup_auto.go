@@ -226,6 +226,7 @@ type AutoBackupResult struct {
 	Results    []BackupResult `json:"results,omitempty"`
 	Files      int64          `json:"files"`
 	Bytes      int64          `json:"bytes"`
+	Pruned     int            `json:"pruned,omitempty"` // 多卷共用 NAS 目标时统一清理掉的快照数
 	StartedAt  string         `json:"started_at,omitempty"`
 	FinishedAt string         `json:"finished_at,omitempty"`
 }
@@ -1034,6 +1035,29 @@ func (m *Manager) RunAutoBackupJob(ctx context.Context, rule GPIOAutoBackup, dry
 	if !dryRun && rule.Direction == BackupDirectionToVolume && backupModeIsMove(rule.Mode) && len(volumes) > 1 {
 		return result, fmt.Errorf("规则「%s」用的是移动类模式（会删除 NAS 上的源文件），而当前插着 %d 块打标卷：这条规则一次只能作用于一块盘，请先拔掉其它打标卷再运行", rule.Name, len(volumes))
 	}
+	// 「打标卷 → NAS」时所有卷共用 rule.Fixed 这个 NAS 目标。多块卷同时在线：
+	//   · sync 模式：第二块卷的 --delete 会把第一块卷刚同步进 NAS 的文件删掉，
+	//     正式运行直接拒绝；
+	//   · 归档类模式：逐卷清理快照会按「目标根下全部快照」计数，卷 B 的清理把
+	//     卷 A 刚生成的快照删掉——move_archive 下源文件已经删了，数据从卡上和
+	//     NAS 上同时消失。改成单卷不清理、全部跑完后统一清理一次，保留份数
+	//     不小于本次新生成的快照数。单块卷的行为不变。
+	sharedTarget := rule.Direction == BackupDirectionFromVolume && len(volumes) > 1
+	if !dryRun && sharedTarget && rule.Mode == BackupModeSync {
+		return result, fmt.Errorf("规则「%s」用的是同步模式（会删除目标里多出来的文件），而当前插着 %d 块打标卷：它们共用同一个 NAS 目标，后一块卷会把前一块刚同步的文件删掉。请一次只插一块打标卷，或改用归档类模式", rule.Name, len(volumes))
+	}
+	deferPrune := sharedTarget && backupModeUsesSnapshots(rule.Mode)
+	sharedTargetRoot := ""
+	if deferPrune {
+		if root, rerr := m.resolveBackupLocation(rule.Fixed); rerr == nil {
+			sharedTargetRoot = root
+		} else {
+			// 目标解析不了时 RunBackupJob 会报同样的错，这里不再拦，
+			// 让逐卷的错误信息说话。
+			deferPrune = false
+		}
+	}
+	newSnapshots := make([]string, 0, len(volumes))
 	var failures []string
 	for _, volume := range volumes {
 		if ctx != nil && ctx.Err() != nil {
@@ -1056,12 +1080,27 @@ func (m *Manager) RunAutoBackupJob(ctx context.Context, rule GPIOAutoBackup, dry
 				}
 			}
 		}
-		run, err := m.RunBackupJob(ctx, job, dryRun)
+		run, err := m.runBackupJobWithOptions(ctx, job, dryRun, backupRunOptions{deferPruneTo: deferPrune})
 		result.Results = append(result.Results, run)
 		result.Files += run.Files
 		result.Bytes += run.Bytes
 		if err != nil {
 			failures = append(failures, fmt.Sprintf("%s：%v", volume.displayName(), err))
+		} else if deferPrune && run.Snapshot != "" {
+			newSnapshots = append(newSnapshots, run.Snapshot)
+		}
+	}
+	// 多块卷共用 NAS 目标时的统一清理：保留份数不小于本次新生成的快照数，
+	// 否则 Keep 比卷数小时会把本次刚生成的快照也清掉。试跑不删任何东西。
+	if deferPrune && !dryRun && sharedTargetRoot != "" && rule.Keep > 0 {
+		keep := rule.Keep
+		if len(newSnapshots) > keep {
+			keep = len(newSnapshots)
+		}
+		pruned, perr := m.pruneBackupSnapshots(sharedTargetRoot, keep)
+		result.Pruned += pruned
+		if perr != nil {
+			failures = append(failures, "清理旧快照失败："+perr.Error())
 		}
 	}
 	result.FinishedAt = time.Now().Format(time.RFC3339)

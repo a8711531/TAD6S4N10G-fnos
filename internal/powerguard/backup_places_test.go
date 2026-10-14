@@ -36,7 +36,18 @@ func backupPlacesFakeManager(t *testing.T) *Manager {
 	}
 
 	write("proc/mounts", backupPlacesFakeMounts)
-	// 可移动介质标记：/sys/block/sdc/removable = 1
+	// 可移动介质标记。isRemovableDevice 走 /sys/class/block/<name>（真实 sysfs
+	// 里是符号链接，这里用普通目录模拟——EvalSymlinks 对普通目录原样返回）。
+	// 真实拓扑里分区要经符号链接上溯一层才到整盘，那部分由
+	// TestIsRemovableDeviceUsesSysfsSymlinkAndUsbPath 覆盖；这里直接给整盘和
+	// 分区条目各写一份 removable，让分类测试只钉住「识别结果」。
+	write("sys/class/block/sdc/removable", "1\n")
+	write("sys/class/block/sdc1/removable", "1\n")
+	write("sys/class/block/sdd/removable", "1\n")
+	write("sys/class/block/sdd1/removable", "1\n")
+	write("sys/class/block/sdb/removable", "0\n")
+	write("sys/class/block/sda/removable", "0\n")
+	// /sys/block 一份同样保留，覆盖「只有 /sys/block」的回退路径。
 	write("sys/block/sdc/removable", "1\n")
 	write("sys/block/sdb/removable", "0\n")
 	write("sys/block/sda/removable", "0\n")
@@ -301,5 +312,75 @@ func TestIsBackupRemoteFSType(t *testing.T) {
 		if isBackupRemoteFSType(fsType) {
 			t.Fatalf("%q 不是远程挂载", fsType)
 		}
+	}
+}
+
+// CodeRabbit 第二轮：部分 USB 硬盘盒把 removable 报成 0，只能靠 sysfs 符号链接
+// 解析出的总线路径（含 /usb）认出来；分区要用 sysfs 归属整盘，不能去末尾数字猜
+// （nvme0n1p1 去掉数字得到 nvme0n1p，mmcblk0p1 得到 mmcblk0p，都不对）。
+func TestIsRemovableDeviceUsesSysfsSymlinkAndUsbPath(t *testing.T) {
+	root := t.TempDir()
+	write := func(path, content string) {
+		full := filepath.Join(root, filepath.FromSlash(path))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link := func(linkPath, target string) {
+		full := filepath.Join(root, filepath.FromSlash(linkPath))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.FromSlash(target), full); err != nil {
+			t.Skipf("无法创建符号链接，跳过： %v", err)
+		}
+	}
+
+	// USB 硬盘盒：removable=0，但 sysfs 路径带 /usb。
+	usbDisk := "devices/pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/host6/target6:0:0/6:0:0:0/block/sdc"
+	write("sys/"+usbDisk+"/removable", "0\n")
+	write("sys/"+usbDisk+"/sdc1/partition", "1\n")
+	link("sys/class/block/sdc", "../../"+usbDisk)
+	link("sys/class/block/sdc1", "../../"+usbDisk+"/sdc1")
+
+	// 内置 NVMe：removable=0、路径无 /usb。
+	nvme := "devices/pci0000:00/0000:00:01.0/nvme/nvme0/nvme0n1"
+	write("sys/"+nvme+"/removable", "0\n")
+	write("sys/"+nvme+"/nvme0n1p1/partition", "1\n")
+	link("sys/class/block/nvme0n1", "../../"+nvme)
+	link("sys/class/block/nvme0n1p1", "../../"+nvme+"/nvme0n1p1")
+
+	manager := &Manager{Root: root}
+	if !manager.isRemovableDevice("/dev/sdc1") {
+		t.Fatal("USB 硬盘盒分区（removable=0、总线路径含 /usb）应被识别为可移动")
+	}
+	if !manager.isRemovableDevice("/dev/sdc") {
+		t.Fatal("USB 硬盘盒整盘应被识别为可移动")
+	}
+	if manager.isRemovableDevice("/dev/nvme0n1p1") {
+		t.Fatal("内置 NVMe 分区不应被识别为可移动")
+	}
+	if manager.isRemovableDevice("/dev/nvme0n1") {
+		t.Fatal("内置 NVMe 整盘不应被识别为可移动")
+	}
+
+	// 老内核 / 测试假根里只有 /sys/block 的回退路径：整盘名直接命中。
+	legacy := t.TempDir()
+	legacyFull := filepath.Join(legacy, "sys", "block", "sdd")
+	if err := os.MkdirAll(legacyFull, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacyFull, "removable"), []byte("1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	legacyManager := &Manager{Root: legacy}
+	if !legacyManager.isRemovableDevice("/dev/sdd") {
+		t.Fatal("只有 /sys/block 时整盘也应能识别为可移动")
+	}
+	if legacyManager.isRemovableDevice("/dev/sde") {
+		t.Fatal("sysfs 里不存在的设备不应被识别为可移动")
 	}
 }
