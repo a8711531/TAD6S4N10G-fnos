@@ -22,7 +22,11 @@ import (
 // 安全边界：
 //   - 只处理 USB 接口类 08（大容量存储），绝不碰 SATA/NVMe 上的系统盘；
 //   - 上面还挂着正在使用的分区（/proc/mounts 里出现）的设备直接跳过，
-//     免得把正在读写的移动硬盘踢下线。
+//     免得把正在读写的移动硬盘踢下线；
+//   - 除了直接挂载，被 md/dm（RAID、LVM、dm-crypt）占用的块设备、以及被用作
+//     交换区的分区也算「正在使用」——它们在 /proc/mounts 里显示为 /dev/md*、
+//     /dev/mapper/* 或压根不出现，只按挂载点判断会把仍在服役的盘去授权，
+//     轻则阵列降级、重则卷掉线。
 
 const (
 	// sdcardUSBMassStorageClass 是 bInterfaceClass 里的大容量存储类别。
@@ -228,11 +232,30 @@ func (m *Manager) sdcardBlockDevices(deviceDir string) (hosts []string, blocks [
 	return hosts, blocks
 }
 
-// sdcardActiveMounts 返回该 USB 设备上正在被使用的挂载点（有则不动它）。
+// sdcardActiveMounts 返回该 USB 设备上正在被使用的证据（有则不动它）。
+//
+// 三类都算「正在使用」：
+//  1. /proc/mounts 上直接挂着它；
+//  2. 被 md（RAID 成员）、dm（LVM PV、dm-crypt）等上层设备占用 —— 看
+//     /sys/block/<blk>/holders/* 与各分区 /sys/block/<blk>/<blk>N/holders/*；
+//  3. 分区被用作交换区 —— 看 /proc/swaps。
+//
+// 后两类在挂载表里要么是 /dev/md*、/dev/mapper/*，要么根本查不到，只按第 1 类
+// 判断就会去授权一块还在服役的盘。
 func (m *Manager) sdcardActiveMounts(blocks []string) []string {
 	if len(blocks) == 0 {
 		return nil
 	}
+	found := make([]string, 0, 4)
+	found = append(found, m.sdcardMountedPoints(blocks)...)
+	found = append(found, m.sdcardBlockHolders(blocks)...)
+	found = append(found, m.sdcardSwapDevices(blocks)...)
+	sort.Strings(found)
+	return found
+}
+
+// sdcardMountedPoints 返回直接挂在 /proc/mounts 上的设备/分区。
+func (m *Manager) sdcardMountedPoints(blocks []string) []string {
 	data, err := os.ReadFile(m.rooted("/proc/mounts"))
 	if err != nil {
 		return nil
@@ -248,7 +271,60 @@ func (m *Manager) sdcardActiveMounts(blocks []string) []string {
 			found = append(found, fmt.Sprintf("%s 挂载在 %s", fields[0], fields[1]))
 		}
 	}
-	sort.Strings(found)
+	return found
+}
+
+// sdcardBlockHolders 返回占用这些块设备（或其分区）的上层设备，如 md0、dm-0。
+// 只读 /sys，不碰任何设备。
+func (m *Manager) sdcardBlockHolders(blocks []string) []string {
+	var found []string
+	seen := make(map[string]bool)
+	for _, block := range blocks {
+		if block == "" {
+			continue
+		}
+		patterns := []string{
+			m.rooted(filepath.Join("/sys/block", block, "holders", "*")),
+			// 分区层的 holders：sdb1/holders/md0 这种。
+			m.rooted(filepath.Join("/sys/block", block, block+"*", "holders", "*")),
+		}
+		for _, pattern := range patterns {
+			matches, _ := filepath.Glob(pattern)
+			for _, match := range matches {
+				holder := filepath.Base(match)
+				if holder == "" || holder == "." || holder == "/" {
+					continue
+				}
+				key := block + "|" + holder
+				if seen[key] {
+					continue
+				}
+				seen[key] = true
+				found = append(found, fmt.Sprintf("%s 被 %s 占用", block, holder))
+			}
+		}
+	}
+	return found
+}
+
+// sdcardSwapDevices 返回被当作交换区使用的分区。空交换文件（无 /proc/swaps
+// 条目）与表头行都会被自然跳过。
+func (m *Manager) sdcardSwapDevices(blocks []string) []string {
+	data, err := os.ReadFile(m.rooted("/proc/swaps"))
+	if err != nil {
+		return nil
+	}
+	var found []string
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || !strings.HasPrefix(fields[0], "/dev/") {
+			continue
+		}
+		name := strings.TrimPrefix(fields[0], "/dev/")
+		if sdcardBlockMatches(name, blocks) {
+			found = append(found, fmt.Sprintf("%s 用作交换区", fields[0]))
+		}
+	}
 	return found
 }
 

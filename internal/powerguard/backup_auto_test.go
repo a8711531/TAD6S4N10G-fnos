@@ -413,6 +413,36 @@ func TestAutoBackupSubMarking(t *testing.T) {
 	}
 }
 
+// 目录被删掉或改名之后，「×」还得能取消打标：否则那个按钮永远报「卷内目录不存在」，
+// 每次自动备份还会因为附加源不存在而失败，标记却怎么都清不掉。
+func TestRemoveAutoBackupSubWorksAfterDirectoryDeleted(t *testing.T) {
+	manager := autoBackupFakeManager(t)
+	if _, sub, err := manager.AddAutoBackupSub("/media/usb0/DCIM"); err != nil || sub != "DCIM" {
+		t.Fatalf("给 DCIM 打标失败: %q %v", sub, err)
+	}
+	if err := os.RemoveAll(filepath.Join(manager.Root, "media", "usb0", "DCIM")); err != nil {
+		t.Fatal(err)
+	}
+	// 新打标依旧要求目录存在。
+	if _, _, err := manager.AddAutoBackupSub("/media/usb0/DCIM"); err == nil {
+		t.Fatal("目录不存在时不该还能新打标")
+	}
+	// 取消打标只按路径算，目录没了也要能清掉。
+	if _, sub, err := manager.RemoveAutoBackupSub("/media/usb0/DCIM"); err != nil || sub != "DCIM" {
+		t.Fatalf("目录删掉后仍应能取消打标: %q %v", sub, err)
+	}
+	if got := manager.markedAutoBackupVolumes()[0].Subs; len(got) != 0 {
+		t.Fatalf("取消后不该还留着子目录: %v", got)
+	}
+	// 卷外路径、卷根依旧拒绝。
+	if _, _, err := manager.RemoveAutoBackupSub("/vol1/1000/别的地方"); err == nil {
+		t.Fatal("卷外路径应当被拒绝")
+	}
+	if _, _, err := manager.RemoveAutoBackupSub("/media/usb0"); err == nil {
+		t.Fatal("选中卷根时应提示改用整卷操作")
+	}
+}
+
 // 旧版两处打标位置都继续认：.tad-auto-backup/mark.json（v0.10.30–v0.10.34）与卷根上的
 // .tad-auto-backup 普通文件（更早）；下次写入统一收敛到 .tad-backup/mark.json。
 func TestAutoBackupLegacyMarkerIsUpgraded(t *testing.T) {
@@ -767,6 +797,9 @@ func TestGPIOAutoBackupActionBinding(t *testing.T) {
 func TestGPIOConfigLooksUnconfiguredRespectsAutos(t *testing.T) {
 	config := DefaultGPIOConfig()
 	config.Enabled = false
+	// 旧版本的默认值里没有迁移标记与提示音字段，去掉才等于「从未配置过」。
+	config.Migrations = nil
+	config.StorageNotify = nil
 	for index := range config.Buttons {
 		config.Buttons[index].Actions = GPIOActions{}
 	}

@@ -248,14 +248,27 @@ func applyGPIORecommendedDefaults(config *GPIOConfig) bool {
 // 只有在本机确实带着旧迁移标记时才动手，而且只搬动仍然等于刷新SD卡的那一档
 // ——用户自己改成别的动作之后就不再认作我们的默认值。短按档位只在「空着」或
 // 「还挂着我方旧默认值（重新应用插件）」时才被占用，用户自己选的动作不受影响。
+//
+// 两个约束，缺一个都会反复改写用户的绑定：
+//   - 处理完就把旧标记摘掉：留着的话每次 normalizeConfig 都会再跑一遍，用户
+//     升级后自己把某个键的长按 3 秒设成刷新SD卡，保存时又被我们清掉；
+//   - 只动 network 键：旧版的默认值只写在网络键上，别的键出现刷新SD卡一定是
+//     用户自己设的，不能碰。
 func relocateLegacyRefreshSDCard(config *GPIOConfig) bool {
 	if !gpioContainsString(config.Migrations, gpioDefaultsMigrationLegacyHold3S) {
 		return false
 	}
-	changed := false
+	kept := make([]string, 0, len(config.Migrations))
+	for _, value := range config.Migrations {
+		if value != gpioDefaultsMigrationLegacyHold3S {
+			kept = append(kept, value)
+		}
+	}
+	config.Migrations = kept
+	changed := true
 	for index := range config.Buttons {
 		button := &config.Buttons[index]
-		if button.Actions.Hold3S != GPIOActionRefreshSDCard {
+		if button.ID != "network" || button.Actions.Hold3S != GPIOActionRefreshSDCard {
 			continue
 		}
 		button.Actions.Hold3S = GPIOActionNone
@@ -279,8 +292,15 @@ func gpioContainsString(values []string, target string) bool {
 // gpioConfigLooksUnconfigured 判断一份 GPIO 配置是否仍是「从未配置」的旧默认值：
 // 关闭状态且四个档位全部为 none。历史版本的默认值正是这个样子，升级时可以直接
 // 换成新的开箱即用默认值；只要用户动过任何一个档位就不再认为未配置。
+//
+// 除了档位，还要看用户可能留下的其他痕迹：迁移标记、自定义脚本、存储插入提示音
+// 开关。它们都说明「用户来过并做过选择」。漏判的后果很重——SaveGPIOConfig 会把
+// 这种配置整份换成 DefaultGPIOConfig()，于是用户主动关掉的按键映射被重新打开、
+// 保存过的脚本被删掉、关掉的提示音被重开。
 func gpioConfigLooksUnconfigured(config GPIOConfig) bool {
-	if config.Enabled || len(config.Backups) > 0 || len(config.Autos) > 0 || len(config.AutoVolumes) > 0 {
+	if config.Enabled || len(config.Migrations) > 0 || len(config.Scripts) > 0 ||
+		config.StorageNotify != nil ||
+		len(config.Backups) > 0 || len(config.Autos) > 0 || len(config.AutoVolumes) > 0 {
 		return false
 	}
 	for _, button := range config.Buttons {
@@ -291,6 +311,21 @@ func gpioConfigLooksUnconfigured(config GPIOConfig) bool {
 		}
 	}
 	return len(config.Buttons) == 0 || len(config.Buttons) == len(gpioButtonSpecs)
+}
+
+// preserveGPIOUserData 把「用户自己攒下来、不属于按键档位」的内容原样搬到新配置
+// 上：脚本、备份任务、自动备份规则、打标卷记录，以及存储插入提示音的开关。
+// 迁移只负责补默认值，不该顺手把这些删掉。
+func preserveGPIOUserData(next, previous GPIOConfig) GPIOConfig {
+	next.Scripts = append([]GPIOScript(nil), previous.Scripts...)
+	next.Backups = append([]GPIOBackupJob(nil), previous.Backups...)
+	next.Autos = append([]GPIOAutoBackup(nil), previous.Autos...)
+	next.AutoVolumes = append([]AutoBackupVolumeRecord(nil), previous.AutoVolumes...)
+	if previous.StorageNotify != nil {
+		notify := *previous.StorageNotify
+		next.StorageNotify = &notify
+	}
+	return next
 }
 
 // gpioActionIsEmpty 把缺字段的空字符串和显式的 "none" 都视为「无动作」。

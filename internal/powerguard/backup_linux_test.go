@@ -31,6 +31,65 @@ func backupArchiveJob() GPIOBackupJob {
 	}
 }
 
+// 「按日期转移归档」同样在目标下堆时间戳快照，保留份数必须对它也生效，
+// 否则快照一份都不会被清掉，NAS 空间一直涨。
+func TestRunBackupJobMoveArchiveAlsoPrunesSnapshots(t *testing.T) {
+	if _, err := exec.LookPath("rsync"); err != nil {
+		t.Skip("rsync 未安装，跳过转移归档端到端测试")
+	}
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "dst"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manager := &Manager{Root: root}
+	job := backupArchiveJob()
+	job.Mode = BackupModeMoveArchive
+
+	for index := 0; index < 3; index++ {
+		// 移动类会清空源，每一轮都要重新放文件进去。
+		backupWrite(t, filepath.Join(root, "src", "a.txt"), strings.Repeat("y", index+1))
+		if _, err := manager.RunBackupJob(context.Background(), job, false); err != nil {
+			t.Fatalf("第 %d 次转移归档失败: %v", index, err)
+		}
+	}
+	if snapshots := manager.snapshotEntries("/dst"); len(snapshots) != 2 {
+		t.Fatalf("保留 2 份时应当只剩 2 份快照，实际 %d：%v", len(snapshots), snapshots)
+	}
+	if _, err := os.Stat(filepath.Join(root, "src", "a.txt")); !os.IsNotExist(err) {
+		t.Fatalf("转移归档应当清空源文件，实际 err=%v", err)
+	}
+}
+
+// 试跑通过真实运行路径走一遍（rsync --dry-run），不该留下「上次备份」状态。
+func TestRunBackupJobNowDryRunDoesNotUpdateLastResult(t *testing.T) {
+	if _, err := exec.LookPath("rsync"); err != nil {
+		t.Skip("rsync 未安装，跳过试跑端到端测试")
+	}
+	root := t.TempDir()
+	backupWrite(t, filepath.Join(root, "src", "a.txt"), "alpha")
+	if err := os.MkdirAll(filepath.Join(root, "dst"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manager := &Manager{Root: root}
+	job := backupArchiveJob()
+
+	if _, err := manager.RunBackupJobNow(context.Background(), job, true); err != nil {
+		t.Fatalf("试跑失败: %v", err)
+	}
+	if manager.backupRun.running {
+		t.Fatal("试跑结束应当复位运行标记")
+	}
+	if manager.backupRun.last != nil {
+		t.Fatalf("试跑不该写「上次备份」: %+v", manager.backupRun.last)
+	}
+	if manager.backupRun.lastError != "" {
+		t.Fatalf("试跑不该写 lastError，实际 %q", manager.backupRun.lastError)
+	}
+	if snapshots := manager.snapshotEntries("/dst"); len(snapshots) != 0 {
+		t.Fatalf("试跑不该真的建快照目录: %v", snapshots)
+	}
+}
+
 func TestRunBackupJobArchiveUsesHardlinksAndKeepsCount(t *testing.T) {
 	if _, err := exec.LookPath("rsync"); err != nil {
 		t.Skip("rsync 未安装，跳过归档模式端到端测试")

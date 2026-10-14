@@ -118,7 +118,7 @@ let gpioAutos = [];
 // 打标列表（GET /api/backup/auto 的 devices）：在线存储设备 + 已打标但离线的记录。
 let autoDevices = [];
 // 打标文件在卷内的相对路径（后端下发，只用于提示文案）。
-let autoMarkerDirFile = '.tad-auto-backup/mark.json';
+let autoMarkerDirFile = '.tad-backup/mark.json';
 // 后端记录的一次性默认值补位标记。保存时要原样带回，否则用户手动清空过的
 // 档位会在下次升级时被重新填上默认动作。
 let gpioMigrations = [];
@@ -1683,7 +1683,7 @@ async function autoBackupMarkerAction(action, payload = {}) {
 async function promptAutoBackupMark(path, displayName = '') {
   const alias = await showAppConfirm({
     title: displayName ? `给 ${displayName} 打标` : '给整块卷打标',
-    message: `打标信息写在卷内的 .tad-auto-backup/ 目录里（不会往卷根丢文件），整块盘都会参与自动备份。只备份卡里某几个目录时，改用「给子目录打标…」。`,
+    message: `打标信息写在卷内的 ${autoMarkerDirFile}（不会往卷根丢文件），整块盘都会参与自动备份。只备份卡里某几个目录时，改用「给子目录打标…」。`,
     input: {
       label: '别名（可选，列表里一眼认出是哪块盘）',
       value: '',
@@ -1885,8 +1885,10 @@ function validateAutoRuleDraft(rule) {
     showAutoBackupEditorMessage('请先选择 NAS 侧位置。', true);
     return false;
   }
-  // 同步模式的目标不能是「我的文件」根目录（会清空个人空间）。
-  const target = rule.direction === 'to_volume' ? rule.fixed : null;
+  // from_volume（打标卷 → NAS）时 rule.fixed 才是 NAS 侧的目标；to_volume 时它是
+  // NAS 侧的源（见 backup_auto.go 里 Fixed 字段的说明）。目标直接落在整个「我的
+  // 文件」根目录上，同步模式会把个人空间清空，必须在保存前拦住。
+  const target = rule.direction === 'from_volume' ? rule.fixed : null;
   if (target && target.kind === 'path' && /^\/vol[0-9]+\/[0-9]+\/?$/.test(target.path)) {
     showAutoBackupEditorMessage('NAS 侧目标不能直接是整个「我的文件」根目录，请在它下面新建一个备份目录。', true);
     return false;
@@ -2850,6 +2852,10 @@ function fillGPIOInputs(gpio = {}) {
       mode: String(rule.mode || 'archive'),
       overwrite: rule.overwrite !== false,
       keep: Number(rule.keep) || 0,
+      // 必须原样带回：丢了它，页面重新加载后再保存按键配置会被后端
+      // validateGPIOAutoBackup 拒掉（「请在规则里勾选确认后再保存」），
+      // 用户此后任何按键改动都存不上；编辑器回显也会变成没勾选。
+      allow_move_to_volume: rule.allow_move_to_volume === true,
     }))
     : [];
   setupGPIOActions(gpioScripts, false, gpioBackups, gpioAutos);
@@ -5281,7 +5287,7 @@ function render(status, keepInputs = false) {
   renderFanHardwareWarning(fanStatus);
   $('gpio-status').textContent = gpioStatus.enabled
     ? (gpioStatus.available ? `监听中${gpioStatus.last_event ? ` · 最近：${gpioStatus.last_event}` : ''}` : `已启用但不可用：${gpioStatus.last_error || '无法读取 /dev/port'}`)
-    : (gpioStatus.available ? '硬件接口可用，按键映射尚未启用。' : '按键映射默认关闭。');
+    : (gpioStatus.available ? '硬件接口可用，按键映射尚未启用。' : '未检测到 GPIO 硬件接口。');
   $('gpio-status').className = `inline-status${gpioStatus.enabled && (!gpioStatus.available || gpioStatus.last_error) ? ' error' : ''}`;
   renderStorageNotifyStatus(status.storage_notify);
   const issues = healthIssues(status, fanStatus, storageStatus, gpioStatus);
@@ -5929,6 +5935,9 @@ $('save-fan').addEventListener('click', async () => {
 $('save-gpio').addEventListener('click', async () => {
   if (!commitGPIOScriptEditor()) return;
   if (!commitBackupJobEditor()) return;
+  // 自动备份编辑器开着时，里面的草稿也要先落进 gpioAutos，否则保存后这条
+  // 规则凭空消失，用户还以为是保存成功了。
+  if (!commitAutoBackupEditor()) return;
   const config = gpioConfigFromInputs();
   setBusy(true);
   try {
