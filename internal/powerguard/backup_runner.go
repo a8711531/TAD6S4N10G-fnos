@@ -39,7 +39,7 @@ func (m *Manager) StartBackupJob(job GPIOBackupJob, dryRun bool) error {
 
 	go func() {
 		result, err := m.RunBackupJob(context.Background(), job, dryRun)
-		m.recordBackupFinish(job.Name, &result, nil, err, "copy", "复制按键")
+		m.finishBackupRun(job.Name, &result, nil, err, dryRun)
 	}()
 	return nil
 }
@@ -59,7 +59,7 @@ func (m *Manager) RunBackupJobNow(ctx context.Context, job GPIOBackupJob, dryRun
 	m.backupMu.Unlock()
 
 	result, err := m.RunBackupJob(ctx, job, dryRun)
-	m.recordBackupFinish(job.Name, &result, nil, err, "copy", "复制按键")
+	m.finishBackupRun(job.Name, &result, nil, err, dryRun)
 	return result, err
 }
 
@@ -79,7 +79,7 @@ func (m *Manager) StartAutoBackupJob(rule GPIOAutoBackup, dryRun bool) error {
 
 	go func() {
 		result, err := m.RunAutoBackupJob(context.Background(), rule, dryRun)
-		m.recordBackupFinish(rule.Name, nil, &result, err, "copy", "复制按键")
+		m.finishBackupRun(rule.Name, nil, &result, err, dryRun)
 	}()
 	return nil
 }
@@ -99,8 +99,21 @@ func (m *Manager) RunAutoBackupJobNow(ctx context.Context, rule GPIOAutoBackup, 
 	m.backupMu.Unlock()
 
 	result, err := m.RunAutoBackupJob(ctx, rule, dryRun)
-	m.recordBackupFinish(rule.Name, nil, &result, err, "copy", "复制按键")
+	m.finishBackupRun(rule.Name, nil, &result, err, dryRun)
 	return result, err
+}
+
+// finishBackupRun 一次备份跑完后的统一收尾。试跑走单独一条路：只把运行标记放下，
+// 既不写 last / lastAuto，也不播放蜂鸣闪灯——试跑没有真的写过任何文件，不该让
+// 机箱响、更不该把界面上的「上次备份完成」顶掉。
+func (m *Manager) finishBackupRun(jobName string, result *BackupResult, auto *AutoBackupResult, err error, dryRun bool) {
+	if dryRun {
+		m.backupMu.Lock()
+		m.backupRun.running = false
+		m.backupMu.Unlock()
+		return
+	}
+	m.recordBackupFinish(jobName, result, auto, err, "copy", "复制按键")
 }
 
 // feedbackBackupResult 已并入 recordBackupFinish：普通任务与自动备份共用同一套

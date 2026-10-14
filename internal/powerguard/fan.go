@@ -244,24 +244,14 @@ func normalizeConfig(cfg *Config) bool {
 		changed = true
 	}
 	if cfg.GPIO.Version == 0 {
-		backups := append([]GPIOBackupJob(nil), cfg.GPIO.Backups...)
-		autos := append([]GPIOAutoBackup(nil), cfg.GPIO.Autos...)
-		volumes := append([]AutoBackupVolumeRecord(nil), cfg.GPIO.AutoVolumes...)
-		cfg.GPIO = DefaultGPIOConfig()
-		cfg.GPIO.Backups = backups
-		cfg.GPIO.Autos = autos
-		cfg.GPIO.AutoVolumes = volumes
+		// 老得连版本号都没有：整份换成新默认值，但用户攒下的脚本、备份任务、
+		// 打标卷记录与提示音开关要原样带过去。
+		cfg.GPIO = preserveGPIOUserData(DefaultGPIOConfig(), cfg.GPIO)
 		changed = true
 	} else if gpioConfigLooksUnconfigured(cfg.GPIO) {
 		// 旧版本的默认值是「关闭 + 四个档位全为无动作」，从未配置过的机器
 		// 升级后自动套用新的开箱即用默认值，避免用户以为按键坏了。
-		backups := append([]GPIOBackupJob(nil), cfg.GPIO.Backups...)
-		autos := append([]GPIOAutoBackup(nil), cfg.GPIO.Autos...)
-		volumes := append([]AutoBackupVolumeRecord(nil), cfg.GPIO.AutoVolumes...)
-		cfg.GPIO = DefaultGPIOConfig()
-		cfg.GPIO.Backups = backups
-		cfg.GPIO.Autos = autos
-		cfg.GPIO.AutoVolumes = volumes
+		cfg.GPIO = preserveGPIOUserData(DefaultGPIOConfig(), cfg.GPIO)
 		changed = true
 	}
 	if applyGPIORecommendedDefaults(&cfg.GPIO) {

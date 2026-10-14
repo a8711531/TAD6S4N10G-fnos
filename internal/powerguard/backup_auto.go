@@ -522,19 +522,37 @@ func (m *Manager) autoBackupVolumeForPath(path string) (AutoBackupVolume, error)
 	return best, nil
 }
 
-// autoBackupSubForPath 把用户选的目录换算成「相对卷根的子目录」；选的正是卷根时返回空串。
-func (m *Manager) autoBackupSubForPath(volume AutoBackupVolume, path string) (string, error) {
+// autoBackupSubRelative 把用户选的目录换算成「相对卷根的子目录」；选的正是卷根时
+// 返回空串。只做路径合法性判断，**不要求目录当前存在**。
+//
+// 取消打标必须用它：用户把 DCIM 删掉或改名之后，界面上那个「×」不能一直报
+// 「卷内目录不存在」，否则标记永远取消不掉，每次自动备份还会因为附加源不存在而失败。
+func (m *Manager) autoBackupSubRelative(volume AutoBackupVolume, path string) (string, error) {
 	clean := filepath.ToSlash(filepath.Clean(strings.TrimSpace(path)))
 	mount := filepath.ToSlash(filepath.Clean(volume.MountPoint))
 	if clean == mount {
 		return "", nil
 	}
+	if !strings.HasPrefix(clean, mount+"/") {
+		return "", fmt.Errorf("所选目录不在这块卷上：%s", volume.displayName())
+	}
 	rel := strings.TrimPrefix(clean, mount+"/")
 	if err := validateAutoBackupSub(rel); err != nil {
 		return "", fmt.Errorf("卷内子目录无效：%v", err)
 	}
-	info, err := os.Stat(m.rooted(filepath.Join(mount, rel)))
-	if err != nil || !info.IsDir() {
+	return rel, nil
+}
+
+// autoBackupSubForPath 打标时用：在 autoBackupSubRelative 之上再要求目录真的存在，
+// 免得把「已经不存在的目录」写进标记里。
+func (m *Manager) autoBackupSubForPath(volume AutoBackupVolume, path string) (string, error) {
+	rel, err := m.autoBackupSubRelative(volume, path)
+	if err != nil || rel == "" {
+		return rel, err
+	}
+	mount := filepath.ToSlash(filepath.Clean(volume.MountPoint))
+	info, statErr := os.Stat(m.rooted(filepath.Join(mount, rel)))
+	if statErr != nil || !info.IsDir() {
 		return "", fmt.Errorf("卷内目录不存在：%s", rel)
 	}
 	return rel, nil
@@ -626,12 +644,13 @@ func (m *Manager) AddAutoBackupSub(path string) (AutoBackupVolume, string, error
 }
 
 // RemoveAutoBackupSub 取消某个子目录的打标；全部子目录都取消后回到「整块卷」。
+// 只按路径算相对子目录，不要求目录还在——目录被删掉之后也得能取消。
 func (m *Manager) RemoveAutoBackupSub(path string) (AutoBackupVolume, string, error) {
 	volume, err := m.autoBackupVolumeForPath(path)
 	if err != nil {
 		return volume, "", err
 	}
-	sub, err := m.autoBackupSubForPath(volume, path)
+	sub, err := m.autoBackupSubRelative(volume, path)
 	if err != nil {
 		return volume, "", err
 	}
@@ -1004,7 +1023,8 @@ func (m *Manager) RunAutoBackupJob(ctx context.Context, rule GPIOAutoBackup, dry
 	volumes := m.markedAutoBackupVolumes()
 	if len(volumes) == 0 {
 		result.FinishedAt = time.Now().Format(time.RFC3339)
-		return result, fmt.Errorf("没有找到打标的可移动卷：请先在自动备份卡片里给 U 盘 / 移动硬盘打标（在卷根写入 %s）", BackupAutoMarkerFileName)
+		return result, fmt.Errorf("没有找到打标的可移动卷：请先在自动备份卡片里给 U 盘 / 移动硬盘打标（在卷内写入 %s/%s）",
+			BackupAutoMarkerDirName, BackupAutoMarkerFileName)
 	}
 	result.Volumes = len(volumes)
 	// 「NAS → 打标卷」+ 移动类模式会删掉 NAS 上的源：这条规则必须只作用于一块盘。

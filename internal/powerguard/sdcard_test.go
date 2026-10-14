@@ -204,6 +204,76 @@ func TestStartRefreshSDCardRejectsConcurrentRun(t *testing.T) {
 	}
 }
 
+// 旧标记只处理一次，而且只动 network 键：用户升级后自己把某个键的长按 3 秒设成
+// 刷新SD卡，保存时不该被我们再清掉。
+func TestRelocateLegacyRefreshSDCardRunsOnceAndOnlyTouchesNetwork(t *testing.T) {
+	config := GPIOConfig{
+		Version:    gpioConfigVersion,
+		Enabled:    true,
+		Migrations: []string{gpioDefaultsMigrationLegacyHold3S},
+		Buttons: []GPIOButtonConfig{
+			{ID: "network", Actions: GPIOActions{Hold3S: GPIOActionRefreshSDCard}},
+			{ID: "copy", Actions: GPIOActions{Short: GPIOActionLog, Hold3S: GPIOActionRefreshSDCard}},
+		},
+	}
+	if !relocateLegacyRefreshSDCard(&config) {
+		t.Fatal("带着旧标记时应当执行搬迁")
+	}
+	if gpioContainsString(config.Migrations, gpioDefaultsMigrationLegacyHold3S) {
+		t.Fatal("搬迁完必须把旧标记摘掉，否则每次归一化都会重跑")
+	}
+	network, _ := gpioTestButton(config, "network")
+	if !gpioActionIsEmpty(network.Actions.Hold3S) || network.Actions.Short != GPIOActionRefreshSDCard {
+		t.Fatalf("网络键应当从长按搬到短按，实际 short=%q hold3s=%q", network.Actions.Short, network.Actions.Hold3S)
+	}
+	copyButton, _ := gpioTestButton(config, "copy")
+	if copyButton.Actions.Hold3S != GPIOActionRefreshSDCard || copyButton.Actions.Short != GPIOActionLog {
+		t.Fatalf("别的按键不属于这次迁移，不该被动: %+v", copyButton.Actions)
+	}
+
+	// 用户随后自己把网络键长按 3 秒设成刷新SD卡：标记已摘，不该再被改写。
+	network.Actions.Hold3S = GPIOActionRefreshSDCard
+	for index := range config.Buttons {
+		if config.Buttons[index].ID == "network" {
+			config.Buttons[index] = network
+		}
+	}
+	if relocateLegacyRefreshSDCard(&config) {
+		t.Fatal("搬迁只能做一次")
+	}
+	if network, _ = gpioTestButton(config, "network"); network.Actions.Hold3S != GPIOActionRefreshSDCard {
+		t.Fatalf("用户自己设的长按不该被清掉，实际 %q", network.Actions.Hold3S)
+	}
+}
+
+// 「看起来没配置过」不能只看四个档位：用户主动关掉按键映射、但留过迁移标记、脚本
+// 或提示音开关，都说明他来过。被判成未配置就会被默认值整份顶掉——映射被重开、
+// 脚本被删、提示音被重开。
+func TestGPIOConfigLooksUnconfiguredRespectsUserTraces(t *testing.T) {
+	empty := gpioTestConfig(false, nil)
+	if !gpioConfigLooksUnconfigured(empty) {
+		t.Fatal("关闭且四档全空的老配置应当被判为未配置")
+	}
+
+	withMigration := empty
+	withMigration.Migrations = []string{gpioDefaultsMigrationRefreshSDCard}
+	if gpioConfigLooksUnconfigured(withMigration) {
+		t.Fatal("带迁移标记说明用户来过，不能当成未配置")
+	}
+
+	withScript := empty
+	withScript.Scripts = []GPIOScript{{ID: "s1", Name: "自检", Body: "echo ok"}}
+	if gpioConfigLooksUnconfigured(withScript) {
+		t.Fatal("保存过脚本说明用户来过，不能当成未配置")
+	}
+
+	notifyOff := empty
+	notifyOff.StorageNotify = gpioBoolPointer(false)
+	if gpioConfigLooksUnconfigured(notifyOff) {
+		t.Fatal("关掉过提示音说明用户来过，不能当成未配置")
+	}
+}
+
 func gpioTestButton(config GPIOConfig, id string) (GPIOButtonConfig, bool) {
 	for _, button := range config.Buttons {
 		if button.ID == id {

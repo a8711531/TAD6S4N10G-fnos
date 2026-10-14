@@ -71,6 +71,10 @@ function loadAppContext(overrides = {}) {
     console,
     URL,
     URLSearchParams,
+    // 浏览器里 TextEncoder 一直存在（app.js 用它算脚本字节数），但默认不往沙箱里加：
+    // 既有用例是在「初始化流程没跑到那一步」的前提下写的，加上它会让一些后台 promise
+    // 继续执行、反过来改掉用例的前置状态。要用的用例自己传 overrides.TextEncoder。
+    ...(overrides.TextEncoder ? { TextEncoder: overrides.TextEncoder, TextDecoder: overrides.TextDecoder || TextDecoder } : {}),
     setInterval: () => 0,
     clearInterval: () => {},
     setTimeout: () => 0,
@@ -1159,7 +1163,7 @@ test('打标设备列表：接口回执驱动列表，别名优先于卷标显�
   const { fetch } = recordingFetch((href) => {
     if (href.includes('api/backup/auto')) {
       return {
-        marker_dir: '.tad-auto-backup/mark.json',
+        marker_dir: '.tad-backup/mark.json',
         devices: [
           { identity: '1234-ABCD', alias: '相机SD卡', label: 'NO NAME', marked: true, online: true, removable: true, mount_point: '/media/usb0', subs: ['DCIM'] },
           { identity: 'vol1', label: '', marked: false, online: true, removable: false, mount_point: '/vol1', subs: [] },
@@ -1174,7 +1178,7 @@ test('打标设备列表：接口回执驱动列表，别名优先于卷标显�
 
   const devices = app.resolve('autoDevices');
   assert.equal(devices.length, 3, '应把三台设备都收进列表');
-  assert.equal(app.resolve('autoMarkerDirFile'), '.tad-auto-backup/mark.json', '打标文件位置由后端下发');
+  assert.equal(app.resolve('autoMarkerDirFile'), '.tad-backup/mark.json', '打标文件位置由后端下发');
 
   const autoDeviceName = app.resolve('autoDeviceName');
   assert.equal(autoDeviceName(devices[0]), '相机SD卡', '别名优先');
@@ -1660,4 +1664,96 @@ test('内置存储：列表里只留一句「内置存储 · 不支持打标」�
   assert.equal(autoDeviceName({ label: 'NO NAME' }), 'NO NAME');
   assert.equal(autoDeviceName({ device: '/dev/sdc1' }), '/dev/sdc1');
   assert.equal(autoDeviceName({}), '未知设备');
+});
+
+test('自动备份：「我的文件」根目录只挡 NAS 侧目标，不挡 NAS 侧源', () => {
+  const app = loadAppContext({ fetch: recordingFetch(() => ({})).fetch });
+  const validate = app.resolve('validateAutoRuleDraft');
+  const base = {
+    id: 'rule-x', name: '搬照片', volume_sub: 'DCIM', mode: 'sync', overwrite: true, keep: 0,
+  };
+
+  // 打标卷 → NAS：fixed 是 NAS 侧目标，指向整个「我的文件」根目录必须拦下
+  const dangerous = { ...base, direction: 'from_volume', fixed: { kind: 'path', path: '/vol1/1000' } };
+  assert.equal(validate(dangerous), false, '打标卷 → NAS 的目标是整个「我的文件」时要拦住');
+  assert.match(app.element('auto-backup-message').textContent, /我的文件/);
+
+  // 同一个位置在「NAS → 打标卷」下是 NAS 侧的源，把整份「我的文件」备份进打标盘是合法用法
+  assert.equal(
+    validate({ ...dangerous, direction: 'to_volume', mode: 'archive' }), true,
+    'NAS → 打标卷时该位置是源，不该被误拒'
+  );
+  assert.equal(
+    validate({ ...dangerous, fixed: { kind: 'path', path: '/vol1/1000/备份' } }), true,
+    '指向子目录时两个方向都放行'
+  );
+});
+
+test('自动备份：页面重载后移动确认项要原样带回，否则按键配置再也存不上', () => {
+  const app = loadAppContext({ fetch: recordingFetch(() => ({})).fetch, TextEncoder });
+  app.resolve('fillGPIOInputs')({
+    enabled: true,
+    migrations: [],
+    buttons: [],
+    autos: [{
+      id: 'to-disk', name: '归档到移动盘', direction: 'to_volume',
+      fixed: { kind: 'path', path: '/vol1/1000/照片' },
+      volume_sub: '照片', mode: 'move_archive', overwrite: true, keep: 0,
+      allow_move_to_volume: true,
+    }],
+  });
+  const rules = app.resolve('gpioAutos');
+  assert.equal(rules.length, 1);
+  assert.equal(rules[0].allow_move_to_volume, true, '确认项必须保留，丢了就会提交不带它的 autos 被后端拒绝');
+
+  // 老规则没有这个字段时回填成明确的 false，而不是 undefined
+  app.resolve('fillGPIOInputs')({
+    autos: [{
+      id: 'old', name: '老规则', direction: 'from_volume',
+      fixed: { kind: 'path', path: '/vol1/1000/导入' },
+      volume_sub: '', mode: 'archive', overwrite: true, keep: 0,
+    }],
+  });
+  assert.equal(app.resolve('gpioAutos')[0].allow_move_to_volume, false);
+});
+
+test('「保存按钮控制」先把自动备份编辑器里的草稿收进来，再一并提交', async () => {
+  const radios = ['archive', 'sync', 'move_archive', 'move_overwrite'].map((value) => {
+    const radio = listeningStub();
+    radio.value = value;
+    radio.checked = value === 'archive';
+    return radio;
+  });
+  const { requests, fetch } = recordingFetch(() => ({ fan: {}, gpio: {} }));
+  const app = loadAppContext({
+    fetch,
+    querySelector: (selector) => {
+      if (selector.includes('auto-backup-direction')) return { value: 'to_volume', checked: true };
+      if (selector.includes('auto-backup-mode')) {
+        if (selector.includes(':checked')) return radios.find((radio) => radio.checked) || null;
+        const match = selector.match(/value="([^"]+)"/);
+        return match ? radios.find((radio) => radio.value === match[1]) : null;
+      }
+      return stubElement();
+    },
+    querySelectorAll: (selector) => (selector.includes('auto-backup-mode') ? radios : []),
+  });
+  const saves = () => requests.filter((item) => item.url.includes('api/config/gpio'));
+
+  // 编辑器开着但名称还空着：保存要被拦住，不能把这条草稿悄悄丢掉
+  app.element('auto-backup-editor').hidden = false;
+  app.element('auto-backup-name').value = '';
+  await app.click('save-gpio');
+  assert.equal(saves().length, 0, '自动备份草稿不合法时不该提交按键控制');
+
+  // 名称补齐、NAS 侧位置选好之后，同样的点击走完整保存，草稿进入 autos
+  app.element('auto-backup-name').value = '归档到移动盘';
+  app.resolve('autoEditorLocations').fixed = { kind: 'path', path: '/vol1/1000/照片' };
+  await app.click('save-gpio');
+  assert.equal(saves().length, 1, '补齐后应当保存按键控制');
+  const payload = JSON.parse(saves()[0].init.body);
+  assert.ok(
+    Array.isArray(payload.autos) && payload.autos.some((rule) => rule.name === '归档到移动盘'),
+    '编辑器草稿要落进提交的 autos'
+  );
 });

@@ -39,28 +39,17 @@ type sdcardRunState struct {
 
 // StartRefreshSDCard 在后台刷新一次，立即返回。按键动作用它，避免把 GPIO
 // 轮询循环堵上好几秒；结束时用与备份一致的蜂鸣 + 闪灯给出回执。
+//
+// 占位只做一次：这里占好之后直接调 runRefreshSDCardClaimed，不能再走会自己
+// 占位的 RunRefreshSDCard，否则会被自己刚设的 running 标记拒掉（按键刷新
+// 永远报「上一次刷新SD卡还没结束」）。
 func (m *Manager) StartRefreshSDCard() error {
-	m.sdcardMu.Lock()
-	if m.sdcardRun.running {
-		m.sdcardMu.Unlock()
-		return fmt.Errorf("上一次刷新SD卡还没结束，请稍候")
+	if err := m.claimSdcardRun(); err != nil {
+		return err
 	}
-	m.sdcardRun.running = true
-	m.sdcardRun.startedAt = time.Now()
-	m.sdcardMu.Unlock()
 
 	go func() {
-		result, err := m.RunRefreshSDCard(context.Background())
-		m.sdcardMu.Lock()
-		m.sdcardRun.running = false
-		if err != nil {
-			m.sdcardRun.lastError = err.Error()
-			m.sdcardRun.lastSummary = ""
-		} else {
-			m.sdcardRun.lastError = ""
-			m.sdcardRun.lastSummary = result.Summary
-		}
-		m.sdcardMu.Unlock()
+		_, err := m.runRefreshSDCardClaimed(context.Background())
 		m.feedbackSdcardResult(err)
 	}()
 	return nil
@@ -68,15 +57,28 @@ func (m *Manager) StartRefreshSDCard() error {
 
 // RunRefreshSDCard 同步刷新一次，供界面按钮做即时反馈（会阻塞到刷新结束）。
 func (m *Manager) RunRefreshSDCard(ctx context.Context) (SdcardRefreshResult, error) {
+	if err := m.claimSdcardRun(); err != nil {
+		return SdcardRefreshResult{}, err
+	}
+	return m.runRefreshSDCardClaimed(ctx)
+}
+
+// claimSdcardRun 占一次位：已经在刷新中就拒绝，返回给调用方的错误文案保持不变。
+func (m *Manager) claimSdcardRun() error {
 	m.sdcardMu.Lock()
+	defer m.sdcardMu.Unlock()
 	if m.sdcardRun.running {
-		m.sdcardMu.Unlock()
-		return SdcardRefreshResult{}, fmt.Errorf("上一次刷新SD卡还没结束，请稍候")
+		return fmt.Errorf("上一次刷新SD卡还没结束，请稍候")
 	}
 	m.sdcardRun.running = true
 	m.sdcardRun.startedAt = time.Now()
-	m.sdcardMu.Unlock()
+	return nil
+}
 
+// runRefreshSDCardClaimed 真正干活的那个：要求调用方已经用 claimSdcardRun
+// 占好位（不管同步还是异步入口都只会占一次）。结束时统一复位 running 并写入
+// lastSummary / lastError。
+func (m *Manager) runRefreshSDCardClaimed(ctx context.Context) (SdcardRefreshResult, error) {
 	started := time.Now()
 	result, err := m.refreshSDCard(ctx)
 	if result.ElapsedMS == 0 {

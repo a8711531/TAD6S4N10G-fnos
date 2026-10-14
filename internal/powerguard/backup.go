@@ -1551,7 +1551,9 @@ func (m *Manager) RunBackupJob(ctx context.Context, job GPIOBackupJob, dryRun bo
 			return result, fmt.Errorf("rsync 执行失败：%v", runErr)
 		}
 	}
-	if job.Mode == BackupModeArchive && job.Keep > 0 && !dryRun && result.Snapshot != "" {
+	// 两种「按日期归档」都会在目标根下生成时间戳快照目录，保留份数对它们都要生效，
+	// 否则转移归档的快照会一直堆下去。
+	if backupModeUsesSnapshots(job.Mode) && job.Keep > 0 && !dryRun && result.Snapshot != "" {
 		pruned, err := m.pruneBackupSnapshots(targetRoot, job.Keep)
 		if err != nil {
 			result.Warning = strings.TrimSpace(result.Warning + "；清理旧快照失败：" + err.Error())
@@ -1559,6 +1561,12 @@ func (m *Manager) RunBackupJob(ctx context.Context, job GPIOBackupJob, dryRun bo
 		result.Pruned = pruned
 	}
 	return result, nil
+}
+
+// backupModeUsesSnapshots 报告这种模式是否按时间戳快照目录留档（归档与转移归档
+// 都是），这类模式才需要按保留份数清理旧快照。
+func backupModeUsesSnapshots(mode string) bool {
+	return mode == BackupModeArchive || mode == BackupModeMoveArchive
 }
 
 // nextBackupSnapshot 生成目标目录下本次快照的路径，以及可复用的上一份快照。

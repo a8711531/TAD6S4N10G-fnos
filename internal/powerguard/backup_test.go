@@ -165,6 +165,55 @@ func TestPruneBackupSnapshotsUnlimitedKeepsAll(t *testing.T) {
 	}
 }
 
+// 两种「按日期归档」都会在目标下生成时间戳快照，保留份数必须都算数：
+// 只认 archive 的话，转移归档的快照会一直堆下去。
+func TestBackupModeUsesSnapshots(t *testing.T) {
+	cases := map[string]bool{
+		BackupModeArchive:       true,
+		BackupModeMoveArchive:   true,
+		BackupModeCopy:          false,
+		BackupModeSync:          false,
+		BackupModeMoveOverwrite: false,
+	}
+	for mode, want := range cases {
+		if got := backupModeUsesSnapshots(mode); got != want {
+			t.Fatalf("%s：期望 %v，实际 %v", mode, want, got)
+		}
+	}
+}
+
+// 试跑没有真的写过任何文件，因此不该覆盖「上次备份」结果，也不该播放蜂鸣回执。
+func TestFinishBackupRunDryRunKeepsLastResult(t *testing.T) {
+	manager := &Manager{}
+	previous := BackupResult{JobName: "昨晚的备份", FinishedAt: "2026-10-14T03:00:00+08:00"}
+	manager.backupRun.last = &previous
+	manager.backupRun.running = true
+
+	dry := BackupResult{JobName: "试跑"}
+	manager.finishBackupRun("试跑", &dry, nil, nil, true)
+
+	if manager.backupRun.running {
+		t.Fatal("试跑结束应当复位运行标记")
+	}
+	if manager.backupRun.last == nil || manager.backupRun.last.JobName != "昨晚的备份" {
+		t.Fatalf("试跑不该顶掉上次结果: %+v", manager.backupRun.last)
+	}
+	if manager.backupRun.lastError != "" {
+		t.Fatalf("试跑不该写 lastError，实际 %q", manager.backupRun.lastError)
+	}
+
+	// 正式跑一次：这次才该更新「上次备份」。
+	manager.backupRun.running = true
+	real := BackupResult{JobName: "正式任务"}
+	manager.finishBackupRun("正式任务", &real, nil, nil, false)
+	if manager.backupRun.last == nil || manager.backupRun.last.JobName != "正式任务" {
+		t.Fatalf("正式运行应当更新上次结果: %+v", manager.backupRun.last)
+	}
+	if manager.backupRun.running {
+		t.Fatal("正式运行结束同样要复位运行标记")
+	}
+}
+
 func TestNextBackupSnapshotAvoidsCollision(t *testing.T) {
 	root := t.TempDir()
 	manager := &Manager{Root: root}

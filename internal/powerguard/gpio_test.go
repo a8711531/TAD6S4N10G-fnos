@@ -71,8 +71,12 @@ func TestNormalizeConfigPreservesShortActions(t *testing.T) {
 
 func TestNormalizeConfigUpgradesUntouchedGPIOConfig(t *testing.T) {
 	config := DefaultConfig(profiles[1])
-	// 复刻旧版本的默认值：按键映射关闭且四个档位全为无动作。
+	// 复刻旧版本的默认值：按键映射关闭且四个档位全为无动作。旧版本的配置里既没有
+	// 迁移标记也没有提示音字段——「有没有迁移标记」正是区分「从未配置过」与
+	// 「用户主动关掉」的依据，所以这里必须一起清掉。
 	config.GPIO.Enabled = false
+	config.GPIO.Migrations = nil
+	config.GPIO.StorageNotify = nil
 	for index := range config.GPIO.Buttons {
 		config.GPIO.Buttons[index].Actions = GPIOActions{}
 	}
@@ -320,5 +324,66 @@ func TestExecuteGPIOScriptUsesBashAndEventEnvironment(t *testing.T) {
 	}
 	if !strings.Contains(output, "copy|短按|1250|环境测试") {
 		t.Fatalf("unexpected script output %q", output)
+	}
+}
+
+// 用户主动关掉按键映射（四个档位全为无动作）之后保存，必须保持关闭。这种配置以前
+// 会被当成「从未配置」，保存时整份换成默认值——映射自己开回来、脚本被删、提示音被重开。
+func TestSaveGPIOConfigKeepsUserDisabledMapping(t *testing.T) {
+	manager := autoBackupFakeManager(t)
+	disabled := gpioTestConfig(false, nil)
+	disabled.Migrations = []string{gpioDefaultsMigrationRefreshSDCard}
+	disabled.StorageNotify = gpioBoolPointer(false)
+	disabled.Scripts = []GPIOScript{{ID: "s1", Name: "自检", Body: "echo ok"}}
+	if err := manager.SaveGPIOConfig(disabled); err != nil {
+		t.Fatalf("保存失败: %v", err)
+	}
+	config, err := manager.loadConfigLocked()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.GPIO.Enabled {
+		t.Fatal("用户主动关掉的按键映射不该被默认值重新打开")
+	}
+	if len(config.GPIO.Scripts) != 1 || config.GPIO.Scripts[0].ID != "s1" {
+		t.Fatalf("保存过的脚本不该被删: %+v", config.GPIO.Scripts)
+	}
+	if config.GPIO.StorageNotifyEnabled() {
+		t.Fatal("关掉的存储插入提示音不该被重开")
+	}
+	if network, ok := gpioTestButton(config.GPIO, "network"); !ok || !gpioActionIsEmpty(network.Actions.Short) {
+		t.Fatalf("关掉映射后不该被补上默认动作: %+v", network.Actions)
+	}
+}
+
+// 迁移补默认值时，用户攒下的脚本与提示音开关必须原样带过去。
+func TestPreserveGPIOUserDataKeepsScriptsAndNotify(t *testing.T) {
+	previous := GPIOConfig{
+		Scripts:       []GPIOScript{{ID: "s1", Name: "自检", Body: "echo ok"}},
+		StorageNotify: gpioBoolPointer(false),
+		Backups: []GPIOBackupJob{{
+			ID: "b1", Name: "照片", Mode: BackupModeCopy,
+			Source: BackupLocation{Kind: "path", Path: "/vol1/src"},
+			Target: BackupLocation{Kind: "path", Path: "/vol1/dst"},
+		}},
+	}
+	merged := preserveGPIOUserData(DefaultGPIOConfig(), previous)
+	if len(merged.Scripts) != 1 || merged.Scripts[0].ID != "s1" {
+		t.Fatalf("脚本应当被保留: %+v", merged.Scripts)
+	}
+	if merged.StorageNotifyEnabled() {
+		t.Fatal("关掉的提示音应当被保留成关闭")
+	}
+	if len(merged.Backups) != 1 {
+		t.Fatalf("备份任务应当被保留: %+v", merged.Backups)
+	}
+	// 换新默认值是给「档位」补位，不该把新默认值本身也带丢。
+	if !merged.Enabled || merged.Migrations == nil {
+		t.Fatalf("新默认值本身应当保留: %+v", merged)
+	}
+	// 指针不能与原配置共享：改动合并结果不该反向污染来源。
+	*merged.StorageNotify = true
+	if *previous.StorageNotify {
+		t.Fatal("提示音开关应当是独立副本")
 	}
 }

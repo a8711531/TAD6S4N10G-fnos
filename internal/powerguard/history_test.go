@@ -2238,7 +2238,7 @@ func TestFanDebugTakeoverAndPercent(t *testing.T) {
 	if err := manager.SetFanDebugValue("it8613:hwmon3:fan1", 50, "percent"); err == nil {
 		t.Fatal("percent set must fail when the fan is not taken over")
 	}
-	// 接管 fan1:从当前转速无缝接管(102 → 40%),fan2 不受影响
+	// 接管 fan1:从曲线当前应用值接管(45°C → 50%),fan2 不受影响
 	if err := manager.SetFanDebugTakeover("it8613:hwmon3:fan1", true); err != nil {
 		t.Fatal(err)
 	}

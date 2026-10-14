@@ -206,6 +206,107 @@ func TestRefreshSDCardFailsWithOnlySATAHosts(t *testing.T) {
 	}
 }
 
+// 按键走的是后台入口：以前 StartRefreshSDCard 先占了位，再去调会自己占位的
+// RunRefreshSDCard，被自己设的标记拒掉——网络键短按永远只响一声失败长鸣。
+func TestStartRefreshSDCardRunsToCompletion(t *testing.T) {
+	fastSDCardWaits(t)
+
+	root := t.TempDir()
+	sdcardMkdir(t, root, "sys/bus/usb/devices/2-1.4:1.0")
+	sdcardWrite(t, root, "sys/bus/usb/devices/2-1.4:1.0/bInterfaceClass", "08\n")
+	sdcardWrite(t, root, "sys/bus/usb/devices/2-1.4/authorized", "0\n")
+	sdcardMkdir(t, root, "sys/bus/usb/devices/2-1.4/2-1.4:1.0/host6")
+	sdcardMkdir(t, root, "sys/class/scsi_host/host6")
+	sdcardWrite(t, root, "sys/class/scsi_host/host6/scan", "")
+	sdcardWrite(t, root, "proc/mounts", "")
+
+	manager := &Manager{Root: root}
+	if err := manager.StartRefreshSDCard(); err != nil {
+		t.Fatalf("空闲时后台刷新应当被接受: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if running, _, _ := manager.SdcardRefreshStatus(); !running {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("后台刷新一直没有结束")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	running, summary, lastErr := manager.SdcardRefreshStatus()
+	if running {
+		t.Fatal("结束后不该还标记着正在运行")
+	}
+	if lastErr != "" {
+		t.Fatalf("后台刷新不该失败，实际 %q", lastErr)
+	}
+	if summary == "" {
+		t.Fatal("成功后应当写进摘要")
+	}
+	if got := sdcardRead(t, root, "sys/bus/usb/devices/2-1.4/authorized"); got != "1" {
+		t.Fatalf("读卡器应被重新授权，实际 %q", got)
+	}
+}
+
+// 只按 /proc/mounts 判断「正在使用」会把仍在服役的盘去授权：RAID 成员、LVM PV、
+// dm-crypt 在挂载表里是 md/dm 的名字，swap 分区压根不出现。这些设备一律跳过。
+func TestRefreshSDCardSkipsRAIDMemberAndSwap(t *testing.T) {
+	fastSDCardWaits(t)
+
+	root := t.TempDir()
+	// 读卡器 2-1.4（sdb）：干净，应当被重新识别。
+	sdcardWrite(t, root, "sys/bus/usb/devices/2-1.4:1.0/bInterfaceClass", "08\n")
+	sdcardWrite(t, root, "sys/bus/usb/devices/2-1.4/authorized", "0\n")
+	sdcardMkdir(t, root, "sys/bus/usb/devices/2-1.4/2-1.4:1.0/host6")
+	sdcardMkdir(t, root, "sys/class/scsi_host/host6")
+	sdcardWrite(t, root, "sys/class/scsi_host/host6/scan", "")
+
+	// RAID 成员 2-1.3（sdc）：分区被 md0 占着，挂载表里查不到它。
+	sdcardWrite(t, root, "sys/bus/usb/devices/2-1.3:1.0/bInterfaceClass", "08\n")
+	sdcardWrite(t, root, "sys/bus/usb/devices/2-1.3/authorized", "1\n")
+	sdcardMkdir(t, root, "sys/bus/usb/devices/2-1.3/2-1.3:1.0/host7/target7:0:0/7:0:0:0/block/sdc")
+	sdcardMkdir(t, root, "sys/class/scsi_host/host7")
+	sdcardWrite(t, root, "sys/class/scsi_host/host7/scan", "")
+	sdcardMkdir(t, root, "sys/block/sdc/sdc1/holders/md0")
+
+	// 交换分区 2-1.5（sdd）：出现在 /proc/swaps 里。
+	sdcardWrite(t, root, "sys/bus/usb/devices/2-1.5:1.0/bInterfaceClass", "08\n")
+	sdcardWrite(t, root, "sys/bus/usb/devices/2-1.5/authorized", "1\n")
+	sdcardMkdir(t, root, "sys/bus/usb/devices/2-1.5/2-1.5:1.0/host8/target8:0:0/8:0:0:0/block/sdd")
+	sdcardMkdir(t, root, "sys/class/scsi_host/host8")
+	sdcardWrite(t, root, "sys/class/scsi_host/host8/scan", "")
+
+	sdcardWrite(t, root, "proc/mounts", "")
+	sdcardWrite(t, root, "proc/swaps", "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n"+
+		"/dev/sdd2                               partition\t8000508\t\t0\t\t-2\n")
+
+	manager := &Manager{Root: root}
+	result, err := manager.RunRefreshSDCard(context.Background())
+	if err != nil {
+		t.Fatalf("刷新失败: %v", err)
+	}
+	if len(result.Devices) != 1 || result.Devices[0] != "2-1.4" {
+		t.Fatalf("只该重新识别干净的读卡器，实际 %+v", result.Devices)
+	}
+	if got := sdcardRead(t, root, "sys/bus/usb/devices/2-1.3/authorized"); got != "1" {
+		t.Fatalf("RAID 成员不该被去授权，实际 %q", got)
+	}
+	if got := sdcardRead(t, root, "sys/bus/usb/devices/2-1.5/authorized"); got != "1" {
+		t.Fatalf("交换分区所在盘不该被去授权，实际 %q", got)
+	}
+	if len(result.Skipped) != 2 {
+		t.Fatalf("两块盘都该被跳过，实际 %+v", result.Skipped)
+	}
+	joined := strings.Join(result.Skipped, " | ")
+	if !strings.Contains(joined, "md0") || !strings.Contains(joined, "交换区") {
+		t.Fatalf("跳过原因应写清是阵列还是交换区，实际 %q", joined)
+	}
+	if result.ScannedHosts != 3 {
+		t.Fatalf("三个控制器都该被重扫，实际 %d", result.ScannedHosts)
+	}
+}
+
 func TestSDCardHelpers(t *testing.T) {
 	if deviceDir, name := usbDeviceFromInterface("/sys/bus/usb/devices/2-1.4:1.0", "2-1.4:1.0"); name != "2-1.4" ||
 		deviceDir != "/sys/bus/usb/devices/2-1.4" {
