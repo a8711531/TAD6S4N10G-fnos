@@ -473,8 +473,9 @@ func (m *Manager) fanSpinUpGraceLocked() bool {
 }
 
 // errNoUsableFan 所有选中的风扇都读不到转速：保存配置时拒绝（防止静默存下
-// 无风扇可用的配置）；运行时周期应用识别该错误后跳过本周期，不报错也不
-// fail-safe 拉满——机器没有可控风扇时刷屏报错没有任何意义。
+// 无风扇可用的配置）；运行时周期应用保持错误状态报警——机器有两个风扇接口，
+// 全部停转就是真故障（风扇卡死/线被扯掉/测速线坏），绝不能清掉错误装正常。
+// 单个通道 0 转仍按跳过处理（接口未接风扇或被反插），不触发本错误。
 var errNoUsableFan = errors.New("所有选中的风扇都读不到转速（可能未接风扇或接口被反插），请检查接线后重新选择")
 
 func (m *Manager) validateFanLocked(cfg *FanConfig) error {
@@ -1221,11 +1222,14 @@ func (m *Manager) ApplyFanCurrent() error {
 	}
 	if err := m.validateFanLocked(&cfg.Fan); err != nil {
 		if errors.Is(err, errNoUsableFan) {
-			// 运行时周期应用：所有选中风扇都读不到转速（接口未接风扇或被反插）时
-			// 本周期没有可控风扇——跳过即可，不报错也不 fail-safe 拉满，否则控制
-			// 循环会把同一错误一直刷到状态里（保存配置时仍会拦下这种配置）。
-			m.fanLastError = ""
-			return nil
+			// 运行时周期应用：所有选中风扇都读不到转速 = 全部停转。机器有两个
+			// 风扇接口，都停转就是真故障（卡死/掉线/测速线坏），必须保持错误
+			// 状态报警——周期循环丢弃返回值（不刷日志），报警经 fanLastError
+			// 持久呈现在界面上，风扇恢复后由成功路径清除。不做 fail-safe 拉满：
+			// 往空通道写 100% 无意义，而关停档维修场景走不到这里（OffMode
+			// 跳过 0 转检查）。单个通道 0 转仍按跳过处理，不触发本分支。
+			m.fanLastError = err.Error()
+			return err
 		}
 		return m.setFanFailureLocked(err)
 	}

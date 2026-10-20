@@ -1429,17 +1429,21 @@ func TestZeroRPMRejectedAfterSpinUpGraceExpires(t *testing.T) {
 	manager.fanOffExitedAt = time.Now().Add(-fanSpinUpGraceWindow - time.Second)
 	manager.mu.Unlock()
 
-	// 宽限期过后仍然 0 转：运行时跳过该风扇（不再报错拉满），保存时自动剔除。
+	// 宽限期过后仍然 0 转：这是唯一选中的风扇，全部停转 = 真故障，运行时必须
+	// 保持错误状态报警（但不 fail-safe 拉满——往空通道写 100% 无意义）。
 	beforeApply, _ := readInt(pwm1)
-	if err := manager.ApplyFanCurrent(); err != nil {
-		t.Fatalf("宽限期过后 0 转风扇应被跳过而非报错: %v", err)
+	if err := manager.ApplyFanCurrent(); err == nil {
+		t.Fatal("宽限期过后所有选中风扇 0 转必须报错报警")
+	}
+	manager.mu.Lock()
+	alarm := manager.fanLastError
+	manager.mu.Unlock()
+	if alarm == "" {
+		t.Fatal("全部停转时 fanLastError 必须保持报警状态")
 	}
 	// 风扇保持原样（不 fail-safe 拉满）
 	if got, _ := readInt(pwm1); got != beforeApply {
-		t.Fatalf("0 转风扇应被跳过而非拉满，pwm1 从 %d 被改写为 %d", beforeApply, got)
-	}
-	if got, _ := readInt(pwm1); got == 255 {
-		t.Fatal("0 转风扇被 fail-safe 拉满到 100%")
+		t.Fatalf("0 转风扇不应被拉满，pwm1 从 %d 被改写为 %d", beforeApply, got)
 	}
 	// 保存时重新构建配置（上次的 on 已被修改）
 	on2 := DefaultFanConfig()
@@ -1499,21 +1503,68 @@ func TestRejectedOffModeConfigLeavesNoPhantomTransition(t *testing.T) {
 		t.Fatalf("被拒绝的配置不得落盘: %+v", onDisk.Fan)
 	}
 
-	// 风扇此刻 0 转：不存在假的关停宽限时它按故障处理（保存校验剔除 / 运行时
-	// 跳过），周期性下发绝不能把它当成「起转中」重新下发曲线目标。先把 pwm1
-	// 拨成一个曲线算不出来的值，真假宽限一试便知。
+	// 风扇此刻 0 转：不存在假的关停宽限时它是唯一选中风扇，全部停转按故障报警
+	// （返回错误、fanLastError 保持），绝不能把它当成「起转中」重新下发曲线目标。
+	// 先把 pwm1 拨成一个曲线算不出来的值，真假宽限一试便知。
 	writeTestValue(t, fan1, "0")
 	writeTestValue(t, pwm1, "30")
-	if err := manager.ApplyFanCurrent(); err != nil {
-		t.Fatalf("0 转风扇应被跳过而非报错: %v", err)
+	if err := manager.ApplyFanCurrent(); err == nil {
+		t.Fatal("所有选中风扇 0 转必须报错报警")
 	}
 	if got, _ := readInt(pwm1); got != 30 {
-		t.Fatalf("0 转风扇应被跳过，pwm1 从 30 被改写为 %d（假的关停宽限让它被当成起转中的风扇）", got)
+		t.Fatalf("0 转风扇不应被改写，pwm1 从 30 变为 %d（假的关停宽限让它被当成起转中的风扇）", got)
 	}
 	manager.mu.Lock()
 	exitedAt = manager.fanOffExitedAt
 	manager.mu.Unlock()
 	if !exitedAt.IsZero() {
 		t.Fatalf("宽限状态不得因被拒绝的配置而改变: %v", exitedAt)
+	}
+}
+
+// 两个风扇接口全部停转 = 真故障（卡死/掉线/测速线坏）：运行时必须保持错误
+// 状态报警，绝不能清掉错误让界面看起来一切正常；但不 fail-safe 拉满（往空
+// 通道写 100% 无意义，且真故障时该通道也已失控）。手动关停档维修场景走不到
+// 这里：关停档跳过 0 转检查，由 TestOffModeKeepsWorkingWhenFanReportsZeroRPM
+// 守住。风扇恢复后报警由成功路径清除。
+func TestAllFansZeroRPMAlarmsAtRuntime(t *testing.T) {
+	manager := newFanDebugTestManager(t)
+	hwmon := filepath.Join(manager.Root, "sys", "class", "hwmon", "hwmon3")
+	pwm1 := filepath.Join(hwmon, "pwm1")
+	fan1 := filepath.Join(hwmon, "fan1_input")
+
+	// 选中两个接口保存：fan2 未接（0 转）被自动剔除，fan1 正常受控。
+	cfg := DefaultFanConfig()
+	cfg.Enabled = true
+	cfg.CPUFanIDs = []string{"it8613:hwmon3:fan1", "it8613:hwmon3:fan2"}
+	if err := manager.SaveFanConfig(cfg); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	// fan1 也停转：两个接口全部 0 转 = 真故障，必须报错并保持报警状态。
+	writeTestValue(t, fan1, "0")
+	if err := manager.ApplyFanCurrent(); err == nil {
+		t.Fatal("所有选中风扇 0 转必须报错报警")
+	}
+	manager.mu.Lock()
+	alarm := manager.fanLastError
+	manager.mu.Unlock()
+	if !strings.Contains(alarm, "所有选中的风扇都读不到转速") {
+		t.Fatalf("fanLastError 应保持全部停转报警，实际 %q", alarm)
+	}
+	if got, _ := readInt(pwm1); got == 255 {
+		t.Fatal("不做 fail-safe 拉满，pwm1 不应被写成 100%")
+	}
+
+	// 风扇恢复：报警清除，曲线控制恢复。
+	writeTestValue(t, fan1, "1900")
+	if err := manager.ApplyFanCurrent(); err != nil {
+		t.Fatalf("风扇恢复后应正常受控: %v", err)
+	}
+	manager.mu.Lock()
+	alarm = manager.fanLastError
+	manager.mu.Unlock()
+	if alarm != "" {
+		t.Fatalf("风扇恢复后报警应清除，实际 %q", alarm)
 	}
 }
