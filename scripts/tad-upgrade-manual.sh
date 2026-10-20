@@ -176,10 +176,20 @@ echo "== 5/6 更新平台记录（manifest / 图标 / 生命周期脚本）=="
 # 先把将被替换的 cmd/wizard 备份下来：下面的 rm -rf 之后一旦复制失败，cleanup
 # 才有东西可还原——否则 $APPMETA/cmd/main 已经不在，回滚分支的 restart 根本
 # 跑不起来（平台记录备份只保留到本次升级结束）。
-METABAK="$APPMETA.bak-meta-$(date +%Y%m%d%H%M%S)"
-mkdir -p "$METABAK"
-cp -a "$APPMETA/cmd" "$APPMETA/wizard" "$METABAK/"
-cp -a "$APPMETA/manifest" "$APPMETA/ICON.PNG" "$APPMETA/ICON_256.PNG" "$METABAK/" 2>/dev/null || true
+# 备份先写进临时目录，cmd/wizard 完整复制成功后才把 METABAK 指过去：cp 半途
+# 失败时 cleanup 不能拿着残缺的备份去回滚——回滚分支会先删掉完好的 cmd/wizard
+# 再用残缺副本顶上，服务就再也起不来了。
+METABAK_TMP="$APPMETA.bak-meta-$(date +%Y%m%d%H%M%S)"
+mkdir -p "$METABAK_TMP"
+cp -a "$APPMETA/cmd" "$APPMETA/wizard" "$METABAK_TMP/" || true
+if [ -d "$METABAK_TMP/cmd" ] && [ -f "$METABAK_TMP/cmd/main" ] && [ -d "$METABAK_TMP/wizard" ]; then
+  cp -a "$APPMETA/manifest" "$APPMETA/ICON.PNG" "$APPMETA/ICON_256.PNG" "$METABAK_TMP/" 2>/dev/null || true
+  METABAK=$METABAK_TMP
+else
+  rm -rf "$METABAK_TMP"
+  echo "备份 cmd/wizard 失败，已中止升级（回滚程序目录后服务会拉回原版）" >&2
+  exit 1
+fi
 cp -a "$STAGE/manifest" "$STAGE/ICON.PNG" "$STAGE/ICON_256.PNG" "$APPMETA/"
 rm -rf "$APPMETA/cmd" "$APPMETA/wizard"
 cp -a "$STAGE/cmd" "$APPMETA/cmd"

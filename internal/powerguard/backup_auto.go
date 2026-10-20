@@ -132,10 +132,13 @@ type AutoBackupVolume struct {
 	ReadOnly   bool   `json:"read_only"`
 	// Alias 打标时设置的别名；Subs 已打标的卷内子目录（空 = 整块卷）；
 	// Marked 是否已打标；Legacy 是否为旧版卷根标识文件（需在下次写入时升级）。
+	// Corrupt 标记文件损坏（解析失败/子目录全部无效）：按未打标处理，自动备份
+	// 跳过该卷并明确报错，绝不能折叠成「整块卷」执行移动/删除类规则。
 	Alias    string   `json:"alias,omitempty"`
 	Subs     []string `json:"subs,omitempty"`
 	Marked   bool     `json:"marked"`
 	Legacy   bool     `json:"legacy,omitempty"`
+	Corrupt  bool     `json:"corrupt,omitempty"`
 	MarkedAt string   `json:"marked_at,omitempty"`
 }
 
@@ -207,6 +210,7 @@ type AutoBackupDevice struct {
 	Online       bool     `json:"online"`
 	PendingClear bool     `json:"pending_clear,omitempty"`
 	Legacy       bool     `json:"legacy,omitempty"`
+	Corrupt      bool     `json:"corrupt,omitempty"`
 	ReadOnly     bool     `json:"read_only,omitempty"`
 	Removable    bool     `json:"removable"`
 	Device       string   `json:"device,omitempty"`
@@ -397,33 +401,48 @@ func normalizeAutoBackupSubs(subs []string) []string {
 	return out
 }
 
+// parseAutoBackupMark 解析打标 JSON 并校验子目录。JSON 损坏（截断/乱写）、或写明的
+// 子目录全部非法时返回错误：此时无法知道用户到底标记了哪些子目录，把错误折叠成
+// 「已打标、整块卷」会让移动/删除类规则把没选中的目录整卷搬走，必须让上层
+// fail-closed（跳过该卷并明确报错）。
+func parseAutoBackupMark(data []byte) (AutoBackupMark, error) {
+	var mark AutoBackupMark
+	if err := json.Unmarshal(data, &mark); err != nil {
+		return AutoBackupMark{}, fmt.Errorf("打标标记损坏，无法解析（%v），请重新打标", err)
+	}
+	rawSubs := mark.Subs
+	mark.Subs = normalizeAutoBackupSubs(mark.Subs)
+	if len(rawSubs) > 0 && len(mark.Subs) == 0 {
+		return AutoBackupMark{}, errors.New("打标标记里的子目录全部无效，无法确认备份范围，请重新打标")
+	}
+	return mark, nil
+}
+
 // readAutoBackupMark 读取卷上的打标标记，返回标记内容、是否已打标、是否为旧位置
-// （旧位置会在下次写入时收拾干净）。标记文件读不出来（损坏/无权限）时按「已打标、
-// 整块卷」处理，避免盘插着却被静默忽略。
-func (m *Manager) readAutoBackupMark(volume AutoBackupVolume) (AutoBackupMark, bool, bool) {
+// （旧位置会在下次写入时收拾干净）。标记文件存在但损坏（截断 JSON / 子目录全部
+// 非法）时返回错误：调用方必须把它当「未打标」跳过，绝不能当成「整块卷」执行。
+func (m *Manager) readAutoBackupMark(volume AutoBackupVolume) (AutoBackupMark, bool, bool, error) {
 	// 1) 当前位置：卷内 .tad-backup/mark.json
 	if data, err := os.ReadFile(m.rooted(autoBackupMarkerFile(volume.MountPoint))); err == nil {
-		var mark AutoBackupMark
-		if json.Unmarshal(data, &mark) != nil {
-			return AutoBackupMark{}, true, false
+		mark, parseErr := parseAutoBackupMark(data)
+		if parseErr != nil {
+			return AutoBackupMark{}, false, false, parseErr
 		}
-		mark.Subs = normalizeAutoBackupSubs(mark.Subs)
-		return mark, true, false
+		return mark, true, false, nil
 	}
 	// 2) 旧版打标目录 .tad-auto-backup/mark.json（v0.10.30–v0.10.34）
 	if data, err := os.ReadFile(m.rooted(autoBackupLegacyMarkerFile(volume.MountPoint))); err == nil {
-		var mark AutoBackupMark
-		if json.Unmarshal(data, &mark) != nil {
-			return AutoBackupMark{}, true, true
+		mark, parseErr := parseAutoBackupMark(data)
+		if parseErr != nil {
+			return AutoBackupMark{}, false, false, parseErr
 		}
-		mark.Subs = normalizeAutoBackupSubs(mark.Subs)
-		return mark, true, true
+		return mark, true, true, nil
 	}
 	// 3) 更旧版：与打标目录同名的卷根普通文件，只能按「整块卷已打标」理解。
 	if info, err := os.Stat(m.rooted(autoBackupLegacyMarkerName(volume.MountPoint))); err == nil && !info.IsDir() {
-		return AutoBackupMark{}, true, true
+		return AutoBackupMark{}, true, true, nil
 	}
-	return AutoBackupMark{}, false, false
+	return AutoBackupMark{}, false, false, nil
 }
 
 // removeAutoBackupLegacyMarks 收拾旧版的两处打标位置。写成 best-effort：清不掉最多
@@ -478,7 +497,10 @@ func (m *Manager) listAutoBackupVolumes() []AutoBackupVolume {
 			Device: volume.Device, MountPoint: volume.MountPoint,
 			Label: volume.Label, UUID: volume.UUID, ReadOnly: volume.ReadOnly,
 		}
-		if mark, marked, legacy := m.readAutoBackupMark(entry); marked {
+		if mark, marked, legacy, err := m.readAutoBackupMark(entry); err != nil {
+			entry.Corrupt = true
+			m.logfUnlocked("auto backup: %s 打标标记损坏，已按未打标处理：%v", entry.displayName(), err)
+		} else if marked {
 			entry.Marked, entry.Legacy = true, legacy
 			entry.Alias, entry.Subs, entry.MarkedAt = mark.Alias, mark.Subs, mark.MarkedAt
 		}
@@ -489,10 +511,12 @@ func (m *Manager) listAutoBackupVolumes() []AutoBackupVolume {
 }
 
 // markedAutoBackupVolumes 当前插着、且已打标的可移动卷（执行自动备份时用）。
+// 打标标记损坏的卷也带上传给执行层：宁可让规则跑一遍后明确报「跳过」，
+// 也不能静默漏掉一块插着的盘，让用户以为它备份过了。
 func (m *Manager) markedAutoBackupVolumes() []AutoBackupVolume {
 	var marked []AutoBackupVolume
 	for _, volume := range m.listAutoBackupVolumes() {
-		if volume.Marked {
+		if volume.Marked || volume.Corrupt {
 			marked = append(marked, volume)
 		}
 	}
@@ -628,7 +652,7 @@ func (m *Manager) AddAutoBackupSub(path string) (AutoBackupVolume, string, error
 	if sub == "" {
 		return volume, "", errors.New("请选择卷内的子目录；要对整块卷打标请用「给整块卷打标」")
 	}
-	mark, marked, _ := m.readAutoBackupMark(volume)
+	mark, marked, _, _ := m.readAutoBackupMark(volume)
 	if !marked {
 		mark = AutoBackupMark{}
 	}
@@ -658,7 +682,7 @@ func (m *Manager) RemoveAutoBackupSub(path string) (AutoBackupVolume, string, er
 	if sub == "" {
 		return volume, "", errors.New("请选择要取消打标的卷内子目录")
 	}
-	mark, marked, _ := m.readAutoBackupMark(volume)
+	mark, marked, _, _ := m.readAutoBackupMark(volume)
 	if !marked {
 		return volume, sub, fmt.Errorf("%s 还没有打标", volume.displayName())
 	}
@@ -687,7 +711,7 @@ func (m *Manager) SetAutoBackupAlias(path, alias string) (AutoBackupVolume, erro
 	if err != nil {
 		return volume, err
 	}
-	mark, marked, _ := m.readAutoBackupMark(volume)
+	mark, marked, _, _ := m.readAutoBackupMark(volume)
 	if !marked {
 		return volume, fmt.Errorf("%s 还没有打标，无法设置别名", volume.displayName())
 	}
@@ -916,18 +940,23 @@ func (m *Manager) AutoBackupDevices() []AutoBackupDevice {
 			Device: volume.Device, MountPoint: volume.MountPoint,
 			Label: volume.Label, UUID: volume.UUID, ReadOnly: volume.ReadOnly,
 		}
-		mark, marked, legacy := m.readAutoBackupMark(entry)
+		mark, marked, legacy, markErr := m.readAutoBackupMark(entry)
 		identity := entry.identity()
 		if identity != "" {
 			seen[identity] = true
 		}
-		devices = append(devices, AutoBackupDevice{
-			Identity: identity, Alias: mark.Alias, Subs: mark.Subs,
-			Marked: marked, Online: true, Legacy: legacy,
+		device := AutoBackupDevice{
+			Identity: identity, Marked: marked, Online: true, Legacy: legacy,
 			ReadOnly: volume.ReadOnly, Removable: volume.Removable,
 			Device: volume.Device, MountPoint: volume.MountPoint,
-			Label: volume.Label, UUID: volume.UUID, MarkedAt: mark.MarkedAt,
-		})
+			Label: volume.Label, UUID: volume.UUID,
+		}
+		if markErr != nil {
+			device.Corrupt = true
+		} else {
+			device.Alias, device.Subs, device.MarkedAt = mark.Alias, mark.Subs, mark.MarkedAt
+		}
+		devices = append(devices, device)
 	}
 	for _, record := range records {
 		if seen[record.Identity] {
@@ -1064,6 +1093,12 @@ func (m *Manager) RunAutoBackupJob(ctx context.Context, rule GPIOAutoBackup, dry
 			failures = append(failures, "已取消")
 			break
 		}
+		// 打标标记损坏的卷 fail-closed：无法确认用户标记了哪些子目录，
+		// 当成「整块卷」执行移动/删除类规则会把没选中的目录搬走，必须跳过。
+		if volume.Corrupt {
+			failures = append(failures, fmt.Sprintf("%s：打标标记损坏，无法确认备份范围，已跳过该卷（请重新打标）", volume.displayName()))
+			continue
+		}
 		job, err := autoBackupJobForVolume(rule, volume)
 		if err != nil {
 			failures = append(failures, fmt.Sprintf("%s：%v", volume.displayName(), err))
@@ -1086,8 +1121,16 @@ func (m *Manager) RunAutoBackupJob(ctx context.Context, rule GPIOAutoBackup, dry
 		result.Bytes += run.Bytes
 		if err != nil {
 			failures = append(failures, fmt.Sprintf("%s：%v", volume.displayName(), err))
-		} else if deferPrune && run.Snapshot != "" {
-			newSnapshots = append(newSnapshots, run.Snapshot)
+		}
+		// 失败的卷也可能已经生成快照（rsync 超时/被杀/硬失败时，快照目录里
+		// 已有传了一半的文件，而移动模式下这些文件对应源已被删掉——它们可能
+		// 就是唯一副本）。统一清理必须把失败卷的快照也计入保留份数，否则
+		// Keep 比卷数小时，清理会把失败卷刚传出来的数据连同其它卷的新快照
+		// 一起删掉。只计磁盘上真实存在的快照目录。
+		if deferPrune && run.Snapshot != "" {
+			if info, serr := os.Stat(m.rooted(run.Snapshot)); serr == nil && info.IsDir() {
+				newSnapshots = append(newSnapshots, run.Snapshot)
+			}
 		}
 	}
 	// 多块卷共用 NAS 目标时的统一清理：保留份数不小于本次新生成的快照数，

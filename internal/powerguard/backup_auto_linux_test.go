@@ -403,3 +403,148 @@ func TestAutoBackupMoveToVolumeRequiresSingleVolume(t *testing.T) {
 		t.Fatalf("NAS 上应保留空目录结构: %v", err)
 	}
 }
+
+// 打标标记损坏（截断 JSON / 子目录全部非法）时必须 fail-closed：跳过该卷并明确
+// 报错，绝不能折叠成「已打标、整块卷」——那会让移动类规则把没选中的目录整卷
+// 搬走。回归：先仅标记 DCIM，再写入损坏的标记，执行移动类规则必须失败，
+// 未选中的内容保持原样，也不能启动整卷 rsync。
+func TestRunAutoBackupJobSkipsCorruptMark(t *testing.T) {
+	if _, err := exec.LookPath("rsync"); err != nil {
+		t.Skip("rsync 未安装，跳过打标损坏端到端测试")
+	}
+	root := t.TempDir()
+	backupWrite(t, filepath.Join(root, "proc", "mounts"),
+		"/dev/sdb2 / ext4 rw 0 0\n/dev/sdc1 /media/usb0 vfat rw 0 0\n")
+	backupWrite(t, filepath.Join(root, "sys", "block", "sdc", "removable"), "1\n")
+	if err := os.MkdirAll(filepath.Join(root, "media", "usb0", "DCIM"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	backupWrite(t, filepath.Join(root, "media", "usb0", "DCIM", "p1.jpg"), "photo-1")
+	// 未选中的目录与卷根文件：损坏回退成「整块卷」时它们会被搬走，必须保持原样。
+	if err := os.MkdirAll(filepath.Join(root, "media", "usb0", "私有"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	backupWrite(t, filepath.Join(root, "media", "usb0", "私有", "n.txt"), "keep")
+	backupWrite(t, filepath.Join(root, "media", "usb0", "说明.txt"), "keep-root")
+	if err := os.MkdirAll(filepath.Join(root, "vol1", "1000", "导入"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	manager := &Manager{Root: root, ConfigPath: filepath.Join(root, "config.json")}
+	if err := manager.saveConfigLocked(DefaultConfig(Profile{})); err != nil {
+		t.Fatalf("准备配置失败: %v", err)
+	}
+	if _, _, err := manager.AddAutoBackupSub("/media/usb0/DCIM"); err != nil {
+		t.Fatalf("打标失败: %v", err)
+	}
+
+	cases := map[string]string{
+		// 截断的 JSON：无法解析。
+		"截断JSON": `{"alias":"相机","subs":["DCIM"`,
+		// 合法 JSON 但子目录全部非法：无法确认备份范围。
+		"全非法子目录": `{"alias":"相机","subs":["../etc",".."]}`,
+	}
+	for name, payload := range cases {
+		t.Run(name, func(t *testing.T) {
+			backupWrite(t, filepath.Join(root, "media", "usb0", BackupAutoMarkerDirName, BackupAutoMarkerFileName), payload)
+			rule := GPIOAutoBackup{
+				ID: "dump", Name: "相机导入", Direction: BackupDirectionFromVolume,
+				Fixed: BackupLocation{Kind: "path", Path: "/vol1/1000/导入"},
+				Mode:  BackupModeMoveArchive,
+			}
+			result, err := manager.RunAutoBackupJob(context.Background(), rule, false)
+			if err == nil {
+				t.Fatal("打标标记损坏时必须报错，不能执行移动类规则")
+			}
+			if !strings.Contains(err.Error(), "打标标记损坏") && !strings.Contains(err.Error(), "全部无效") {
+				t.Fatalf("错误应说明标记损坏/无效: %v", err)
+			}
+			if result.Volumes != 1 {
+				t.Fatalf("损坏的卷也应计入处理范围: %+v", result)
+			}
+			// 未选中的内容一个都不能少；打标子目录本身也不能被动。
+			for _, path := range []string{
+				"media/usb0/私有/n.txt", "media/usb0/说明.txt", "media/usb0/DCIM/p1.jpg",
+			} {
+				if _, serr := os.Stat(filepath.Join(root, filepath.FromSlash(path))); serr != nil {
+					t.Fatalf("未选中的内容不该被动 %s: %v", path, serr)
+				}
+			}
+			// NAS 目标保持为空：不能启动整卷 rsync。
+			if entries, rerr := os.ReadDir(filepath.Join(root, "vol1", "1000", "导入")); rerr != nil || len(entries) != 0 {
+				t.Fatalf("不应启动整卷 rsync: %v %+v", rerr, entries)
+			}
+		})
+	}
+}
+
+// 多块打标卷共用 NAS 目标时统一清理快照：失败卷也可能已经生成快照（rsync 中途
+// 被杀/超时，快照目录里已有传了一半的文件，而移动模式下这些文件对应的源已被删，
+// 可能是唯一副本）。清理必须把失败卷的快照计入保留份数，否则 Keep 比卷数小时
+// 会把它们连同其它卷的新快照一起删掉。
+func TestAutoBackupUnifiedPruneKeepsFailedVolumeSnapshots(t *testing.T) {
+	root := t.TempDir()
+	backupWrite(t, filepath.Join(root, "proc", "mounts"),
+		"/dev/sdb2 / ext4 rw 0 0\n/dev/sdc1 /media/usb0 vfat rw 0 0\n/dev/sdd1 /media/usb1 vfat rw 0 0\n")
+	backupWrite(t, filepath.Join(root, "sys", "block", "sdc", "removable"), "1\n")
+	backupWrite(t, filepath.Join(root, "sys", "block", "sdd", "removable"), "1\n")
+	for _, mount := range []string{"usb0", "usb1"} {
+		if err := os.MkdirAll(filepath.Join(root, "media", mount), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(root, "vol1", "1000", "导入"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manager := &Manager{Root: root}
+	for _, mount := range []string{"/media/usb0", "/media/usb1"} {
+		if _, err := manager.MarkAutoBackupVolume(mount, ""); err != nil {
+			t.Fatalf("打标失败 %s: %v", mount, err)
+		}
+	}
+
+	// rsync 替身：建好快照目录、写入部分文件后硬失败（退出码 42），
+	// 模拟「传输中途被杀/超时」。不依赖系统 rsync。
+	wrapper := filepath.Join(root, "fake-rsync.sh")
+	script := "#!/bin/bash\ndest=\"${@: -1}\"\ndest=\"${dest%/}\"\nmkdir -p \"$dest\"\nprintf 'partial' > \"$dest/partial.txt\"\nexit 42\n"
+	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	origPath, origErr, origDone := backupRsyncOnce.path, backupRsyncOnce.err, backupRsyncOnce.done
+	backupRsyncOnce.path, backupRsyncOnce.err, backupRsyncOnce.done = wrapper, nil, true
+	defer func() { backupRsyncOnce.path, backupRsyncOnce.err, backupRsyncOnce.done = origPath, origErr, origDone }()
+
+	rule := GPIOAutoBackup{
+		ID: "dump", Name: "相机导入", Direction: BackupDirectionFromVolume,
+		Fixed: BackupLocation{Kind: "path", Path: "/vol1/1000/导入"},
+		Mode:  BackupModeMoveArchive, Keep: 1,
+	}
+	result, err := manager.RunAutoBackupJob(context.Background(), rule, false)
+	if err == nil {
+		t.Fatal("两块卷的 rsync 都硬失败，必须报错")
+	}
+	if !strings.Contains(err.Error(), "2/2 块打标卷处理失败") {
+		t.Fatalf("应报告两块卷都失败: %v", err)
+	}
+	// 统一清理必须把两份（失败卷的）快照都计入保留份数：Keep=1 但本次新快照
+	// 有 2 份，keep 取 max → 什么都不清。若漏计失败卷，keep=1 会把第一块卷
+	// 刚传出来的唯一副本删掉。
+	entries, rerr := os.ReadDir(filepath.Join(root, "vol1", "1000", "导入"))
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("两份部分快照都该保留（Keep 不得小于本次新快照数）: %v", entries)
+	}
+	for _, entry := range entries {
+		if !backupSnapshotPat.MatchString(entry.Name()) {
+			t.Fatalf("不应出现非快照目录: %v", entry.Name())
+		}
+		if _, serr := os.Stat(filepath.Join(root, "vol1", "1000", "导入", entry.Name(), "partial.txt")); serr != nil {
+			t.Fatalf("失败卷快照里的部分数据不该被清掉: %v", serr)
+		}
+	}
+	if result.Pruned != 0 {
+		t.Fatalf("不应清理任何快照: %+v", result)
+	}
+}

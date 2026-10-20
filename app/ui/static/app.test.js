@@ -50,6 +50,54 @@ function listeningStub() {
   return stub;
 }
 
+// 可记录属性/子节点/事件的元素桩：渲染路径选择器列表的用例专用，
+// 能断言 tabIndex、role、aria-selected、classList，并模拟 click / keydown 触发
+function recordingElement(tag = 'li') {
+  const store = { checked: false, value: '', textContent: '', children: [], attrs: new Map() };
+  const classes = new Set();
+  const listeners = new Map();
+  const classList = {
+    add: (...names) => names.forEach((name) => classes.add(name)),
+    remove: (...names) => names.forEach((name) => classes.delete(name)),
+    toggle: (name, force) => {
+      const on = force === undefined ? !classes.has(name) : Boolean(force);
+      if (on) classes.add(name);
+      else classes.delete(name);
+      return on;
+    },
+    contains: (name) => classes.has(name),
+  };
+  const dispatch = (type, event = {}) => {
+    const handler = listeners.get(type);
+    if (handler) handler({ preventDefault() {}, stopPropagation() {}, ...event });
+  };
+  return new Proxy(function stub() {}, {
+    get(_target, prop) {
+      if (prop === Symbol.toPrimitive || prop === 'toString') return () => store.textContent || tag;
+      if (prop === 'classList') return classList;
+      if (prop === 'children') return store.children;
+      if (prop === 'append') return (...kids) => { store.children.push(...kids); };
+      if (prop === 'replaceChildren') return () => { store.children.length = 0; };
+      if (prop === 'setAttribute') return (name, val) => { store.attrs.set(String(name), String(val)); };
+      if (prop === 'getAttribute') return (name) => (store.attrs.has(String(name)) ? store.attrs.get(String(name)) : null);
+      if (prop === 'addEventListener') return (type, handler) => { listeners.set(String(type), handler); };
+      if (prop === 'click') return () => dispatch('click');
+      if (prop === 'keydown') return (event) => dispatch('keydown', event);
+      if (prop === 'listeners') return listeners;
+      if (prop in store) return store[prop];
+      return stubElement();
+    },
+    set(_target, prop, value) {
+      if (prop === 'className') {
+        classes.clear();
+        String(value).split(/\s+/).filter(Boolean).forEach((name) => classes.add(name));
+      }
+      store[prop] = value;
+      return true;
+    },
+  });
+}
+
 function loadAppContext(overrides = {}) {
   const source = fs.readFileSync(path.join(__dirname, 'app.js'), 'utf8');
   const matchMedia = () => ({ matches: false, addEventListener() {} });
@@ -91,8 +139,8 @@ function loadAppContext(overrides = {}) {
     location: { reload() {}, href: '', pathname: '/', origin: 'http://localhost' },
     document: {
       readyState: 'complete',
-      getElementById: (id) => element(id),
-      createElement: () => stubElement(),
+      getElementById: (id) => (overrides.getElementById ? overrides.getElementById(id, element) : element(id)),
+      createElement: overrides.createElement || (() => stubElement()),
       createElementNS: () => stubElement(),
       createTextNode: () => stubElement(),
       querySelector: overrides.querySelector || (() => stubElement()),
@@ -1262,6 +1310,71 @@ test('浏览对话框位置列表：剩余容量属于第一行（右对齐）�
   assert.equal(meta({ ...place, read_only: true }), '可移动介质 · 只读');
   assert.equal(meta({ subtitle: '远程挂载', read_only: true, total_bytes: 1 }), '远程挂载 · 只读');
   assert.equal(meta({}), '', '什么都没有时就空着');
+});
+
+test('浏览对话框位置列表：位置行可聚焦，Enter/空格 与点击等效', async () => {
+  const { requests, fetch } = recordingFetch((href) => {
+    if (href.includes('api/backup/browse')) {
+      return { mode: 'places', scope: 'places', path: '/vol1/1000', places: [], entries: [], volumes: [] };
+    }
+    return {};
+  });
+  const placesList = recordingElement('ul');
+  const app = loadAppContext({
+    fetch,
+    createElement: () => recordingElement(),
+    getElementById: (id, fallback) => (id === 'path-picker-places' ? placesList : fallback(id)),
+  });
+  app.resolve('renderPathPlaces')([{ id: 'v1', name: '卷1', path: '/vol1', home: '/vol1/1000', kind: 'volume' }], '');
+
+  const li = placesList.children[0];
+  assert.equal(li.tabIndex, 0, '位置行应可键盘聚焦');
+  li.keydown({ key: 'Tab', target: li });
+  assert.equal(requests.filter((item) => item.url.includes('api/backup/browse')).length, 0, '其他按键不应触发进入');
+  li.keydown({ key: 'Enter', target: li });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(
+    requests.some((item) => item.url.includes(`api/backup/browse?path=${encodeURIComponent('/vol1/1000')}&scope=places`)),
+    'Enter 应等效于点击，进入卷内目录',
+  );
+});
+
+test('浏览对话框目录列表：行是 option 可聚焦，Enter 选中文件并同步 aria-selected', () => {
+  const { fetch } = recordingFetch(() => ({}));
+  const entriesList = recordingElement('ul');
+  const app = loadAppContext({
+    fetch,
+    createElement: () => recordingElement(),
+    getElementById: (id, fallback) => (id === 'path-picker-entries' ? entriesList : fallback(id)),
+    // selectPathFile 靠这个选择器清旧高亮，桩里按 classList 现算
+    querySelectorAll: (selector) => (
+      selector === '.path-entry.selected' ? entriesList.children.filter((row) => row.classList.contains('selected')) : []
+    ),
+  });
+  app.resolve('renderPathEntries')({
+    mode: 'browse',
+    path: '/vol1/1000',
+    entries: [
+      { name: 'a.txt', path: '/vol1/1000/a.txt', is_dir: false, size: 12 },
+      { name: 'b.txt', path: '/vol1/1000/b.txt', is_dir: false, size: 34 },
+    ],
+  }, false);
+
+  const [rowA, rowB] = entriesList.children;
+  assert.equal(rowA.tabIndex, 0, '目录行应可键盘聚焦');
+  assert.equal(rowA.getAttribute('role'), 'option');
+  assert.equal(rowA.getAttribute('aria-selected'), 'false', '初始未选中');
+
+  rowA.keydown({ key: 'Enter' });
+  assert.equal(app.resolve('pathPicker').selectedFile, '/vol1/1000/a.txt', 'Enter 应选中文件');
+  assert.equal(rowA.getAttribute('aria-selected'), 'true');
+  assert.ok(rowA.classList.contains('selected'));
+
+  rowB.keydown({ key: ' ' });
+  assert.equal(app.resolve('pathPicker').selectedFile, '/vol1/1000/b.txt', '空格应等效于点击选中');
+  assert.equal(rowA.getAttribute('aria-selected'), 'false', '旧选中行要同步清掉 aria-selected');
+  assert.ok(!rowA.classList.contains('selected'), '旧选中行要清掉高亮 class');
+  assert.equal(rowB.getAttribute('aria-selected'), 'true');
 });
 
 

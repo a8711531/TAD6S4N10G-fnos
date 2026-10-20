@@ -265,7 +265,7 @@ func TestNormalizeConfigMigratesDiskCurveWithoutReplacingCPUCurve(t *testing.T) 
 	if len(cfg.Fan.HDDCurve) != 2 || cfg.Fan.HDDCurve[0].TempC != 28 || cfg.Fan.HDDCurve[1].PWMPercent != 100 {
 		t.Fatalf("legacy disk curve was not copied to HDD: %+v", cfg.Fan.HDDCurve)
 	}
-	if !fanPointsEqual(cfg.Fan.NVMeCurve, defaultStorageFanCurve(30)) {
+	if !fanPointsEqual(cfg.Fan.NVMeCurve, defaultNVMeFanCurve(30)) {
 		t.Fatalf("NVMe curve did not fall back to the balanced default: %+v", cfg.Fan.NVMeCurve)
 	}
 	if cfg.Fan.DiskCurve != nil {
@@ -1356,5 +1356,55 @@ func TestLeavingOffModeSpinsFansBackUp(t *testing.T) {
 	writeTestValue(t, fan1, "1900")
 	if err := manager.ApplyFanCurrent(); err != nil {
 		t.Fatalf("转速恢复后下发仍应成功: %v", err)
+	}
+}
+
+// 起转宽限窗口不是永久豁免：离开关停档 30 秒后仍然 0 转的通道必须重新按故障
+// 处理（下发 fail-safe 满速、保存被拒）。旧的「见过一次转速就永久免检」会让
+// 拔掉/损坏的风扇永远不被发现。
+func TestZeroRPMRejectedAfterSpinUpGraceExpires(t *testing.T) {
+	manager := newFanDebugTestManager(t)
+	hwmon := filepath.Join(manager.Root, "sys", "class", "hwmon", "hwmon3")
+	pwm1 := filepath.Join(hwmon, "pwm1")
+	fan1 := filepath.Join(hwmon, "fan1_input")
+
+	off := DefaultFanConfig()
+	off.Enabled = true
+	off.OffMode = true
+	off.CPUFanIDs = []string{"it8613:hwmon3:fan1"}
+	for i := range off.Curve {
+		off.Curve[i].PWMPercent = 0
+	}
+	for i := range off.HDDCurve {
+		off.HDDCurve[i].PWMPercent = 0
+	}
+	for i := range off.NVMeCurve {
+		off.NVMeCurve[i].PWMPercent = 0
+	}
+	if err := manager.SaveFanConfig(off); err != nil {
+		t.Fatalf("save off: %v", err)
+	}
+	writeTestValue(t, fan1, "0") // 关停把风扇停住了
+
+	on := DefaultFanConfig()
+	on.Enabled = true
+	on.CPUFanIDs = []string{"it8613:hwmon3:fan1"}
+	if err := manager.SaveFanConfig(on); err != nil {
+		t.Fatalf("宽限期内切回正常档必须能保存: %v", err)
+	}
+
+	// 把宽限期拨到 30 秒之前：模拟用户离开关停档很久之后风扇仍然没有转起来。
+	manager.mu.Lock()
+	manager.fanOffExitedAt = time.Now().Add(-fanSpinUpGraceWindow - time.Second)
+	manager.mu.Unlock()
+
+	if err := manager.ApplyFanCurrent(); err == nil {
+		t.Fatal("宽限期过后仍然 0 转的风扇必须按故障处理")
+	}
+	if got, _ := readInt(pwm1); got != 255 {
+		t.Fatalf("0 转故障应 fail-safe 拉满，实际 pwm1=%d", got)
+	}
+	if err := manager.SaveFanConfig(on); err == nil {
+		t.Fatal("宽限期过后保存也应被拒（0 转通道不可控）")
 	}
 }

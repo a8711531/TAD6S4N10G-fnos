@@ -235,9 +235,12 @@ type Manager struct {
 	fanLastError  string
 	fanLastTarget int
 	fanLastTemp   float64
-	// 运行期见过转速反馈（RPM>0）的通道。关停档会把风扇停成 0 转，此时不能拿
-	// 「当前 0 转」当「通道不可控」拒绝下发，否则切出关停后永远起不来。
-	fanLiveRPM map[string]bool
+	// 关停档退出后的起转宽限窗口：风扇从 0 转自然起转需要几秒到几十秒，期间的
+	// 0 转速不能当「通道接不到风扇」拒绝下发，否则切出关停后永远起不来。
+	// fanOffExitedAt 记录关停档 → 普通档的切换时刻，宽限期见 fanSpinUpGraceWindow；
+	// 过期后恢复严格检查，不再像旧的「见过转速就永久豁免」那样放过真故障。
+	fanOffWasActive bool
+	fanOffExitedAt  time.Time
 
 	// 风扇调试模式（运行时状态，不落盘；重启即恢复曲线控制）
 	fanDebugTakenOver       map[string]int

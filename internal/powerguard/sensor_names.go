@@ -27,8 +27,10 @@ var legacySensorNamePCB = map[string]bool{
 }
 
 // applyDefaultSensorNames 只在第一次（sensor_name_defaults_applied 为 false）把
-// 默认名写进配置：这一次是「固定保存」，同名键会被默认值覆盖（用户明确要求
-// 主板PCB / 光模块2 这些名字）；之后再改名或清空都不受这里影响。
+// 默认名补进配置，且只填「尚未设置」的键：配置里已经有名字的（旧版本写过的内置
+// 默认、用户自己改的）一律不动——首次升级时无条件覆盖会把用户手起的名字悄悄
+// 改掉。旧内置名的收敛（「PCB温度」/「PCB」→「主板PCB」）单独走
+// applySensorNameRenames，那里只动旧名，不碰用户的其它命名。
 func applyDefaultSensorNames(cfg *Config) bool {
 	if cfg.SensorNameDefaultsApplied {
 		return false
@@ -37,13 +39,15 @@ func applyDefaultSensorNames(cfg *Config) bool {
 	if cfg.SensorNames == nil {
 		cfg.SensorNames = make(map[string]string, len(defaultSensorNames))
 	}
+	changed := false
 	for key, name := range defaultSensorNames {
-		if cfg.SensorNames[key] == name {
+		if cfg.SensorNames[key] != "" {
 			continue
 		}
 		cfg.SensorNames[key] = name
+		changed = true
 	}
-	return true
+	return changed
 }
 
 // applySensorNameRenames 做 0.10.46 的一次性重命名：默认名早已按 v0.10.45 固定过

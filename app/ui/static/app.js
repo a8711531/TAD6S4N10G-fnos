@@ -2230,6 +2230,13 @@ function renderPathPlaces(places, insideID) {
     }
     // 与硬盘测试工具一致：点存储空间直接进入卷内用户目录（home），不停在卷根
     li.addEventListener('click', () => browsePathTo(place.home || place.path, 'places'));
+    // 键盘可达：Enter / 空格 触发与点击相同的行为（target 限定 li 本身，避免劫持内部改名按钮）
+    li.tabIndex = 0;
+    li.addEventListener('keydown', (event) => {
+      if (event.target !== li || (event.key !== 'Enter' && event.key !== ' ')) return;
+      event.preventDefault();
+      li.click();
+    });
     list.append(li);
   });
 }
@@ -2296,14 +2303,27 @@ function renderPathEntries(data, placesMode) {
       if (entry.is_dir) browsePathTo(entry.path, pathPicker.scope);
       else if (pathPicker.allowFile) selectPathFile(entry.path, row);
     });
+    // 键盘可达：列表是 role="listbox"，每行作为 option 可聚焦，Enter / 空格 同点击
+    row.tabIndex = 0;
+    row.setAttribute('role', 'option');
+    row.setAttribute('aria-selected', 'false');
+    row.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      event.preventDefault();
+      row.click();
+    });
     list.append(row);
   });
 }
 
 function selectPathFile(path, row) {
   pathPicker.selectedFile = path;
-  document.querySelectorAll('.path-entry.selected').forEach((item) => item.classList.remove('selected'));
+  document.querySelectorAll('.path-entry.selected').forEach((item) => {
+    item.classList.remove('selected');
+    item.setAttribute('aria-selected', 'false');
+  });
   row.classList.add('selected');
+  row.setAttribute('aria-selected', 'true');
   updatePathPickerSelectLabel();
 }
 

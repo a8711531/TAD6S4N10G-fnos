@@ -206,9 +206,16 @@ func storageSlotIDs(kind string) []string {
 	return ids
 }
 
-// defaultStorageFanCurve 是硬盘类曲线的出厂默认（平衡档），按最低转速收口。
+// defaultStorageFanCurve 是机械硬盘曲线的出厂默认（平衡档），按最低转速收口。
 func defaultStorageFanCurve(minimum int) []FanPoint {
 	return clampCurvePWM(builtinFanCurves["balanced"].HDD, minimum)
+}
+
+// defaultNVMeFanCurve 是 NVMe 曲线的出厂默认（平衡档）。NVMe 温度范围与机械盘
+// 不同（待机温度更高、无 25°C 以下的盘体温），缺省回退必须用自己的曲线，
+// 不能错用 HDD 曲线。
+func defaultNVMeFanCurve(minimum int) []FanPoint {
+	return clampCurvePWM(builtinFanCurves["balanced"].NVMe, minimum)
 }
 
 // 0.10.36 及以前的出厂默认（最低转速 60%、三条曲线都从 60% 起）。
@@ -296,7 +303,7 @@ func normalizeConfig(cfg *Config) bool {
 		changed = true
 	}
 	if cfg.Fan.NVMeCurve == nil {
-		cfg.Fan.NVMeCurve = defaultStorageFanCurve(cfg.Fan.MinPWMPercent)
+		cfg.Fan.NVMeCurve = defaultNVMeFanCurve(cfg.Fan.MinPWMPercent)
 		changed = true
 	}
 	if cfg.Fan.HDDSlotIDs == nil {
@@ -437,33 +444,36 @@ func selectedFanSources(cfg FanConfig) map[string][]string {
 	return result
 }
 
-// noteFanSpinningLocked 记录这一轮读到转速反馈的通道。「当前 0 转」只说明这一刻
-// 停着（很可能是我们自己按关停档停住的），只有从来没读到过转速的通道才当作
-// 「接不到风扇、不可控」。
-func (m *Manager) noteFanSpinningLocked(fans []FanDevice) {
-	for _, fan := range fans {
-		if fan.RPM > 0 {
-			m.markFanLiveLocked(fan.ID)
-		}
-	}
-}
+// fanSpinUpGraceWindow 关停档退出后允许风扇从 0 转自然起转的宽限期。
+// 风扇从停转到转速反馈恢复需要几秒到几十秒，期间读到的 0 转速不能当
+// 「通道接不到风扇」；宽限期过后仍然 0 转的通道按故障处理。
+const fanSpinUpGraceWindow = 30 * time.Second
 
-// markFanLiveLocked 标记这个通道确实挂着风扇（读到过转速，或已被我们成功控制过）。
-func (m *Manager) markFanLiveLocked(id string) {
-	if id == "" {
+// noteOffModeStateLocked 记录关停档 → 普通档的切换时刻，作为起转宽限期的起点。
+// 旧实现用「曾经读到过转速」的永久标记（fanLiveRPM）豁免 0 转检查：风扇拔掉
+// 之后标记还在，0 转故障会被永久放行，fail-safe 形同虚设。宽限窗口从切换时刻
+// 起算，过期后立刻恢复严格检查，既不误伤起转中的风扇，也不豁免真故障。
+func (m *Manager) noteOffModeStateLocked(offMode bool) {
+	if offMode {
+		m.fanOffWasActive = true
 		return
 	}
-	if m.fanLiveRPM == nil {
-		m.fanLiveRPM = make(map[string]bool)
+	if m.fanOffWasActive {
+		m.fanOffWasActive = false
+		m.fanOffExitedAt = time.Now()
 	}
-	m.fanLiveRPM[id] = true
 }
 
-func (m *Manager) fanKnownLiveLocked(id string) bool {
-	return m.fanLiveRPM[id]
+// fanSpinUpGraceLocked 报告当前是否仍在关停退出后的起转宽限期内。
+func (m *Manager) fanSpinUpGraceLocked() bool {
+	if m.fanOffExitedAt.IsZero() {
+		return false
+	}
+	return time.Since(m.fanOffExitedAt) < fanSpinUpGraceWindow
 }
 
 func (m *Manager) validateFanLocked(cfg FanConfig) error {
+	m.noteOffModeStateLocked(cfg.OffMode)
 	if cfg.MinPWMPercent < 30 || cfg.MinPWMPercent > 100 {
 		return errors.New("fan min_pwm_percent must be between 30 and 100")
 	}
@@ -499,7 +509,6 @@ func (m *Manager) validateFanLocked(cfg FanConfig) error {
 	if err != nil {
 		return err
 	}
-	m.noteFanSpinningLocked(fans)
 	available := make(map[string]FanDevice, len(fans))
 	for _, fan := range fans {
 		available[fan.ID] = fan
@@ -514,10 +523,9 @@ func (m *Manager) validateFanLocked(cfg FanConfig) error {
 		if cfg.OffMode {
 			continue
 		}
-		// 刚刚被关停档停住的风扇此刻也是 0 转，但它上一秒还在转（见过转速反馈），
-		// 属于「我们把它停住的」而不是「通道接不到风扇」。这种情况必须放行，
-		// 否则切出关停时保存直接失败，风扇永远起不来。
-		if fan.RPM <= 0 && !m.fanKnownLiveLocked(fan.ID) {
+		// 刚退出关停档的风扇从 0 转自然起转需要几秒到几十秒，宽限期内读到的
+		// 0 转速不算「通道接不到风扇」；宽限期过后仍然 0 转才按故障拒绝。
+		if fan.RPM <= 0 && !m.fanSpinUpGraceLocked() {
 			return fmt.Errorf("fan %s reports no valid RPM and cannot be controlled safely", fan.ID)
 		}
 	}
@@ -1231,7 +1239,7 @@ func (m *Manager) applyFanLocked(cfg FanConfig) error {
 	if err != nil {
 		return err
 	}
-	m.noteFanSpinningLocked(fans)
+	m.noteOffModeStateLocked(cfg.OffMode)
 	selected := selectedFanSources(cfg)
 	byID := make(map[string]FanDevice, len(fans))
 	for _, fan := range fans {
@@ -1274,23 +1282,38 @@ func (m *Manager) applyFanLocked(cfg FanConfig) error {
 		if _, taken := m.fanDebugTakenOver[id]; taken {
 			continue // 被调试接管:脱离曲线控制,由调试接口锁定转速
 		}
-		// 关停档：直接写 0%，不再看最低转速与曲线；只有紧急温度能翻盘到满速。
+		// 关停档：直接写 0%，不再看最低转速与曲线。但温度源保护与普通模式
+		// 相同——该风扇选中的源一个都读不到时，说明控制环成了瞎子，继续停转
+		// 不再安全，必须翻到满速并报错；紧急温度同样翻满速。
 		if cfg.OffMode {
+			sourceAvailable := false
+			for _, source := range sources {
+				switch source {
+				case "cpu":
+					sourceAvailable = sourceAvailable || cpuErr == nil
+				case "hdd":
+					sourceAvailable = sourceAvailable || hddAvailable
+				case "nvme":
+					sourceAvailable = sourceAvailable || nvmeAvailable
+				}
+			}
 			target := 0
-			if emergency {
+			if emergency || !sourceAvailable {
 				target = 100
+				if !sourceAvailable {
+					errs = append(errs, fmt.Errorf("no selected temperature source is available for fan %s; forced to full speed", id))
+				}
 			}
 			if err := setFanPWM(fan, target); err != nil {
 				errs = append(errs, fmt.Errorf("set fan %s to %d%%: %w", id, target, err))
 				continue
 			}
-			// 这个通道是被我们主动停住的（关停档），记成「有风扇」，切出关停时
-			// 才不会被 0 转卡住。
-			m.markFanLiveLocked(id)
 			lastTarget = max(lastTarget, target)
 			continue
 		}
-		if fan.RPM <= 0 && !m.fanKnownLiveLocked(id) {
+		// 刚退出关停档的风扇从 0 转自然起转需要几秒到几十秒，宽限期内读到的
+		// 0 转速不算「通道接不到风扇」；宽限期过后仍然 0 转按故障 fail-safe。
+		if fan.RPM <= 0 && !m.fanSpinUpGraceLocked() {
 			errs = append(errs, fmt.Errorf("fan %s reports no valid RPM", id), setFanPWM(fan, 100))
 			continue
 		}
@@ -1641,36 +1664,59 @@ func (m *Manager) fanStatusLocked(cfg FanConfig) FanControlStatus {
 			ControlSources: append([]string(nil), selected[fan.ID]...),
 		})
 	}
-	if temperature, err := m.controlTemperature(); err == nil {
-		result.TemperatureC = temperature
-		result.CPUTemperatureC = temperature
+	cpuTemperature, cpuErr := m.controlTemperature()
+	if cpuErr == nil {
+		result.TemperatureC = cpuTemperature
+		result.CPUTemperatureC = cpuTemperature
 		if len(cfg.Curve) >= 2 {
-			result.CPUTargetPWMPercent = interpolatePWMPercent(cfg.Curve, temperature, cfg.MinPWMPercent, cfg.EmergencyTempC)
+			result.CPUTargetPWMPercent = interpolatePWMPercent(cfg.Curve, cpuTemperature, cfg.MinPWMPercent, cfg.EmergencyTempC)
 		}
 	} else if cfg.Enabled {
-		result.LastError = combineError(result.LastError, err)
+		result.LastError = combineError(result.LastError, cpuErr)
 	}
 	storage := m.StorageStatus()
-	if temperature, available := maximumStorageTemperature(storage, "front", cfg.HDDSlotIDs); available {
-		result.HDDTemperatureC = temperature
+	hddTemperature, hddAvailable := maximumStorageTemperature(storage, "front", cfg.HDDSlotIDs)
+	if hddAvailable {
+		result.HDDTemperatureC = hddTemperature
 		if len(cfg.HDDCurve) >= 2 {
-			result.HDDTargetPWMPercent = interpolatePWMPercent(cfg.HDDCurve, temperature, cfg.MinPWMPercent, cfg.EmergencyTempC)
+			result.HDDTargetPWMPercent = interpolatePWMPercent(cfg.HDDCurve, hddTemperature, cfg.MinPWMPercent, cfg.EmergencyTempC)
 		}
 	}
-	if temperature, available := maximumStorageTemperature(storage, "m2", cfg.NVMeSlotIDs); available {
-		result.NVMeTemperatureC = temperature
+	nvmeTemperature, nvmeAvailable := maximumStorageTemperature(storage, "m2", cfg.NVMeSlotIDs)
+	if nvmeAvailable {
+		result.NVMeTemperatureC = nvmeTemperature
 		if len(cfg.NVMeCurve) >= 2 {
-			result.NVMeTargetPWMPercent = interpolatePWMPercent(cfg.NVMeCurve, temperature, cfg.MinPWMPercent, cfg.EmergencyTempC)
+			result.NVMeTargetPWMPercent = interpolatePWMPercent(cfg.NVMeCurve, nvmeTemperature, cfg.MinPWMPercent, cfg.EmergencyTempC)
 		}
 	}
 	result.DiskTemperatureC = max(result.HDDTemperatureC, result.NVMeTemperatureC)
 	if cfg.OffMode {
 		// 关停档实际下发就是 0%（只有紧急温度会翻成满速）。别用「曲线 + 最低转速」
 		// 算出来的 40% 当目标，否则界面显示 40% 而风扇其实停着，两边互相打架。
+		// 与 applyFanLocked 的保护保持一致：选中的温度源一个都读不到时，实际会
+		// 写满速并报错，这里也显示满速，不让界面与现实打架。
+		selectedSources := map[string]bool{}
+		for _, sources := range selected {
+			for _, source := range sources {
+				selectedSources[source] = true
+			}
+		}
+		anySourceAvailable := false
+		for source := range selectedSources {
+			switch source {
+			case "cpu":
+				anySourceAvailable = anySourceAvailable || cpuErr == nil
+			case "hdd":
+				anySourceAvailable = anySourceAvailable || hddAvailable
+			case "nvme":
+				anySourceAvailable = anySourceAvailable || nvmeAvailable
+			}
+		}
 		target := 0
 		if result.CPUTemperatureC >= cfg.EmergencyTempC ||
 			(result.HDDTemperatureC > 0 && result.HDDTemperatureC >= cfg.EmergencyTempC) ||
-			(result.NVMeTemperatureC > 0 && result.NVMeTemperatureC >= cfg.EmergencyTempC) {
+			(result.NVMeTemperatureC > 0 && result.NVMeTemperatureC >= cfg.EmergencyTempC) ||
+			!anySourceAvailable {
 			target = 100
 		}
 		result.CPUTargetPWMPercent = target

@@ -2700,6 +2700,12 @@ button.danger {
 .places li:hover,
 .dirs li:hover { background: var(--surface-muted); }
 
+.places li:focus-visible,
+.dirs li:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: -2px;
+}
+
 .places li.active { background: var(--primary); color: #fff; }
 .places li.active .pl-free,
 .places li.active .pl-sub,

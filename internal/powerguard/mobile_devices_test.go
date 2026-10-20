@@ -110,24 +110,30 @@ func TestUSBDeviceNameFromPath(t *testing.T) {
 	}
 }
 
-// 传感器默认显示名只补一次：内置映射固定写进配置（同名键也按用户指定覆盖），
-// 之后清空或改名不再被塞回来（sensor_name_defaults_applied 记住了）。
+// 传感器默认显示名只补一次，而且只补「没有名字」的键：配置里已经有名字的
+// （旧版本写过的内置默认、用户自己改的）首次升级也不能被默认值覆盖；旧内置名
+// 的收敛（PCB温度/PCB → 主板PCB）单独走改名逻辑。补过之后清空或改名不再被
+// 塞回来（sensor_name_defaults_applied 记住了）。
 func TestDefaultSensorNamesAppliedOnce(t *testing.T) {
-	cfg := Config{SensorNames: map[string]string{"it8613:temp2": "PCB", "acpitz:temp1": "机箱"}}
+	cfg := Config{SensorNames: map[string]string{
+		"it8613:temp2": "PCB",        // 旧内置名 → 由改名逻辑收敛成主板PCB
+		"mlx5:sensor0": "万兆网卡1", // 用户自己起的：绝不能被默认值覆盖
+		"acpitz:temp1": "机箱",
+	}}
 	if !normalizeConfig(&cfg) {
 		t.Fatal("首次归一化应写入默认显示名")
 	}
 	if got := cfg.SensorNames["it8613:temp2"]; got != "主板PCB" {
-		t.Fatalf("首次迁移应按默认表覆盖，got %q", got)
+		t.Fatalf("旧内置名应由改名逻辑收敛成主板PCB，got %q", got)
+	}
+	if got := cfg.SensorNames["mlx5:sensor0"]; got != "万兆网卡1" {
+		t.Fatalf("用户已保存的名字不能被默认值覆盖，got %q", got)
 	}
 	if got := cfg.SensorNames["acpitz:temp1"]; got != "机箱" {
 		t.Fatalf("默认表之外的键不能被改动，got %q", got)
 	}
-	if got := cfg.SensorNames["mlx5:sensor0"]; got != "CX-4 LX#1" {
-		t.Fatalf("默认名没写进来，got %q", got)
-	}
 	if got := cfg.SensorNames["mlx5#2:Module1"]; got != "光模块2" {
-		t.Fatalf("默认名没写进来，got %q", got)
+		t.Fatalf("没有名字的键才补默认值，got %q", got)
 	}
 	if !cfg.SensorNameDefaultsApplied {
 		t.Fatal("应记下已补过默认名")

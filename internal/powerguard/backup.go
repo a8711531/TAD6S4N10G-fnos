@@ -65,6 +65,11 @@ const (
 	backupSnapshotSuffix = "_%d"
 
 	backupRsyncFallbackTimeout = 6 * time.Hour
+
+	// 远程挂载的容量探测超时：NFS hard mount / 断连的 CIFS、卡死的 rclone
+	// 网关会让 statfs 无限阻塞，BackupPlaces 是界面常用接口，不能被一次
+	// 容量查询挂死。超时按「容量未知」处理。
+	backupRemoteUsageProbeTimeout = 2 * time.Second
 )
 
 // backupModeIsMove 判断是否为会删除源文件的「移动」模式。
@@ -875,7 +880,9 @@ func (m *Manager) BackupPlaces() []BackupPlace {
 			continue
 		}
 		label, sub := backupRemoteDisplay(mount, aliases, friendly, officialNames, officialBrands)
-		total, free := m.backupUsage(mount.mountPoint)
+		// 远程挂载的 statfs 可能无限阻塞（断连的 NFS/CIFS、卡死的网盘），
+		// 必须带超时：宁可这一行容量显示为空，不能把整个位置列表挂死。
+		total, free := m.backupUsageTimeout(mount.mountPoint, backupRemoteUsageProbeTimeout)
 		remote = append(remote, BackupPlace{
 			ID:         "remote:" + mount.mountPoint,
 			Name:       label,
@@ -895,6 +902,81 @@ func (m *Manager) BackupPlaces() []BackupPlace {
 	places = append(places, remote...)
 	places = append(places, external...)
 	return places
+}
+
+// BackupPlaceRoots 是 BackupPlaces 的轻量版：只列位置根（ID/Path/Kind），不读
+// 容量。BackupPlaces 会对每个挂载 statfs——断连的远程挂载可能把整条列表卡到
+// 超时；而权限判断、改名校验、移动护栏只需要「路径属于哪个位置」，用这个版本
+// 就够，也不会发起任何远程 IO。
+func (m *Manager) BackupPlaceRoots() []BackupPlace {
+	var places []BackupPlace
+	for _, root := range m.internalVolumeRoots() {
+		places = append(places, BackupPlace{
+			ID:   "volume:" + root,
+			Path: root,
+			Kind: BackupPlaceVolume,
+		})
+	}
+	for _, mount := range m.parseAllMounts() {
+		if !isBackupRemoteFSType(mount.fsType) || mount.mountPoint == "/" {
+			continue
+		}
+		places = append(places, BackupPlace{
+			ID:       "remote:" + mount.mountPoint,
+			Path:     mount.mountPoint,
+			Kind:     BackupPlaceRemote,
+			ReadOnly: mount.readOnly,
+		})
+	}
+	// 外接存储直接走挂载表 + 可移动位判断：不走 ListBackupVolumes（它会对
+	// 所有挂载 statfs），这里保持零远程 IO。
+	for _, entry := range m.parseMountInfo() {
+		switch entry.mountPoint {
+		case "/", "/boot", "/boot/efi", "/boot/firmware":
+			continue
+		}
+		if strings.HasPrefix(entry.fsType, "overlay") || strings.HasPrefix(entry.fsType, "squashfs") {
+			continue
+		}
+		if !m.isRemovableDevice(entry.device) {
+			continue
+		}
+		places = append(places, BackupPlace{
+			ID:        "external:" + entry.mountPoint,
+			Path:      entry.mountPoint,
+			Kind:      BackupPlaceExternal,
+			Removable: true,
+			ReadOnly:  entry.readOnly,
+		})
+	}
+	return places
+}
+
+// backupUsageTimeout 带超时的容量查询：远程挂载断连时 statfs 可能无限阻塞
+// （NFS hard mount、卡死的网盘），不能让一次容量查询把调用方挂死。超时按
+// 「容量未知」处理（0，前端不显示）。卡住的 syscall 无法中断，探测 goroutine
+// 会留到调用自行返回为止，量级可接受。
+func (m *Manager) backupUsageTimeout(path string, timeout time.Duration) (total, free uint64) {
+	type fsUsage struct {
+		total, free uint64
+	}
+	done := make(chan fsUsage, 1)
+	go func() {
+		t, f, err := filesystemUsage(m.rooted(path))
+		if err != nil {
+			done <- fsUsage{}
+			return
+		}
+		done <- fsUsage{total: t, free: f}
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case usage := <-done:
+		return usage.total, usage.free
+	case <-timer.C:
+		return 0, 0
+	}
 }
 
 // remoteMountFriendlyNames 尽力推断云盘的显示名：遍历挂载进程的命令行，rclone
@@ -985,7 +1067,7 @@ func (m *Manager) SetRemoteAlias(mountPoint, name string) error {
 		return errors.New("显示名最长 64 个字符")
 	}
 	known := false
-	for _, place := range m.BackupPlaces() {
+	for _, place := range m.BackupPlaceRoots() {
 		if place.Kind == BackupPlaceRemote && place.Path == mountPoint {
 			known = true
 			break
@@ -1227,7 +1309,7 @@ func (m *Manager) CreateBackupDirectory(path, name, scope string) (BackupMkdirRe
 		return result, errors.New("不能直接在文件系统根目录下新建文件夹，请先进到具体位置")
 	}
 	if scope == BackupScopePlaces {
-		if placePathOwner(m.BackupPlaces(), clean) == "" {
+		if placePathOwner(m.BackupPlaceRoots(), clean) == "" {
 			return result, errors.New("该目录不在可选位置内，可先切到原生目录模式")
 		}
 		// 卷位置覆盖整棵卷树，但飞牛的内部目录（@appdata、docker、thumb…）
@@ -1332,7 +1414,7 @@ func (m *Manager) moveSourceGuard(src string) error {
 	if backupTeamRootPat.MatchString(slash) {
 		return errors.New("移动类模式会删除源里的文件，源不能是整个共享文件夹根目录，请在它下面选择具体目录")
 	}
-	if isPlaceRoot(m.BackupPlaces(), slash) {
+	if isPlaceRoot(m.BackupPlaceRoots(), slash) {
 		return errors.New("移动类模式会删除源里的文件，源不能是远程挂载根目录，请在它下面选择具体目录")
 	}
 	return nil

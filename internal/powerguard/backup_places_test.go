@@ -3,6 +3,7 @@ package powerguard
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -63,10 +64,27 @@ func backupPlacesFakeManager(t *testing.T) *Manager {
 	mkdir("vol02/1000-1-2056118d/来自：分享")
 	mkdir("media/usb0/DCIM")
 
+	// 隔离远程挂载名的配置目录：remoteConfigDirs 指向真实系统路径（/etc/mountmgr
+	// 等），在真装了飞牛配置的机器上跑测试会把「读不到配置 → 兜底命名」的断言
+	// 打歪。统一替换成空临时目录，测试只钉住纯仿真环境下的行为。
+	savedRemoteConfigDirs := remoteConfigDirs
+	remoteConfigDirs = []string{t.TempDir()}
+	t.Cleanup(func() { remoteConfigDirs = savedRemoteConfigDirs })
+
 	return &Manager{Root: root}
 }
 
+// skipOnNonLinux 位置列表的仿真依赖 Linux 的 /proc/mounts 与 statfs 语义
+// （非 Linux 平台 filesystemUsage 是返回错误的占位实现，容量恒为 0）。
+func skipOnNonLinux(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skipf("位置列表仿真依赖 Linux 行为（%s 上跳过）", runtime.GOOS)
+	}
+}
+
 func TestBackupPlacesBuildsFnosCategories(t *testing.T) {
+	skipOnNonLinux(t)
 	manager := backupPlacesFakeManager(t)
 	places := manager.BackupPlaces()
 
@@ -115,6 +133,7 @@ func TestBackupPlacesBuildsFnosCategories(t *testing.T) {
 }
 
 func TestBackupPlacesOrderFollowsFnosSidebar(t *testing.T) {
+	skipOnNonLinux(t)
 	manager := backupPlacesFakeManager(t)
 	places := manager.BackupPlaces()
 	if len(places) < 3 {
@@ -337,6 +356,7 @@ func TestIsBackupRemoteFSType(t *testing.T) {
 // 解析出的总线路径（含 /usb）认出来；分区要用 sysfs 归属整盘，不能去末尾数字猜
 // （nvme0n1p1 去掉数字得到 nvme0n1p，mmcblk0p1 得到 mmcblk0p，都不对）。
 func TestIsRemovableDeviceUsesSysfsSymlinkAndUsbPath(t *testing.T) {
+	skipOnNonLinux(t)
 	root := t.TempDir()
 	write := func(path, content string) {
 		full := filepath.Join(root, filepath.FromSlash(path))
