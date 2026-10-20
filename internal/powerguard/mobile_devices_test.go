@@ -116,7 +116,7 @@ func TestUSBDeviceNameFromPath(t *testing.T) {
 // 塞回来（sensor_name_defaults_applied 记住了）。
 func TestDefaultSensorNamesAppliedOnce(t *testing.T) {
 	cfg := Config{SensorNames: map[string]string{
-		"it8613:temp2": "PCB",        // 旧内置名 → 由改名逻辑收敛成主板PCB
+		"it8613:temp2": "PCB",   // 旧内置名 → 由改名逻辑收敛成主板PCB
 		"mlx5:sensor0": "万兆网卡1", // 用户自己起的：绝不能被默认值覆盖
 		"acpitz:temp1": "机箱",
 	}}

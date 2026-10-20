@@ -404,48 +404,52 @@ func TestAutoBackupMoveToVolumeRequiresSingleVolume(t *testing.T) {
 	}
 }
 
-// 打标标记损坏（截断 JSON / 子目录全部非法）时必须 fail-closed：跳过该卷并明确
-// 报错，绝不能折叠成「已打标、整块卷」——那会让移动类规则把没选中的目录整卷
-// 搬走。回归：先仅标记 DCIM，再写入损坏的标记，执行移动类规则必须失败，
-// 未选中的内容保持原样，也不能启动整卷 rsync。
+// 打标标记损坏（截断 JSON / 内容不是打标对象 / 子目录全部非法或指向卷根）时必须
+// fail-closed：跳过该卷并明确报错，绝不能折叠成「已打标、整块卷」——那会让移动类
+// 规则把没选中的目录整卷搬走。回归：先仅标记 DCIM，再写入损坏的标记，执行移动类
+// 规则必须失败，未选中的内容保持原样，也不能启动整卷 rsync。每例独立临时目录。
 func TestRunAutoBackupJobSkipsCorruptMark(t *testing.T) {
 	if _, err := exec.LookPath("rsync"); err != nil {
 		t.Skip("rsync 未安装，跳过打标损坏端到端测试")
 	}
-	root := t.TempDir()
-	backupWrite(t, filepath.Join(root, "proc", "mounts"),
-		"/dev/sdb2 / ext4 rw 0 0\n/dev/sdc1 /media/usb0 vfat rw 0 0\n")
-	backupWrite(t, filepath.Join(root, "sys", "block", "sdc", "removable"), "1\n")
-	if err := os.MkdirAll(filepath.Join(root, "media", "usb0", "DCIM"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	backupWrite(t, filepath.Join(root, "media", "usb0", "DCIM", "p1.jpg"), "photo-1")
-	// 未选中的目录与卷根文件：损坏回退成「整块卷」时它们会被搬走，必须保持原样。
-	if err := os.MkdirAll(filepath.Join(root, "media", "usb0", "私有"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	backupWrite(t, filepath.Join(root, "media", "usb0", "私有", "n.txt"), "keep")
-	backupWrite(t, filepath.Join(root, "media", "usb0", "说明.txt"), "keep-root")
-	if err := os.MkdirAll(filepath.Join(root, "vol1", "1000", "导入"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	manager := &Manager{Root: root, ConfigPath: filepath.Join(root, "config.json")}
-	if err := manager.saveConfigLocked(DefaultConfig(Profile{})); err != nil {
-		t.Fatalf("准备配置失败: %v", err)
-	}
-	if _, _, err := manager.AddAutoBackupSub("/media/usb0/DCIM"); err != nil {
-		t.Fatalf("打标失败: %v", err)
-	}
-
 	cases := map[string]string{
 		// 截断的 JSON：无法解析。
 		"截断JSON": `{"alias":"相机","subs":["DCIM"`,
 		// 合法 JSON 但子目录全部非法：无法确认备份范围。
 		"全非法子目录": `{"alias":"相机","subs":["../etc",".."]}`,
+		// JSON null：Unmarshal 到结构体不报错、留下零值，空 Subs 会被当成整卷。
+		"null标记": `null`,
+		// 点目录清理后等于卷根：同样会把打标范围悄悄放大成整卷。
+		"点目录": `{"alias":"相机","subs":["."]}`,
 	}
 	for name, payload := range cases {
 		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			backupWrite(t, filepath.Join(root, "proc", "mounts"),
+				"/dev/sdb2 / ext4 rw 0 0\n/dev/sdc1 /media/usb0 vfat rw 0 0\n")
+			backupWrite(t, filepath.Join(root, "sys", "block", "sdc", "removable"), "1\n")
+			if err := os.MkdirAll(filepath.Join(root, "media", "usb0", "DCIM"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			backupWrite(t, filepath.Join(root, "media", "usb0", "DCIM", "p1.jpg"), "photo-1")
+			// 未选中的目录与卷根文件：损坏回退成「整块卷」时它们会被搬走，必须保持原样。
+			if err := os.MkdirAll(filepath.Join(root, "media", "usb0", "私有"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			backupWrite(t, filepath.Join(root, "media", "usb0", "私有", "n.txt"), "keep")
+			backupWrite(t, filepath.Join(root, "media", "usb0", "说明.txt"), "keep-root")
+			if err := os.MkdirAll(filepath.Join(root, "vol1", "1000", "导入"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			manager := &Manager{Root: root, ConfigPath: filepath.Join(root, "config.json")}
+			if err := manager.saveConfigLocked(DefaultConfig(Profile{})); err != nil {
+				t.Fatalf("准备配置失败: %v", err)
+			}
+			if _, _, err := manager.AddAutoBackupSub("/media/usb0/DCIM"); err != nil {
+				t.Fatalf("打标失败: %v", err)
+			}
+
 			backupWrite(t, filepath.Join(root, "media", "usb0", BackupAutoMarkerDirName, BackupAutoMarkerFileName), payload)
 			rule := GPIOAutoBackup{
 				ID: "dump", Name: "相机导入", Direction: BackupDirectionFromVolume,
@@ -546,5 +550,54 @@ func TestAutoBackupUnifiedPruneKeepsFailedVolumeSnapshots(t *testing.T) {
 	}
 	if result.Pruned != 0 {
 		t.Fatalf("不应清理任何快照: %+v", result)
+	}
+}
+
+// 全部卷都因坏标记被跳过的批次：本轮没有生成任何新快照、没有传入任何数据，
+// 统一清理绝不能按 Keep 删旧快照——否则两块坏盘会把前次保留下来的旧快照白白
+// 清掉（move_archive 下源文件早已删除，旧快照可能就是唯一副本）。
+func TestAutoBackupAllCorruptBatchNeverPrunesOldSnapshots(t *testing.T) {
+	root := t.TempDir()
+	backupWrite(t, filepath.Join(root, "proc", "mounts"),
+		"/dev/sdb2 / ext4 rw 0 0\n/dev/sdc1 /media/usb0 vfat rw 0 0\n/dev/sdd1 /media/usb1 vfat rw 0 0\n")
+	backupWrite(t, filepath.Join(root, "sys", "block", "sdc", "removable"), "1\n")
+	backupWrite(t, filepath.Join(root, "sys", "block", "sdd", "removable"), "1\n")
+	for _, mount := range []string{"usb0", "usb1"} {
+		if err := os.MkdirAll(filepath.Join(root, "media", mount), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// 两块盘的打标标记都损坏（null 不是有效的打标对象）。
+		backupWrite(t, filepath.Join(root, "media", mount, BackupAutoMarkerDirName, BackupAutoMarkerFileName), `null`)
+	}
+	// 前次运行留下的两份旧快照，各有文件；Keep=1 时若误清理会删掉其中一份。
+	target := filepath.Join(root, "vol1", "1000", "导入")
+	snapshots := []string{"2026-10-19_120000", "2026-10-20_120000"}
+	for _, snapshot := range snapshots {
+		dir := filepath.Join(target, snapshot)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "old.txt"), []byte("keep"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	manager := &Manager{Root: root}
+	rule := GPIOAutoBackup{
+		ID: "dump", Name: "相机导入", Direction: BackupDirectionFromVolume,
+		Fixed: BackupLocation{Kind: "path", Path: "/vol1/1000/导入"},
+		Mode:  BackupModeMoveArchive, Keep: 1,
+	}
+	result, err := manager.RunAutoBackupJob(context.Background(), rule, false)
+	if err == nil || !strings.Contains(err.Error(), "打标标记损坏") {
+		t.Fatalf("坏标记批次必须报标记错误: %v", err)
+	}
+	if result.Pruned != 0 {
+		t.Fatalf("没有新快照的失败批次不得清理任何旧快照: %+v", result)
+	}
+	for _, snapshot := range snapshots {
+		if _, serr := os.Stat(filepath.Join(target, snapshot, "old.txt")); serr != nil {
+			t.Fatalf("旧快照及文件必须完整保留 %s: %v", snapshot, serr)
+		}
 	}
 }

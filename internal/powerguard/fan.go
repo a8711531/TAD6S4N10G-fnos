@@ -478,7 +478,6 @@ func (m *Manager) fanSpinUpGraceLocked() bool {
 var errNoUsableFan = errors.New("所有选中的风扇都读不到转速（可能未接风扇或接口被反插），请检查接线后重新选择")
 
 func (m *Manager) validateFanLocked(cfg *FanConfig) error {
-	m.noteOffModeStateLocked(cfg.OffMode)
 	if cfg.MinPWMPercent < 30 || cfg.MinPWMPercent > 100 {
 		return errors.New("fan min_pwm_percent must be between 30 and 100")
 	}
@@ -518,6 +517,12 @@ func (m *Manager) validateFanLocked(cfg *FanConfig) error {
 	for _, fan := range fans {
 		available[fan.ID] = fan
 	}
+	// 起转宽限只依据「已接受并实际生效」的关停状态，待校验的配置不得修改运行
+	// 状态（被拒绝的配置不能留下假的关停转换）：fanSpinUpGraceLocked 覆盖退出
+	// 关停后的 30 秒窗口；(m.fanOffWasActive && !cfg.OffMode) 覆盖「当前生效的是
+	// 关停档、本次保存要切回普通档」这一跳——此刻风扇必然还是 0 转，不能判死。
+	// 真正的关停转换记录只发生在 applyFanLocked。
+	grace := m.fanSpinUpGraceLocked() || (m.fanOffWasActive && !cfg.OffMode)
 	var dead []string
 	for id := range selected {
 		fan, ok := available[id]
@@ -531,7 +536,7 @@ func (m *Manager) validateFanLocked(cfg *FanConfig) error {
 		}
 		// 刚退出关停档的风扇从 0 转自然起转需要几秒到几十秒，宽限期内读到的
 		// 0 转速不算「通道接不到风扇」；宽限期过后仍然 0 转才按故障处理。
-		if fan.RPM <= 0 && !m.fanSpinUpGraceLocked() {
+		if fan.RPM <= 0 && !grace {
 			dead = append(dead, id)
 		}
 	}

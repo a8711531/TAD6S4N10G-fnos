@@ -379,6 +379,11 @@ func validateAutoBackupSub(sub string) error {
 	if strings.Contains(slash, "..") {
 		return errors.New("不能包含 ..")
 	}
+	// 清理后等于卷根的路径（"."、"./"）等于没选子目录：上层会把它当「整块卷」
+	// 处理，移动/删除类规则于是把没选中的内容一起搬走，必须拒绝。
+	if filepath.ToSlash(filepath.Clean(slash)) == "." {
+		return errors.New("不能指向卷根本身")
+	}
 	return nil
 }
 
@@ -401,21 +406,26 @@ func normalizeAutoBackupSubs(subs []string) []string {
 	return out
 }
 
-// parseAutoBackupMark 解析打标 JSON 并校验子目录。JSON 损坏（截断/乱写）、或写明的
-// 子目录全部非法时返回错误：此时无法知道用户到底标记了哪些子目录，把错误折叠成
-// 「已打标、整块卷」会让移动/删除类规则把没选中的目录整卷搬走，必须让上层
-// fail-closed（跳过该卷并明确报错）。
+// parseAutoBackupMark 解析打标 JSON 并校验子目录。JSON 损坏（截断/乱写）、内容不是
+// 打标对象（null 等）、或写明的子目录全部非法时返回错误：此时无法知道用户到底标记了
+// 哪些子目录，把错误折叠成「已打标、整块卷」会让移动/删除类规则把没选中的目录整卷
+// 搬走，必须让上层 fail-closed（跳过该卷并明确报错）。
 func parseAutoBackupMark(data []byte) (AutoBackupMark, error) {
-	var mark AutoBackupMark
+	// 必须用指针接：json.Unmarshal 把 JSON null 解到结构体时不报错、留下零值，
+	// 空 Subs 会被上层当成「整块卷」。null 不是有效的打标对象，拒绝。
+	var mark *AutoBackupMark
 	if err := json.Unmarshal(data, &mark); err != nil {
 		return AutoBackupMark{}, fmt.Errorf("打标标记损坏，无法解析（%v），请重新打标", err)
+	}
+	if mark == nil {
+		return AutoBackupMark{}, errors.New("打标标记损坏（内容为 null，不是有效的打标对象），请重新打标")
 	}
 	rawSubs := mark.Subs
 	mark.Subs = normalizeAutoBackupSubs(mark.Subs)
 	if len(rawSubs) > 0 && len(mark.Subs) == 0 {
 		return AutoBackupMark{}, errors.New("打标标记里的子目录全部无效，无法确认备份范围，请重新打标")
 	}
-	return mark, nil
+	return *mark, nil
 }
 
 // readAutoBackupMark 读取卷上的打标标记，返回标记内容、是否已打标、是否为旧位置
@@ -1135,7 +1145,9 @@ func (m *Manager) RunAutoBackupJob(ctx context.Context, rule GPIOAutoBackup, dry
 	}
 	// 多块卷共用 NAS 目标时的统一清理：保留份数不小于本次新生成的快照数，
 	// 否则 Keep 比卷数小时会把本次刚生成的快照也清掉。试跑不删任何东西。
-	if deferPrune && !dryRun && sharedTargetRoot != "" && rule.Keep > 0 {
+	// 例外：本批次一块卷都没生成新快照且存在失败（例如全部因打标损坏被跳过）
+	// 时禁止清理——本轮没有传入任何数据，按 Keep 清理只会白白删掉旧快照。
+	if deferPrune && !dryRun && sharedTargetRoot != "" && rule.Keep > 0 && !(len(newSnapshots) == 0 && len(failures) > 0) {
 		keep := rule.Keep
 		if len(newSnapshots) > keep {
 			keep = len(newSnapshots)

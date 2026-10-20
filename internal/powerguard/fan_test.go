@@ -1449,3 +1449,71 @@ func TestZeroRPMRejectedAfterSpinUpGraceExpires(t *testing.T) {
 		t.Fatal("宽限期过后保存应报错（全部剔除后无可用风扇）")
 	}
 }
+
+// 被拒绝的关停配置不得留下假的关停状态：校验在任何运行状态修改之前完成，
+// 保存失败时 fanOffWasActive / fanOffExitedAt 都必须保持原样——否则下一轮普通
+// 模式会误以为「刚退出关停」而开启 30 秒起转宽限，把真正的 0 转通道当成起转中
+// 的风扇重新下发曲线目标，故障风扇就此被豁免。
+func TestRejectedOffModeConfigLeavesNoPhantomTransition(t *testing.T) {
+	manager := newFanDebugTestManager(t)
+	hwmon := filepath.Join(manager.Root, "sys", "class", "hwmon", "hwmon3")
+	pwm1 := filepath.Join(hwmon, "pwm1")
+	fan1 := filepath.Join(hwmon, "fan1_input")
+
+	// 先保存一份正常配置：fan1 受曲线控制（45°C → 47%）。
+	base := DefaultFanConfig()
+	base.Enabled = true
+	base.CPUFanIDs = []string{"it8613:hwmon3:fan1"}
+	if err := manager.SaveFanConfig(base); err != nil {
+		t.Fatalf("save base: %v", err)
+	}
+
+	// 提交无效配置（关停档 + 非法 MinPWMPercent=29）：保存必须失败，
+	// 且不得留下「关停档曾生效」的假状态。
+	bad := DefaultFanConfig()
+	bad.Enabled = true
+	bad.OffMode = true
+	bad.MinPWMPercent = 29
+	bad.CPUFanIDs = []string{"it8613:hwmon3:fan1"}
+	if err := manager.SaveFanConfig(bad); err == nil {
+		t.Fatal("MinPWMPercent=29 的关停配置必须被拒绝")
+	}
+	manager.mu.Lock()
+	wasActive := manager.fanOffWasActive
+	exitedAt := manager.fanOffExitedAt
+	manager.mu.Unlock()
+	if wasActive {
+		t.Fatal("被拒绝的关停配置不得把 fanOffWasActive 置为 true")
+	}
+	if !exitedAt.IsZero() {
+		t.Fatalf("被拒绝的关停配置不得留下关停退出时刻: %v", exitedAt)
+	}
+	// 磁盘上的配置也仍是旧的正常配置（关停档未生效、未落盘）。
+	manager.mu.Lock()
+	onDisk, err := manager.loadConfigLocked()
+	manager.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if onDisk.Fan.OffMode || onDisk.Fan.MinPWMPercent != base.MinPWMPercent {
+		t.Fatalf("被拒绝的配置不得落盘: %+v", onDisk.Fan)
+	}
+
+	// 风扇此刻 0 转：不存在假的关停宽限时它按故障处理（保存校验剔除 / 运行时
+	// 跳过），周期性下发绝不能把它当成「起转中」重新下发曲线目标。先把 pwm1
+	// 拨成一个曲线算不出来的值，真假宽限一试便知。
+	writeTestValue(t, fan1, "0")
+	writeTestValue(t, pwm1, "30")
+	if err := manager.ApplyFanCurrent(); err != nil {
+		t.Fatalf("0 转风扇应被跳过而非报错: %v", err)
+	}
+	if got, _ := readInt(pwm1); got != 30 {
+		t.Fatalf("0 转风扇应被跳过，pwm1 从 30 被改写为 %d（假的关停宽限让它被当成起转中的风扇）", got)
+	}
+	manager.mu.Lock()
+	exitedAt = manager.fanOffExitedAt
+	manager.mu.Unlock()
+	if !exitedAt.IsZero() {
+		t.Fatalf("宽限状态不得因被拒绝的配置而改变: %v", exitedAt)
+	}
+}
