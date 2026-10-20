@@ -161,6 +161,21 @@ func TestRefreshSDCardReportsNewlyReadMedium(t *testing.T) {
 	}
 }
 
+// 读卡器重新识别成功但没读到介质时摘要必须留空：界面上不再跟着念一句
+// 「没有读到存储介质，如果卡没插好请插好后重试」。
+func TestSdcardSummaryIsSilentWithoutMedium(t *testing.T) {
+	if got := sdcardSummary(SdcardRefreshResult{Devices: []string{"2-1.4"}}); got != "" {
+		t.Fatalf("没读到介质时不应产生提示，实际 %q", got)
+	}
+	got := sdcardSummary(SdcardRefreshResult{
+		Devices:    []string{"2-1.4"},
+		NewDevices: []string{"sdc（59.5 GiB）"},
+	})
+	if !strings.Contains(got, "识别到设备") {
+		t.Fatalf("读到介质时仍要如实报结果，实际 %q", got)
+	}
+}
+
 // 写 /sys 失败（例如权限不足）必须如实报错，不能混成「跳过」而让界面显示成功。
 func TestRefreshSDCardFailsWhenSysfsNotWritable(t *testing.T) {
 	fastSDCardWaits(t)
@@ -241,8 +256,10 @@ func TestStartRefreshSDCardRunsToCompletion(t *testing.T) {
 	if lastErr != "" {
 		t.Fatalf("后台刷新不该失败，实际 %q", lastErr)
 	}
-	if summary == "" {
-		t.Fatal("成功后应当写进摘要")
+	// 读卡器里没插卡，摘要按设计留空（界面不再念「没有读到存储介质…」）；
+	// 后台刷新真的执行过这件事由下面的 authorized 断言证明。
+	if summary != "" {
+		t.Fatalf("没读到介质时摘要应当留空，实际 %q", summary)
 	}
 	if got := sdcardRead(t, root, "sys/bus/usb/devices/2-1.4/authorized"); got != "1" {
 		t.Fatalf("读卡器应被重新授权，实际 %q", got)
@@ -366,7 +383,8 @@ func TestSDCardHelpers(t *testing.T) {
 	}
 }
 
-// 界面上那个「刷新 SD 卡」按钮走的就是这个接口：应返回 200 与可读摘要。
+// 界面上那个「刷新 SD 卡」按钮走的就是这个接口：应返回 200 与重识别结果；
+// 读卡器里没有介质时摘要为空串（前端保持静默，不弹「请插好卡」）。
 func TestHandleRefreshSDCardReturnsSummary(t *testing.T) {
 	fastSDCardWaits(t)
 
@@ -392,8 +410,11 @@ func TestHandleRefreshSDCardReturnsSummary(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &result); err != nil {
 		t.Fatal(err)
 	}
-	if result.Summary == "" || len(result.Devices) != 1 || result.ScannedHosts != 1 {
+	if len(result.Devices) != 1 || result.ScannedHosts != 1 {
 		t.Fatalf("结果不正确: %+v", result)
+	}
+	if result.Summary != "" {
+		t.Fatalf("没读到介质时不应返回提示文案，实际 %q", result.Summary)
 	}
 }
 

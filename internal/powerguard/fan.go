@@ -22,20 +22,23 @@ type FanPoint struct {
 }
 
 type FanConfig struct {
-	Enabled        bool       `json:"enabled"`
-	DeviceID       string     `json:"device_id,omitempty"`
-	CPUFanIDs      []string   `json:"cpu_fan_ids"`
-	HDDFanIDs      []string   `json:"hdd_fan_ids"`
-	NVMeFanIDs     []string   `json:"nvme_fan_ids"`
-	MinPWMPercent  int        `json:"min_pwm_percent"`
-	EmergencyTempC float64    `json:"emergency_temp_c"`
-	PollSeconds    int        `json:"poll_seconds"`
-	Curve          []FanPoint `json:"curve"`
-	DiskCurve      []FanPoint `json:"disk_curve,omitempty"`
-	HDDCurve       []FanPoint `json:"hdd_curve"`
-	NVMeCurve      []FanPoint `json:"nvme_curve"`
-	HDDSlotIDs     []string   `json:"hdd_slot_ids"`
-	NVMeSlotIDs    []string   `json:"nvme_slot_ids"`
+	Enabled        bool     `json:"enabled"`
+	DeviceID       string   `json:"device_id,omitempty"`
+	CPUFanIDs      []string `json:"cpu_fan_ids"`
+	HDDFanIDs      []string `json:"hdd_fan_ids"`
+	NVMeFanIDs     []string `json:"nvme_fan_ids"`
+	MinPWMPercent  int      `json:"min_pwm_percent"`
+	EmergencyTempC float64  `json:"emergency_temp_c"`
+	PollSeconds    int      `json:"poll_seconds"`
+	// OffMode 是「关停」档：绑定风扇一律写 0%，优先级高于最低转速与曲线数值，
+	// 只让位于紧急温度的满速兜底（防烧硬件）。曲线本身保持原样，便于随时退出。
+	OffMode     bool       `json:"off_mode,omitempty"`
+	Curve       []FanPoint `json:"curve"`
+	DiskCurve   []FanPoint `json:"disk_curve,omitempty"`
+	HDDCurve    []FanPoint `json:"hdd_curve"`
+	NVMeCurve   []FanPoint `json:"nvme_curve"`
+	HDDSlotIDs  []string   `json:"hdd_slot_ids"`
+	NVMeSlotIDs []string   `json:"nvme_slot_ids"`
 }
 
 type FanDevice struct {
@@ -66,6 +69,7 @@ type FanControlStatus struct {
 	Available            bool        `json:"available"`
 	DriverDetected       bool        `json:"driver_detected"`
 	Active               bool        `json:"active"`
+	OffMode              bool        `json:"off_mode,omitempty"`
 	TemperatureC         float64     `json:"temperature_c,omitempty"`
 	CPUTemperatureC      float64     `json:"cpu_temperature_c,omitempty"`
 	DiskTemperatureC     float64     `json:"disk_temperature_c,omitempty"`
@@ -98,21 +102,95 @@ type originalFanState struct {
 // 校验下限仍是 30（硬性防停转），这里只是新建配置时的默认档。
 const defaultMinPWMPercent = 40
 
+// builtinFanCurves 是系统集成的三档曲线参数（静音 / 平衡 / 性能），
+// 与前端 app.js 的 CURVE_PRESETS 数值一一对应，改一边必须同步另一边。
+// 出厂默认取「平衡」这一档。
+var builtinFanCurves = map[string]struct {
+	CPU  []FanPoint
+	HDD  []FanPoint
+	NVMe []FanPoint
+}{
+	"quiet": {
+		CPU: []FanPoint{
+			{TempC: 20, PWMPercent: 40}, {TempC: 42, PWMPercent: 40},
+			{TempC: 44, PWMPercent: 43}, {TempC: 60, PWMPercent: 43},
+			{TempC: 70, PWMPercent: 50}, {TempC: 75, PWMPercent: 60},
+			{TempC: 80, PWMPercent: 80}, {TempC: 85, PWMPercent: 100},
+		},
+		HDD: []FanPoint{
+			{TempC: 20, PWMPercent: 40}, {TempC: 30, PWMPercent: 40},
+			{TempC: 35, PWMPercent: 43}, {TempC: 45, PWMPercent: 43},
+			{TempC: 50, PWMPercent: 55}, {TempC: 52, PWMPercent: 70},
+			{TempC: 55, PWMPercent: 80}, {TempC: 60, PWMPercent: 90},
+		},
+		NVMe: []FanPoint{
+			{TempC: 20, PWMPercent: 40}, {TempC: 45, PWMPercent: 40},
+			{TempC: 55, PWMPercent: 55}, {TempC: 60, PWMPercent: 60},
+		},
+	},
+	"balanced": {
+		CPU: []FanPoint{
+			{TempC: 20, PWMPercent: 40}, {TempC: 42, PWMPercent: 40},
+			{TempC: 44, PWMPercent: 47}, {TempC: 60, PWMPercent: 47},
+			{TempC: 70, PWMPercent: 55}, {TempC: 75, PWMPercent: 65},
+			{TempC: 80, PWMPercent: 85}, {TempC: 85, PWMPercent: 100},
+		},
+		HDD: []FanPoint{
+			{TempC: 20, PWMPercent: 40}, {TempC: 30, PWMPercent: 40},
+			{TempC: 35, PWMPercent: 47}, {TempC: 45, PWMPercent: 47},
+			{TempC: 50, PWMPercent: 60}, {TempC: 52, PWMPercent: 75},
+			{TempC: 55, PWMPercent: 80}, {TempC: 60, PWMPercent: 100},
+		},
+		NVMe: []FanPoint{
+			{TempC: 20, PWMPercent: 40}, {TempC: 45, PWMPercent: 40},
+			{TempC: 55, PWMPercent: 60}, {TempC: 60, PWMPercent: 70},
+		},
+	},
+	"performance": {
+		CPU: []FanPoint{
+			{TempC: 20, PWMPercent: 47}, {TempC: 45, PWMPercent: 47},
+			{TempC: 50, PWMPercent: 60}, {TempC: 55, PWMPercent: 70},
+			{TempC: 60, PWMPercent: 85}, {TempC: 85, PWMPercent: 100},
+		},
+		HDD: []FanPoint{
+			{TempC: 20, PWMPercent: 40}, {TempC: 30, PWMPercent: 40},
+			{TempC: 35, PWMPercent: 47}, {TempC: 40, PWMPercent: 50},
+			{TempC: 50, PWMPercent: 65}, {TempC: 52, PWMPercent: 80},
+			{TempC: 55, PWMPercent: 90}, {TempC: 60, PWMPercent: 100},
+		},
+		NVMe: []FanPoint{
+			{TempC: 20, PWMPercent: 40}, {TempC: 45, PWMPercent: 40},
+			{TempC: 55, PWMPercent: 65}, {TempC: 60, PWMPercent: 75},
+		},
+	},
+}
+
+// clampCurvePWM 把一条曲线的转速整体抬到最低转速以上（校验下限 30 是硬性的）。
+// 只抬高不降低，因此曲线的单调不减仍然成立。
+func clampCurvePWM(points []FanPoint, minimum int) []FanPoint {
+	minimum = max(30, min(minimum, 100))
+	out := make([]FanPoint, len(points))
+	for i, point := range points {
+		pwm := point.PWMPercent
+		if pwm < minimum {
+			pwm = minimum
+		}
+		out[i] = FanPoint{TempC: point.TempC, PWMPercent: pwm}
+	}
+	return out
+}
+
 func DefaultFanConfig() FanConfig {
+	balanced := builtinFanCurves["balanced"]
 	config := FanConfig{
 		Enabled:        false,
 		MinPWMPercent:  defaultMinPWMPercent,
 		EmergencyTempC: 85,
 		PollSeconds:    2,
-		Curve: []FanPoint{
-			{TempC: 40, PWMPercent: defaultMinPWMPercent},
-			{TempC: 55, PWMPercent: 70},
-			{TempC: 70, PWMPercent: 85},
-			{TempC: 80, PWMPercent: 100},
-		},
 	}
-	config.HDDCurve = defaultStorageFanCurve(config.MinPWMPercent)
-	config.NVMeCurve = defaultStorageFanCurve(config.MinPWMPercent)
+	config.Curve = clampCurvePWM(balanced.CPU, config.MinPWMPercent)
+	config.HDDCurve = clampCurvePWM(balanced.HDD, config.MinPWMPercent)
+	config.NVMeCurve = clampCurvePWM(balanced.NVMe, config.MinPWMPercent)
 	config.HDDSlotIDs = storageSlotIDs("front")
 	config.NVMeSlotIDs = storageSlotIDs("m2")
 	return config
@@ -128,13 +206,9 @@ func storageSlotIDs(kind string) []string {
 	return ids
 }
 
+// defaultStorageFanCurve 是硬盘类曲线的出厂默认（平衡档），按最低转速收口。
 func defaultStorageFanCurve(minimum int) []FanPoint {
-	minimum = max(30, min(minimum, 100))
-	return []FanPoint{
-		{TempC: 25, PWMPercent: minimum},
-		{TempC: 35, PWMPercent: max(minimum, 85)},
-		{TempC: 50, PWMPercent: 100},
-	}
+	return clampCurvePWM(builtinFanCurves["balanced"].HDD, minimum)
 }
 
 // 0.10.36 及以前的出厂默认（最低转速 60%、三条曲线都从 60% 起）。
@@ -309,6 +383,15 @@ func normalizeConfig(cfg *Config) bool {
 			}
 		}
 	}
+	if applyDefaultSensorNames(cfg) {
+		// 传感器显示名只补一次：把常见芯片默认名（主板PCB / BIOS虚拟温度 /
+		// CX-4 LX#1 等）写进配置，用户之后清空或改名都不再被覆盖。
+		changed = true
+	}
+	if applySensorNameRenames(cfg) {
+		// 0.10.46 之前固定下来的「PCB温度」跟着改名，免得老机器停在旧名字上。
+		changed = true
+	}
 	return changed
 }
 
@@ -354,6 +437,32 @@ func selectedFanSources(cfg FanConfig) map[string][]string {
 	return result
 }
 
+// noteFanSpinningLocked 记录这一轮读到转速反馈的通道。「当前 0 转」只说明这一刻
+// 停着（很可能是我们自己按关停档停住的），只有从来没读到过转速的通道才当作
+// 「接不到风扇、不可控」。
+func (m *Manager) noteFanSpinningLocked(fans []FanDevice) {
+	for _, fan := range fans {
+		if fan.RPM > 0 {
+			m.markFanLiveLocked(fan.ID)
+		}
+	}
+}
+
+// markFanLiveLocked 标记这个通道确实挂着风扇（读到过转速，或已被我们成功控制过）。
+func (m *Manager) markFanLiveLocked(id string) {
+	if id == "" {
+		return
+	}
+	if m.fanLiveRPM == nil {
+		m.fanLiveRPM = make(map[string]bool)
+	}
+	m.fanLiveRPM[id] = true
+}
+
+func (m *Manager) fanKnownLiveLocked(id string) bool {
+	return m.fanLiveRPM[id]
+}
+
 func (m *Manager) validateFanLocked(cfg FanConfig) error {
 	if cfg.MinPWMPercent < 30 || cfg.MinPWMPercent > 100 {
 		return errors.New("fan min_pwm_percent must be between 30 and 100")
@@ -364,13 +473,13 @@ func (m *Manager) validateFanLocked(cfg FanConfig) error {
 	if cfg.PollSeconds < 1 || cfg.PollSeconds > 10 {
 		return errors.New("fan poll_seconds must be between 1 and 10")
 	}
-	if err := validateFanCurve("CPU", cfg.Curve, cfg.MinPWMPercent, cfg.EmergencyTempC); err != nil {
+	if err := validateFanCurve("CPU", cfg.Curve, cfg.MinPWMPercent, cfg.EmergencyTempC, cfg.OffMode); err != nil {
 		return err
 	}
-	if err := validateFanCurve("HDD", cfg.HDDCurve, cfg.MinPWMPercent, cfg.EmergencyTempC); err != nil {
+	if err := validateFanCurve("HDD", cfg.HDDCurve, cfg.MinPWMPercent, cfg.EmergencyTempC, cfg.OffMode); err != nil {
 		return err
 	}
-	if err := validateFanCurve("NVMe", cfg.NVMeCurve, cfg.MinPWMPercent, cfg.EmergencyTempC); err != nil {
+	if err := validateFanCurve("NVMe", cfg.NVMeCurve, cfg.MinPWMPercent, cfg.EmergencyTempC, cfg.OffMode); err != nil {
 		return err
 	}
 	if err := validateFanSlotIDs("HDD", "front", cfg.HDDSlotIDs); err != nil {
@@ -390,6 +499,7 @@ func (m *Manager) validateFanLocked(cfg FanConfig) error {
 	if err != nil {
 		return err
 	}
+	m.noteFanSpinningLocked(fans)
 	available := make(map[string]FanDevice, len(fans))
 	for _, fan := range fans {
 		available[fan.ID] = fan
@@ -399,7 +509,15 @@ func (m *Manager) validateFanLocked(cfg FanConfig) error {
 		if !ok {
 			return fmt.Errorf("configured fan %s was not found", id)
 		}
-		if fan.RPM <= 0 {
+		// 关停档里风扇本来就该停转，0 转速是预期结果而不是故障：这里再判死会让
+		// 周期性应用走进 fail-safe 把风扇拉满，表现就是「关停之后隔一会儿又起转」。
+		if cfg.OffMode {
+			continue
+		}
+		// 刚刚被关停档停住的风扇此刻也是 0 转，但它上一秒还在转（见过转速反馈），
+		// 属于「我们把它停住的」而不是「通道接不到风扇」。这种情况必须放行，
+		// 否则切出关停时保存直接失败，风扇永远起不来。
+		if fan.RPM <= 0 && !m.fanKnownLiveLocked(fan.ID) {
 			return fmt.Errorf("fan %s reports no valid RPM and cannot be controlled safely", fan.ID)
 		}
 	}
@@ -426,9 +544,15 @@ func validateFanSlotIDs(name, kind string, ids []string) error {
 	return nil
 }
 
-func validateFanCurve(name string, curve []FanPoint, minimum int, emergencyTempC float64) error {
+// validateFanCurve 校验曲线形状。offMode 是「关停」档：此时曲线允许整条为 0%
+// 且不再受最低转速约束（关停的优先级就是要高于最低转速），其余规则照旧。
+func validateFanCurve(name string, curve []FanPoint, minimum int, emergencyTempC float64, offMode bool) error {
 	if len(curve) < 2 || len(curve) > 8 {
 		return fmt.Errorf("fan %s curve must contain between 2 and 8 points", name)
+	}
+	floor := minimum
+	if offMode {
+		floor = 0
 	}
 	previousTemp := -1.0
 	previousPWM := -1
@@ -439,7 +563,7 @@ func validateFanCurve(name string, curve []FanPoint, minimum int, emergencyTempC
 		if point.TempC <= previousTemp {
 			return fmt.Errorf("fan %s curve temperatures must be strictly increasing", name)
 		}
-		if point.PWMPercent < minimum || point.PWMPercent > 100 {
+		if point.PWMPercent < floor || point.PWMPercent > 100 {
 			return fmt.Errorf("fan %s curve point %d PWM must be between minimum PWM and 100", name, i+1)
 		}
 		if point.PWMPercent < previousPWM {
@@ -1107,6 +1231,7 @@ func (m *Manager) applyFanLocked(cfg FanConfig) error {
 	if err != nil {
 		return err
 	}
+	m.noteFanSpinningLocked(fans)
 	selected := selectedFanSources(cfg)
 	byID := make(map[string]FanDevice, len(fans))
 	for _, fan := range fans {
@@ -1149,7 +1274,23 @@ func (m *Manager) applyFanLocked(cfg FanConfig) error {
 		if _, taken := m.fanDebugTakenOver[id]; taken {
 			continue // 被调试接管:脱离曲线控制,由调试接口锁定转速
 		}
-		if fan.RPM <= 0 {
+		// 关停档：直接写 0%，不再看最低转速与曲线；只有紧急温度能翻盘到满速。
+		if cfg.OffMode {
+			target := 0
+			if emergency {
+				target = 100
+			}
+			if err := setFanPWM(fan, target); err != nil {
+				errs = append(errs, fmt.Errorf("set fan %s to %d%%: %w", id, target, err))
+				continue
+			}
+			// 这个通道是被我们主动停住的（关停档），记成「有风扇」，切出关停时
+			// 才不会被 0 转卡住。
+			m.markFanLiveLocked(id)
+			lastTarget = max(lastTarget, target)
+			continue
+		}
+		if fan.RPM <= 0 && !m.fanKnownLiveLocked(id) {
 			errs = append(errs, fmt.Errorf("fan %s reports no valid RPM", id), setFanPWM(fan, 100))
 			continue
 		}
@@ -1273,6 +1414,15 @@ func interpolatePWMPercent(points []FanPoint, tempC float64, minimum int, emerge
 }
 
 func fanTargets(cfg FanConfig, cpuTemperature, hddTemperature float64, hddAvailable bool, nvmeTemperature float64, nvmeAvailable bool) (int, int, int, int) {
+	if cfg.OffMode {
+		// 关停档整条曲线写 0%，只有紧急温度会翻成满速
+		if cpuTemperature >= cfg.EmergencyTempC ||
+			(hddAvailable && hddTemperature >= cfg.EmergencyTempC) ||
+			(nvmeAvailable && nvmeTemperature >= cfg.EmergencyTempC) {
+			return 100, 100, 100, 100
+		}
+		return 0, 0, 0, 0
+	}
 	cpuTarget := interpolatePWMPercent(cfg.Curve, cpuTemperature, cfg.MinPWMPercent, cfg.EmergencyTempC)
 	hddTarget := 0
 	if hddAvailable {
@@ -1463,6 +1613,7 @@ func (m *Manager) fanStatusLocked(cfg FanConfig) FanControlStatus {
 	result := FanControlStatus{
 		Active:           cfg.Enabled,
 		DriverDetected:   m.IT87DriverDetected(),
+		OffMode:          cfg.OffMode,
 		LastApply:        m.fanLastApply,
 		LastError:        m.fanLastError,
 		TargetPWMPercent: m.fanLastTarget,
@@ -1513,6 +1664,23 @@ func (m *Manager) fanStatusLocked(cfg FanConfig) FanControlStatus {
 		}
 	}
 	result.DiskTemperatureC = max(result.HDDTemperatureC, result.NVMeTemperatureC)
+	if cfg.OffMode {
+		// 关停档实际下发就是 0%（只有紧急温度会翻成满速）。别用「曲线 + 最低转速」
+		// 算出来的 40% 当目标，否则界面显示 40% 而风扇其实停着，两边互相打架。
+		target := 0
+		if result.CPUTemperatureC >= cfg.EmergencyTempC ||
+			(result.HDDTemperatureC > 0 && result.HDDTemperatureC >= cfg.EmergencyTempC) ||
+			(result.NVMeTemperatureC > 0 && result.NVMeTemperatureC >= cfg.EmergencyTempC) {
+			target = 100
+		}
+		result.CPUTargetPWMPercent = target
+		result.HDDTargetPWMPercent = target
+		result.NVMeTargetPWMPercent = target
+		result.DiskTargetPWMPercent = target
+		result.TargetPWMPercent = target
+		result.ControlSource = ""
+		return result
+	}
 	result.DiskTargetPWMPercent = max(result.HDDTargetPWMPercent, result.NVMeTargetPWMPercent)
 	result.TargetPWMPercent = max(result.CPUTargetPWMPercent, result.HDDTargetPWMPercent, result.NVMeTargetPWMPercent)
 	result.ControlSource = fanControlSource(result.CPUTargetPWMPercent, result.HDDTargetPWMPercent, result.NVMeTargetPWMPercent)

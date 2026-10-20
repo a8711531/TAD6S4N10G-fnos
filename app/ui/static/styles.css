@@ -811,6 +811,105 @@ button.storage-chip {
 .storage-chip.is-action { cursor: pointer; }
 .storage-chip.is-action:hover { filter: brightness(.97); }
 .storage-visual-slot.is-action { cursor: pointer; }
+
+/* 移动设备（SD 卡 / U 盘）：标题与按钮一行，图标排在下一行、一行两个，
+   第三个起自动换行——比三行卡片矮，又能把设备名写全 */
+.storage-mobile {
+  margin-top: 6px;
+  min-width: 0;
+}
+
+.storage-mobile-head {
+  display: flex;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 24px;
+}
+
+.storage-mobile-head h3 {
+  flex: none;
+  margin: 0;
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: .02em;
+  white-space: nowrap;
+}
+
+.storage-mobile-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 2px 12px;
+  margin-top: 3px;
+  min-width: 0;
+}
+/* 没有设备时整行不占高度 */
+.storage-mobile-list:empty { display: none; }
+
+.storage-mobile-item {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  line-height: 1.5;
+}
+
+.storage-mobile-item .storage-mobile-icon { flex: none; width: 15px; height: 15px; }
+.storage-mobile-item.kind-sd .storage-mobile-icon { color: #1f8f6b; }
+.storage-mobile-item.kind-usb .storage-mobile-icon { color: #2f6fb5; }
+
+.storage-mobile-item span {
+  flex: none;
+  color: var(--text-secondary);
+  font-size: 11.5px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.storage-mobile-item small {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.storage-mobile-count {
+  flex: none;
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.storage-mobile-count:empty { display: none; }
+
+.storage-mobile-status {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 11px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.storage-mobile-status:empty { display: none; }
+.storage-mobile-status.error { color: var(--danger); }
+
+.storage-mobile-head button {
+  flex: none;
+  margin-left: auto;
+  height: 24px;
+  padding: 0 10px;
+  border-radius: 7px;
+  font-size: 11.5px;
+  line-height: 1;
+}
+
+[data-theme="dark"] .storage-mobile-item.kind-sd .storage-mobile-icon { color: #46c79b; }
+[data-theme="dark"] .storage-mobile-item.kind-usb .storage-mobile-icon { color: #7bb4ee; }
 .storage-col-health .storage-chip {
   max-width: 100%;
   overflow: hidden;
@@ -1016,9 +1115,9 @@ body.modal-open { overflow: hidden; }
 }
 .curve-tab:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
 
-/* 预设曲线模式（静音/平衡/性能）与「导出曲线参数」：与标签栏同一视觉语言，
-   三个胶囊按钮一组，导出按钮推到最右侧。窄屏整组换行。 */
-.curve-presets {
+/* 曲线模式按键：静音 / 平衡 / 性能 / 临时 / 全速 / 关停 / 手动 / 自定义 1–3。
+   十个按键同一套尺寸与圆角，当前生效的一档反色高亮；窄屏整组换行。 */
+.curve-modes {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -1026,63 +1125,76 @@ body.modal-open { overflow: hidden; }
   margin-top: 10px;
 }
 
-.curve-presets-label { color: var(--muted); font-size: 12px; font-weight: 700; }
+.curve-modes-label { color: var(--muted); font-size: 12px; font-weight: 700; }
 
-.curve-preset {
-  height: 28px;
+.curve-mode {
+  height: 30px;
+  min-width: 62px;
   padding: 0 14px;
   border: 1px solid var(--line-strong);
-  border-radius: 999px;
-  background: var(--surface);
-  color: var(--text-body);
-  font-size: 12px;
-  font-weight: 620;
-  cursor: pointer;
-}
-
-.curve-preset:hover { border-color: var(--primary); color: var(--primary); }
-.curve-preset:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
-
-.curve-presets-hint { color: var(--muted); font-size: 11px; }
-
-.curve-export { margin-left: auto; }
-
-/* 自定义曲线槽位：每槽 = 载入按钮 + 「存」「导」两个小按钮。
-   槽位有内容时载入按钮描边变主色，空槽位是普通样式。 */
-.curve-slots { margin-top: 8px; }
-
-.curve-slot { display: inline-flex; align-items: center; gap: 4px; }
-
-.curve-slot-load {
-  height: 28px;
-  padding: 0 12px;
-  border: 1px solid var(--line-strong);
   border-radius: 8px;
   background: var(--surface);
   color: var(--text-body);
   font-size: 12px;
   font-weight: 620;
   cursor: pointer;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.curve-slot-load:hover { border-color: var(--primary); color: var(--primary); }
-.curve-slot-load.filled { border-color: var(--primary); color: var(--primary); background: var(--primary-soft); }
-.curve-slot-load:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.curve-mode:hover { border-color: var(--primary); color: var(--primary); }
+.curve-mode:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.curve-mode:disabled { opacity: .55; cursor: not-allowed; }
 
-.curve-slot-mini {
-  height: 28px;
-  padding: 0 9px;
-  border: 1px solid var(--line-strong);
+/* 当前生效的那一档 */
+.curve-mode.active {
+  border-color: var(--primary);
+  background: var(--primary);
+  color: #fff;
+}
+
+.curve-mode.active:hover { color: #fff; }
+
+/* 自定义曲线操作弹窗：六个动作三列排开，应用占主色 */
+.curve-slot-dialog { gap: 10px; }
+.curve-slot-summary { color: var(--text-secondary); font-size: 12.5px; }
+.curve-slot-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.curve-slot-actions button { justify-self: stretch; height: 34px; font-size: 12.5px; }
+
+/* 弹窗底部：说明文字占左边，绿底「应用并保存风扇控制」贴最右边 */
+.curve-slot-foot {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.curve-slot-foot .curve-slot-hint { flex: 1 1 auto; margin: 0; min-width: 0; }
+
+/* 「应用并保存风扇控制」：绿底，和蓝色「应用到曲线」区分开，一眼看出会直接下发硬件 */
+.curve-slot-foot button.confirm-save {
+  flex: 0 0 auto;
+  height: 34px;
+  padding: 0 16px;
   border-radius: 8px;
-  background: var(--surface);
-  color: var(--text-secondary);
-  font-size: 12px;
-  font-weight: 620;
-  cursor: pointer;
+  border: 1px solid var(--success);
+  background: var(--success);
+  color: #fff;
+  font-weight: 700;
+  font-size: 12.5px;
 }
 
-.curve-slot-mini:hover { border-color: var(--primary); color: var(--primary); }
-.curve-slot-mini:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.curve-slot-foot button.confirm-save:hover { filter: brightness(.95); }
+.curve-slot-foot button.confirm-save:disabled { opacity: .55; filter: none; }
+.curve-slot-hint { color: var(--muted); font-size: 11.5px; line-height: 1.6; }
+
+@media (max-width: 420px) {
+  .curve-slot-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  /* 窄屏放不下一行：说明文字在上，绿底按钮整行铺满 */
+  .curve-slot-foot { flex-direction: column; align-items: stretch; }
+  .curve-slot-foot button.confirm-save { width: 100%; }
+}
 /* 卡片自身未设 display，hidden 属性默认即生效；显式写出防未来样式回归 */
 .curve-editor[hidden] { display: none; }
 
@@ -1534,15 +1646,6 @@ body.modal-open { overflow: hidden; }
 .curve-fan-option:focus-within {
   border-color: #8cb4ff;
   box-shadow: 0 0 0 3px rgba(52, 120, 246, .11);
-}
-
-#curve-help,
-#disk-curve-help,
-#nvme-curve-help {
-  margin: 8px 0 0;
-  color: var(--muted);
-  font-size: 12px;
-  line-height: 1.5;
 }
 
 .curve-notice { margin-top: 12px; }
@@ -2866,6 +2969,29 @@ button.danger {
 }
 
 .confirm-actions button { min-width: 88px; height: 32px; }
+.confirm-actions button[hidden] { display: none; }
+
+/* 弹出确认里的第三个动作：风扇模式弹窗用它表示「应用并保存风扇控制」。
+   绿底＝真的会写进硬件并落盘，跟蓝色的「只改界面」区别开。 */
+.confirm-actions button.confirm-secondary {
+  border-color: var(--success);
+  background: var(--success);
+  color: #fff;
+}
+
+.confirm-actions button.confirm-secondary:hover { border-color: var(--success); filter: brightness(.95); }
+
+/* 关停弹窗只剩这一个动作：红色，明确是破坏性操作 */
+.confirm-actions button.confirm-secondary.danger {
+  border-color: var(--danger);
+  background: var(--danger);
+}
+
+.confirm-actions button.confirm-secondary.danger:hover { border-color: var(--danger); filter: brightness(.94); }
+
+/* 暗色主题的 --success 是亮绿，白字压不住，换成深色字 */
+[data-theme="dark"] .confirm-actions button.confirm-secondary:not(.danger),
+[data-theme="dark"] .curve-slot-foot button.confirm-save { color: #0d1f17; }
 
 .confirm-actions button.danger {
   margin-left: 0;

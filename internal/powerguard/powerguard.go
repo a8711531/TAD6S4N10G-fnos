@@ -59,21 +59,27 @@ var profiles = []Profile{
 }
 
 type Config struct {
-	Enabled        bool                   `json:"enabled"`
-	PL1W           int64                  `json:"pl1_w"`
-	PL2W           int64                  `json:"pl2_w"`
-	ReapplySeconds int                    `json:"reapply_seconds"`
-	Fan            FanConfig              `json:"fan"`
-	GPIO           GPIOConfig             `json:"gpio"`
-	History        HistoryConfig          `json:"history"`                 // 历史温度：采样开关、数据库大小上限与保留天数
-	Log            LogConfig              `json:"log"`                     // 运行日志：大小上限（与历史数据库上限解耦）
-	SensorNames    map[string]string      `json:"sensor_names,omitempty"`  // 传感器显示名（键为 hwmon 芯片:标签）
-	SensorGroups   map[string]string      `json:"sensor_groups,omitempty"` // 传感器父类归属覆盖（键同上，值 gpu|nic|other；缺省按驱动表）
-	Serial         *SerialSensorConfig    `json:"serial,omitempty"`        // 旧版单设备串口配置：读入即迁移进 Serials 并置 nil（见 normalizeConfig）
-	Serials        []SerialSensorConfig   `json:"serials,omitempty"`       // USB 串口外置温度传感器（usb_serial.go：文本行源，多设备）
-	FanRPMBase     map[string]int         `json:"fan_rpm_base,omitempty"`  // 风扇满转基准（键为风扇 ID；全速运转时按实测自动标定，缺省 2000）
-	FanRPMMap      map[string]map[int]int `json:"fan_rpm_map,omitempty"`   // 风扇 PWM→转速特性表（键为风扇 ID,内层键为 16 步长 PWM 档位；稳态工况自动学习）
-	UIPrefs        UIPrefsConfig          `json:"ui_prefs"`                // 前端界面偏好（随 status 下发，独立小接口保存）
+	Enabled        bool              `json:"enabled"`
+	PL1W           int64             `json:"pl1_w"`
+	PL2W           int64             `json:"pl2_w"`
+	ReapplySeconds int               `json:"reapply_seconds"`
+	Fan            FanConfig         `json:"fan"`
+	GPIO           GPIOConfig        `json:"gpio"`
+	History        HistoryConfig     `json:"history"`                // 历史温度：采样开关、数据库大小上限与保留天数
+	Log            LogConfig         `json:"log"`                    // 运行日志：大小上限（与历史数据库上限解耦）
+	SensorNames    map[string]string `json:"sensor_names,omitempty"` // 传感器显示名（键为 hwmon 芯片:标签）
+	// SensorNameDefaultsApplied 记录内置默认显示名（主板PCB / 光模块1 …）是否
+	// 已补进 SensorNames：只补一次，用户之后清空或改名不再被覆盖。
+	SensorNameDefaultsApplied bool `json:"sensor_name_defaults_applied,omitempty"`
+	// SensorNamePCBRenamed 记录 0.10.46 的默认名调整（PCB温度/PCB → 主板PCB）是否做过：
+	// 只改仍停在旧默认名上的那一项，用户自己改过的名字不动。
+	SensorNamePCBRenamed bool                   `json:"sensor_name_pcb_renamed,omitempty"`
+	SensorGroups         map[string]string      `json:"sensor_groups,omitempty"` // 传感器父类归属覆盖（键同上，值 gpu|nic|other；缺省按驱动表）
+	Serial               *SerialSensorConfig    `json:"serial,omitempty"`        // 旧版单设备串口配置：读入即迁移进 Serials 并置 nil（见 normalizeConfig）
+	Serials              []SerialSensorConfig   `json:"serials,omitempty"`       // USB 串口外置温度传感器（usb_serial.go：文本行源，多设备）
+	FanRPMBase           map[string]int         `json:"fan_rpm_base,omitempty"`  // 风扇满转基准（键为风扇 ID；全速运转时按实测自动标定，缺省 2000）
+	FanRPMMap            map[string]map[int]int `json:"fan_rpm_map,omitempty"`   // 风扇 PWM→转速特性表（键为风扇 ID,内层键为 16 步长 PWM 档位；稳态工况自动学习）
+	UIPrefs              UIPrefsConfig          `json:"ui_prefs"`                // 前端界面偏好（随 status 下发，独立小接口保存）
 	// RemoteAliases 远程挂载的显示名（键为挂载点，如 /vol02/1000-1-xxx）。云盘友好名
 	// 尽力从挂载进程推断，拿不到就靠用户手动改名；见 backup.go 的 SetRemoteAlias。
 	RemoteAliases map[string]string `json:"remote_aliases,omitempty"`
@@ -229,6 +235,9 @@ type Manager struct {
 	fanLastError  string
 	fanLastTarget int
 	fanLastTemp   float64
+	// 运行期见过转速反馈（RPM>0）的通道。关停档会把风扇停成 0 转，此时不能拿
+	// 「当前 0 转」当「通道不可控」拒绝下发，否则切出关停后永远起不来。
+	fanLiveRPM map[string]bool
 
 	// 风扇调试模式（运行时状态，不落盘；重启即恢复曲线控制）
 	fanDebugTakenOver       map[string]int
@@ -780,6 +789,75 @@ func (m *Manager) Restore() error {
 	}
 	m.lastError = ""
 	return nil
+}
+
+// ReleaseFans 把风扇交还 BIOS 控制，功耗限制一概不动（卸载 / 重装专用）：
+// 先把配置里的风扇控制关掉并落盘（否则重装后服务一启动就重新接管），
+// 再按接管前存档的 PWM 与 pwm*_enable 模式写回硬件。配置读不出来时也照样
+// 尝试还硬件——交还控制权比保留配置重要。
+func (m *Manager) ReleaseFans() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var configErr error
+	cfg, err := m.loadConfigLocked()
+	switch {
+	case err == nil:
+		if cfg.Fan.Enabled {
+			cfg.Fan.Enabled = false
+			if saveErr := m.saveConfigLocked(cfg); saveErr != nil {
+				configErr = saveErr
+			}
+		}
+	case !errors.Is(err, fs.ErrNotExist):
+		configErr = err
+	}
+	restoreErr := m.restoreFansLocked()
+	err = errors.Join(configErr, restoreErr)
+	if err != nil {
+		m.lastError = err.Error()
+		return err
+	}
+	m.lastError = ""
+	return nil
+}
+
+// BindAllFansDefault 只在「全新安装」时调用：把三条曲线都绑到所有有转速反馈的
+// 风扇上并打开风扇控制，曲线参数用出厂默认（平衡档）。
+// 卸载重装时配置还在（Fan.Enabled=false），不会走到这里，所以不会抢回 BIOS 的控制权。
+func (m *Manager) BindAllFansDefault() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cfg, err := m.loadConfigLocked()
+	if err != nil {
+		return err
+	}
+	fans, err := m.DiscoverFans()
+	if err != nil {
+		return err
+	}
+	ids := make([]string, 0, len(fans))
+	for _, fan := range fans {
+		// 校验要求绑定的风扇必须有转速反馈，0 RPM 的通道绑上会直接报错
+		if fan.RPM > 0 {
+			ids = append(ids, fan.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return errors.New("没有检测到有转速反馈的风扇，风扇控制保持关闭")
+	}
+	cfg.Fan.CPUFanIDs = append([]string(nil), ids...)
+	cfg.Fan.HDDFanIDs = append([]string(nil), ids...)
+	cfg.Fan.NVMeFanIDs = append([]string(nil), ids...)
+	cfg.Fan.DeviceID = ids[0]
+	cfg.Fan.Enabled = true
+	// 只校验风扇段：这个命令不下发功耗限制，不该因为 RAPL 暂时读不到就整条失败
+	if err := m.validateFanLocked(cfg.Fan); err != nil {
+		return err
+	}
+	if err := m.saveConfigLocked(cfg); err != nil {
+		return err
+	}
+	return m.applyFanLocked(cfg.Fan)
 }
 
 func (m *Manager) DisableAndRestore() error {

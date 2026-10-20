@@ -4,6 +4,13 @@ set -eu
 mkdir -p "${TRIM_PKGETC}" "${TRIM_PKGVAR}"
 chmod 700 "${TRIM_PKGETC}" "${TRIM_PKGVAR}"
 
+# 全新安装（没有旧配置）才把三条曲线的默认绑定和开关补上；
+# 卸载后重装时配置还在（风扇控制已被释放为关闭），不能又把它打开。
+FRESH_INSTALL=0
+if [ ! -f "${TRIM_PKGETC}/config.json" ]; then
+  FRESH_INSTALL=1
+fi
+
 if ! "${TRIM_APPDEST}/bin/tad-module" init \
   --config "${TRIM_PKGETC}/config.json" \
   --state "${TRIM_PKGVAR}/original-state.json"; then
@@ -17,6 +24,17 @@ fi
 if ! it87_ensure; then
   echo "IT87 内置驱动未能就绪（常见原因：缺少 dkms/gcc/linux-headers）。功耗功能仍可用；风扇页会提示，修复工具链后重启本模块即可重试。" \
     >"${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+fi
+
+# 默认全启：三条曲线都绑到所有风扇上，曲线用平衡档。
+# 驱动刚起来时转速可能还没读到，失败只提示——用户可在风扇页手动开启。
+if [ "${FRESH_INSTALL}" = "1" ]; then
+  if ! "${TRIM_APPDEST}/bin/tad-module" bind-all-fans \
+    --config "${TRIM_PKGETC}/config.json" \
+    --state "${TRIM_PKGVAR}/original-state.json"; then
+    echo "未能自动绑定风扇（多为驱动刚加载、转速还没读上来）。请在风扇页勾选风扇并开启风扇曲线。" \
+      >"${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+  fi
 fi
 
 exit 0

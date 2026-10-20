@@ -67,6 +67,10 @@ type StorageStatus struct {
 	Slots     []StorageSlot `json:"slots"`
 	UpdatedAt time.Time     `json:"updated_at,omitempty"`
 	LastError string        `json:"last_error,omitempty"`
+	// Mobile 是当前插着的移动设备（U 盘 / SD 卡），硬盘面板「移动设备」区块用。
+	// 每次取状态现场枚举：插入/拔出要在下一次轮询就反映出来，不能等 60 秒一次的
+	// 全量扫描（那个只刷槽位与 SMART）。
+	Mobile []MobileDevice `json:"mobile,omitempty"`
 }
 
 type storageSlotSpec struct {
@@ -157,8 +161,11 @@ func (m *Manager) RefreshStorage(forceSMART bool) StorageStatus {
 
 func (m *Manager) StorageStatus() StorageStatus {
 	m.storageMu.RLock()
-	defer m.storageMu.RUnlock()
 	status := cloneStorageStatus(m.storageStatus)
+	m.storageMu.RUnlock()
+	// 移动设备每次现场枚举（只读几个 sysfs 小文件）：插拔要在下一次轮询就体现，
+	// 不能挂在 60 秒一次的全量扫描上。
+	status.Mobile = m.MobileDevices()
 	if len(status.Slots) != 0 {
 		return status
 	}
@@ -241,6 +248,7 @@ func activityHasIOEvidence(activity string) bool {
 
 func cloneStorageStatus(status StorageStatus) StorageStatus {
 	status.Slots = append([]StorageSlot(nil), status.Slots...)
+	status.Mobile = append([]MobileDevice(nil), status.Mobile...)
 	return status
 }
 

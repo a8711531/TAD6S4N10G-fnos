@@ -123,25 +123,34 @@ func (m *Manager) waitForNewBlocks(ctx context.Context, before map[string]int64)
 	}
 }
 
+// sdcardSummary 只报「真的读到东西」的结果：重新识别了读卡器但没读到介质时返回
+// 空串（前端保持静默），不再提示用户去插卡——没插卡是用户自己的事，每次点刷新
+// 都念一遍只会占着面板的空间。
 func sdcardSummary(result SdcardRefreshResult) string {
+	if len(result.NewDevices) == 0 && len(result.Skipped) == 0 && len(result.Failed) == 0 {
+		return ""
+	}
 	var builder strings.Builder
-	if len(result.Devices) == 0 {
-		builder.WriteString("没有需要重新识别的 USB 读卡器")
-	} else {
-		fmt.Fprintf(&builder, "已重新识别 %d 个 USB 读卡器（%s）",
-			len(result.Devices), strings.Join(result.Devices, "、"))
+	if len(result.NewDevices) > 0 {
+		if len(result.Devices) == 0 {
+			builder.WriteString("没有需要重新识别的 USB 读卡器")
+		} else {
+			fmt.Fprintf(&builder, "已重新识别 %d 个 USB 读卡器（%s）",
+				len(result.Devices), strings.Join(result.Devices, "、"))
+		}
+		fmt.Fprintf(&builder, "；识别到设备：%s", strings.Join(result.NewDevices, "、"))
 	}
 	if len(result.Skipped) > 0 {
-		fmt.Fprintf(&builder, "；跳过 %d 个（%s）", len(result.Skipped), strings.Join(result.Skipped, "；"))
+		if builder.Len() > 0 {
+			builder.WriteString("；")
+		}
+		fmt.Fprintf(&builder, "跳过 %d 个（%s）", len(result.Skipped), strings.Join(result.Skipped, "；"))
 	}
 	if len(result.Failed) > 0 {
-		fmt.Fprintf(&builder, "；%d 个失败（%s）", len(result.Failed), strings.Join(result.Failed, "；"))
-	}
-	switch {
-	case len(result.NewDevices) > 0:
-		fmt.Fprintf(&builder, "；识别到设备：%s", strings.Join(result.NewDevices, "、"))
-	case len(result.Devices) > 0:
-		builder.WriteString("；没有读到存储介质，如果卡没插好请插好后重试")
+		if builder.Len() > 0 {
+			builder.WriteString("；")
+		}
+		fmt.Fprintf(&builder, "%d 个失败（%s）", len(result.Failed), strings.Join(result.Failed, "；"))
 	}
 	return builder.String()
 }

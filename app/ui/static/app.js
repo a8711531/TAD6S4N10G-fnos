@@ -496,6 +496,12 @@ function initializeStorageVisual() {
     });
     figure.append(frame);
     target.append(figure);
+    if (group.kind === 'm2') {
+      // 「移动设备」区块挂在 M.2 面板正下方：SD 卡 / U 盘不在机箱仓位里，
+      // 但用户的心理位置就是内置 M.2 插槽旁边那一块。
+      const mobile = $('storage-mobile');
+      if (mobile) figure.append(mobile);
+    }
     frame.addEventListener('click', (event) => {
       const marker = event.target.closest('.storage-visual-slot');
       if (!marker?.dataset.detail) return;
@@ -563,8 +569,59 @@ function renderStorageVisual(storage = {}) {
   });
 }
 
-function renderDiagnosticChips(targetID, items, emptyText = '—') {
-  const target = $(targetID);
+// 移动设备区块：插了几个就画几个图标（SD 卡 / U 盘），悬停显示设备名称、
+// 容量与挂载点。容量 0 的空读卡器后端已经过滤掉，这里只负责铺图标。
+function mobileDeviceIcon(kind) {
+  const svg = svgElement('svg', {
+    viewBox: '0 0 24 24',
+    class: 'storage-mobile-icon',
+    'aria-hidden': 'true',
+    fill: 'none',
+    stroke: 'currentColor',
+    'stroke-width': '1.6',
+    'stroke-linecap': 'round',
+    'stroke-linejoin': 'round',
+  });
+  if (kind === 'sd') {
+    // 缺角卡片 + 三根触点
+    svg.append(svgElement('path', { d: 'M8 3h6.6L18 6.4V20a1 1 0 0 1-1 1H8a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z' }));
+    svg.append(svgElement('path', { d: 'M10.6 8.4v3.2M12.9 8.4v3.2M15.2 8.4v3.2' }));
+  } else {
+    // U 盘：金属口 + 塑料壳
+    svg.append(svgElement('rect', { x: '8', y: '9', width: '8', height: '12', rx: '1.6' }));
+    svg.append(svgElement('path', { d: 'M11 9V5h2v4M10.5 13.5h3' }));
+  }
+  return svg;
+}
+
+function renderStorageMobile(storage = {}) {
+  const list = $('storage-mobile-list');
+  if (!list) return;
+  const devices = Array.isArray(storage.mobile) ? storage.mobile : [];
+  list.replaceChildren();
+  // 没有设备时这里什么都不画：整块只有一行高，空状态由右边的计数说明，
+  // 不再单独占一行写长句。
+  devices.forEach((device) => {
+    const kind = device.kind === 'sd' ? 'sd' : 'usb';
+    const item = document.createElement('div');
+    item.className = `storage-mobile-item kind-${kind}`;
+    item.title = [device.name, device.size_label, device.device, device.mount_point ? `挂载 ${device.mount_point}` : '']
+      .filter(Boolean).join(' · ');
+    const caption = document.createElement('span');
+    caption.textContent = device.kind_label || (kind === 'sd' ? 'SD 卡' : 'U 盘');
+    const name = document.createElement('small');
+    name.textContent = device.name || '';
+    item.append(mobileDeviceIcon(kind), caption, name);
+    list.append(item);
+  });
+  const count = $('storage-mobile-count');
+  if (count) {
+    count.textContent = devices.length ? `${devices.length} 个设备` : '未检测到';
+    count.title = devices.length ? '' : '插好介质后最多 5 秒出现；换卡认不出来时点「刷新 SD 卡」';
+  }
+}
+
+function renderDiagnosticChips(targetID, items, emptyText = '—') {  const target = $(targetID);
   target.replaceChildren();
   if (!items.length) {
     target.textContent = emptyText;
@@ -637,6 +694,15 @@ function renderDiagnostics(status, fanStatus) {
   renderDiagnosticChips('fan-control', chips);
 }
 
+// 「关停」档下 0 转是设置出来的结果，不是接线/驱动故障：文案要说明白并催用户尽快退出
+const FAN_OFF_RPM_NOTICE = '因为设置曲线模式为关停，风扇转速反馈为 0 RPM。请尽快取消此模式以免损坏硬件。';
+
+// 后端 status 里带 off_mode；老状态没这个字段时退回读配置，两种来源都认
+function fanOffModeActive(fanStatus = {}) {
+  if (typeof fanStatus.off_mode === 'boolean') return fanStatus.off_mode;
+  return Boolean(currentStatus?.config?.fan?.off_mode);
+}
+
 function healthIssues(status, fanStatus, storageStatus, gpioStatus) {
   const issues = [];
   if (!status.supported) issues.push('当前处理器未通过 TAD6S4N模块兼容性检查');
@@ -645,7 +711,9 @@ function healthIssues(status, fanStatus, storageStatus, gpioStatus) {
   if (fanStatus.driver_detected === true && !fans.length) {
     issues.push('IT87 驱动已检测，但未发现可读取 PWM/RPM 的风扇通道');
   } else if (fanStatus.driver_detected === true && fans.length && !fans.some((fan) => Number(fan.rpm) > 0)) {
-    issues.push('已发现风扇通道，但当前转速反馈均为 0 RPM；请检查风扇接线或驱动状态');
+    issues.push(fanOffModeActive(fanStatus)
+      ? FAN_OFF_RPM_NOTICE
+      : '已发现风扇通道，但当前转速反馈均为 0 RPM；请检查风扇接线或驱动状态');
   }
   if (status.cpu_temperature?.available === false) {
     issues.push('未读取到 CPU coretemp 温度；请检查 coretemp 内核驱动是否已加载');
@@ -698,8 +766,11 @@ function renderFanHardwareWarning(fanStatus = {}) {
     $('fan-warning-title').textContent = '未发现可控风扇通道';
     $('fan-warning-description').textContent = 'IT87 驱动已检测，但没有同时暴露 fan、pwm 与 pwm_enable 的通道，请检查驱动适配。';
   } else if (noRPM) {
-    $('fan-warning-title').textContent = '风扇转速反馈为 0 RPM';
-    $('fan-warning-description').textContent = '已发现风扇通道，请检查单风扇接线、BIOS 模式或驱动状态。';
+    // 关停档下 0 转是设置出来的结果，不是接线/驱动故障，别再把用户往接线方向带
+    $('fan-warning-title').textContent = fanOffModeActive(fanStatus) ? '风扇已按「关停」档停转' : '风扇转速反馈为 0 RPM';
+    $('fan-warning-description').textContent = fanOffModeActive(fanStatus)
+      ? FAN_OFF_RPM_NOTICE
+      : '已发现风扇通道，请检查单风扇接线、BIOS 模式或驱动状态。';
   }
 }
 
@@ -965,7 +1036,7 @@ function commitGPIOScriptEditor() {
   return true;
 }
 
-function deleteGPIOScript(scriptID) {
+async function deleteGPIOScript(scriptID) {
   const script = gpioScripts.find((item) => item.id === scriptID);
   if (!script) return;
   const action = gpioScriptAction(scriptID);
@@ -975,7 +1046,13 @@ function deleteGPIOScript(scriptID) {
     binding.focus();
     return;
   }
-  if (!window.confirm(`确定删除脚本“${script.name}”吗？删除后仍需点击“保存按钮控制”才会持久化。`)) return;
+  const ok = await showAppConfirm({
+    title: '删除脚本',
+    message: `确定删除脚本“${script.name}”吗？删除后仍需点击“保存按钮控制”才会持久化。`,
+    confirmText: '删除',
+    danger: true,
+  });
+  if (!ok) return;
   gpioScripts = gpioScripts.filter((item) => item.id !== scriptID);
   if (gpioEditingScriptID === scriptID) closeGPIOScriptEditor();
   setupGPIOActions(gpioScripts, true);
@@ -1355,7 +1432,7 @@ function commitBackupJobEditor() {
   return true;
 }
 
-function deleteBackupJob(jobID) {
+async function deleteBackupJob(jobID) {
   const job = gpioBackups.find((item) => item.id === jobID);
   if (!job) return;
   const bindings = backupJobBindings(jobID);
@@ -1363,7 +1440,13 @@ function deleteBackupJob(jobID) {
     showBackupStatus(`任务“${job.name}”仍被按键（${bindings.join('、')}）引用，请先在上方下拉框改成其他动作。`, true);
     return;
   }
-  if (!window.confirm(`确定删除备份任务“${job.name}”吗？删除后仍需点击“保存按钮控制”才会持久化。`)) return;
+  const ok = await showAppConfirm({
+    title: '删除备份任务',
+    message: `确定删除备份任务“${job.name}”吗？删除后仍需点击“保存按钮控制”才会持久化。`,
+    confirmText: '删除',
+    danger: true,
+  });
+  if (!ok) return;
   gpioBackups = gpioBackups.filter((item) => item.id !== jobID);
   if (backupEditingJobID === jobID) closeBackupJobEditor();
   setupGPIOActions(gpioScripts, true, gpioBackups);
@@ -1920,7 +2003,7 @@ function commitAutoBackupEditor() {
   return true;
 }
 
-function deleteAutoBackupRule(ruleID) {
+async function deleteAutoBackupRule(ruleID) {
   const rule = gpioAutos.find((item) => item.id === ruleID);
   if (!rule) return;
   const bindings = autoBackupBindings(ruleID);
@@ -1928,7 +2011,13 @@ function deleteAutoBackupRule(ruleID) {
     showAutoBackupStatus(`规则“${rule.name}”仍被按键（${bindings.join('、')}）引用，请先在上方下拉框改成其他动作。`, true);
     return;
   }
-  if (!window.confirm(`确定删除自动备份规则“${rule.name}”吗？删除后仍需点击“保存按钮控制”才会持久化。`)) return;
+  const ok = await showAppConfirm({
+    title: '删除自动备份规则',
+    message: `确定删除自动备份规则“${rule.name}”吗？删除后仍需点击“保存按钮控制”才会持久化。`,
+    confirmText: '删除',
+    danger: true,
+  });
+  if (!ok) return;
   gpioAutos = gpioAutos.filter((item) => item.id !== ruleID);
   if (autoEditingRuleID === ruleID) closeAutoBackupEditor();
   setupGPIOActions(gpioScripts, true, gpioBackups, gpioAutos);
@@ -2298,6 +2387,9 @@ async function promptCreateDirectory() {
 // 替代 window.confirm：浏览器原生弹窗与应用风格不搭，也没法做警示美化。
 // 用法：const ok = await showAppConfirm({ title, message, confirmText, danger });
 // 输入模式再传 input: { label, value, placeholder, maxLength }，确定时回传输入值。
+// 需要第三个动作时传 secondaryText，点它返回字符串 'secondary'。
+// 风扇曲线的模式弹窗靠这个多出「应用并保存风扇控制」。
+// hideConfirm 把主按钮藏起来（只留副按钮当唯一动作），secondaryDanger 让副按钮走红底。
 
 const appConfirm = { onOk: null, resolve: null };
 
@@ -2312,7 +2404,12 @@ function showAppConfirm(options = {}) {
     const ok = $('confirm-ok');
     ok.textContent = options.confirmText || '确定';
     ok.className = options.danger ? 'danger' : 'primary';
+    ok.hidden = Boolean(options.hideConfirm);
     $('confirm-icon').hidden = !options.danger;
+    const secondary = $('confirm-secondary');
+    secondary.hidden = !options.secondaryText;
+    secondary.textContent = options.secondaryText || '';
+    secondary.className = `confirm-secondary${options.secondaryDanger ? ' danger' : ''}`;
     const inputRow = $('confirm-input-row');
     inputRow.hidden = !options.input;
     if (options.input) {
@@ -2344,6 +2441,12 @@ $('confirm-cancel').addEventListener('click', () => closeAppConfirm(null));
 document.querySelectorAll('[data-confirm-close]').forEach((el) => {
   el.addEventListener('click', () => closeAppConfirm(null));
 });
+// 副按钮（「应用并保存风扇控制」）回传 { secondary: true, value }，
+// value 带上输入框内容，手动填百分比时点它也能用用户填的数
+$('confirm-secondary').addEventListener('click', () => {
+  const inputMode = !$('confirm-input-row').hidden;
+  closeAppConfirm({ secondary: true, value: inputMode ? $('confirm-input').value.trim() : undefined });
+});
 $('confirm-ok').addEventListener('click', () => {
   const onOk = appConfirm.onOk;
   const inputMode = !$('confirm-input-row').hidden;
@@ -2354,7 +2457,9 @@ $('confirm-ok').addEventListener('click', () => {
 $('confirm-input').addEventListener('keydown', (event) => {
   if (event.key === 'Enter') {
     event.preventDefault();
-    $('confirm-ok').click();
+    // 主按钮被藏起来的弹窗（关停只有一个红色动作）里，回车走副按钮
+    if ($('confirm-ok').hidden && !$('confirm-secondary').hidden) $('confirm-secondary').click();
+    else $('confirm-ok').click();
   }
 });
 
@@ -2798,23 +2903,38 @@ function renderStorageNotifyStatus(storageNotify = {}) {
   target.title = recent.map(describeStorageInsert).join('\n');
 }
 
-async function refreshSDCardManually() {
+// 刷新 SD 卡：按键映射页与硬盘面板「移动设备」区块共用这一条路径（同一个
+// 后端动作，只是按钮与状态行各自归属自己的卡片）。刷新完再拉一次状态，
+// 新认出来的卡立刻变成图标，不用等下一拍轮询。
+async function refreshSDCardManually(button = $('gpio-refresh-sdcard'), status = $('gpio-sdcard-status')) {
   if (sdcardRefreshBusy) return;
-  const button = $('gpio-refresh-sdcard');
-  const status = $('gpio-sdcard-status');
   sdcardRefreshBusy = true;
   button.disabled = true;
   const originalLabel = button.textContent;
+  const rawIdle = status?.dataset?.idle;
+  const idleText = typeof rawIdle === 'string' ? rawIdle : '';
+  // 记住自己那一行的基类（并剔掉上一次失败留下的 error），刷新结束后按原样恢复。
+  const rawClass = typeof status?.className === 'string' ? status.className : '';
+  const statusClass = rawClass.split(/\s+/).filter((name) => name && name !== 'error').join(' ');
   button.textContent = '正在刷新…';
-  status.textContent = '正在重新识别 USB 读卡器，请稍候（通常几秒）…';
-  status.className = 'inline-status';
+  if (status) {
+    status.textContent = '正在重新识别 USB 读卡器，请稍候（通常几秒）…';
+    status.className = statusClass;
+  }
   try {
     const result = await request('api/gpio/refresh-sdcard', { method: 'POST', body: '{}' });
-    status.textContent = result.summary || '刷新完成。';
-    status.className = 'inline-status';
+    if (status) {
+      // 后端只报「真的读到东西」的结果：读卡器重识别了但没介质时 summary 为空，
+      // 这时回到自己那一行的初始说明（硬盘面板没有说明就是空白），不堆提示。
+      status.textContent = result.summary || idleText;
+      status.className = statusClass;
+    }
+    await refresh(true);
   } catch (error) {
-    status.textContent = error.message;
-    status.className = 'inline-status error';
+    if (status) {
+      status.textContent = error.message;
+      status.className = `${statusClass} error`;
+    }
   } finally {
     button.disabled = false;
     button.textContent = originalLabel;
@@ -2903,6 +3023,8 @@ function clamp(value, minimum, maximum) {
 }
 
 function fanMinimumPWM() {
+  // 关停档：0% 也要能填进曲线，最低转速不再是地板
+  if (fanOffMode) return 0;
   const raw = $('fan-min').value;
   const value = Number(raw);
   // 空框（用户正在改）或非法输入按默认最低转速走，30% 是硬性下限而不是默认值
@@ -3016,77 +3138,261 @@ function removeSelectedCurvePoint(kind) {
 }
 
 // ---- 预设曲线模式：静音 / 平衡 / 性能 --------------------------------------
-// 每档都按「当前最低转速」当地板生成三条曲线（转速 = 最低转速 + 偏移，封顶 100%），
-// 所以用户把最低转速从 40 调到 50 后再套预设，地板会跟着走。
-// 点一下替换的是三条曲线的全部节点（界面上的，未保存），保存风扇控制后才下发。
+// 系统集成的三档参数，数值与后端 internal/powerguard/fan.go 的 builtinFanCurves
+// 一一对应，改一边必须同步另一边。出厂默认就是「平衡」这一档。
+// 点一下替换的是三条曲线的全部节点（界面上的，未保存），保存风扇控制后才下发；
+// 低于「最低转速」的节点会在套用时按最低转速抬起来。
 const CURVE_PRESETS = {
   quiet: {
     label: '静音',
     summary: '低转速优先，晚一点拉高',
-    points: (minimum) => {
-      const add = (delta) => Math.min(100, minimum + delta);
-      return {
-        hdd: [[34, minimum], [46, add(12)], [56, 100]],
-        nvme: [[40, minimum], [54, add(12)], [68, 100]],
-        cpu: [[48, minimum], [66, add(10)], [76, add(22)], [83, 100]],
-      };
-    },
+    points: () => ({
+      hdd: [[20, 40], [30, 40], [35, 43], [45, 43], [50, 55], [52, 70], [55, 80], [60, 90]],
+      nvme: [[20, 40], [45, 40], [55, 55], [60, 60]],
+      cpu: [[20, 40], [42, 40], [44, 43], [60, 43], [70, 50], [75, 60], [80, 80], [85, 100]],
+    }),
   },
   balanced: {
     label: '平衡',
-    summary: '常温低速、升温及时提速',
-    points: (minimum) => {
-      const add = (delta) => Math.min(100, minimum + delta);
-      const storageMid = Math.max(minimum, 85);
-      return {
-        hdd: [[25, minimum], [35, storageMid], [50, 100]],
-        nvme: [[30, minimum], [44, storageMid], [60, 100]],
-        cpu: [[40, minimum], [55, add(12)], [70, add(26)], [80, 100]],
-      };
-    },
+    summary: '常温低速、升温及时提速（出厂默认）',
+    points: () => ({
+      hdd: [[20, 40], [30, 40], [35, 47], [45, 47], [50, 60], [52, 75], [55, 80], [60, 100]],
+      nvme: [[20, 40], [45, 40], [55, 60], [60, 70]],
+      cpu: [[20, 40], [42, 40], [44, 47], [60, 47], [70, 55], [75, 65], [80, 85], [85, 100]],
+    }),
   },
   performance: {
     label: '性能',
     summary: '高转速优先，温度一上来就压住',
-    points: (minimum) => {
-      const add = (delta) => Math.min(100, minimum + delta);
-      return {
-        hdd: [[22, add(12)], [32, add(30)], [45, 100]],
-        nvme: [[30, add(12)], [42, add(30)], [58, 100]],
-        cpu: [[34, add(15)], [50, add(30)], [64, add(44)], [76, 100]],
-      };
-    },
+    points: () => ({
+      hdd: [[20, 40], [30, 40], [35, 47], [40, 50], [50, 65], [52, 80], [55, 90], [60, 100]],
+      nvme: [[20, 40], [45, 40], [55, 65], [60, 75]],
+      cpu: [[20, 47], [45, 47], [50, 60], [55, 70], [60, 85], [85, 100]],
+    }),
   },
 };
 const CURVE_PRESET_ORDER = ['quiet', 'balanced', 'performance'];
 
+// ---- 曲线模式状态 ----------------------------------------------------------
+// activeCurveMode 只驱动按键选中态与文案：quiet/balanced/performance/temp/
+// full/off/manual/slot-1..3。fanOffMode 决定曲线能不能写 0%（关停档）。
+let activeCurveMode = 'temp';
+let fanOffMode = false;
+// 进入全速／关停之前记下的三条曲线，点「临时」可以原样回来
+const TEMP_CURVE_STORAGE_KEY = 'tad-fan-curve-temp';
+let tempCurveBackup = null;
+
+function loadTempCurveBackup() {
+  try {
+    const raw = window.localStorage.getItem(TEMP_CURVE_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    return validCurveSet(parsed);
+  } catch (error) {
+    return null;
+  }
+}
+
+function backupTempCurves() {
+  // 只在从「正常曲线」切到极端档时备份，免得把全 0／全 100 当成临时曲线
+  if (activeCurveMode === 'full' || activeCurveMode === 'off') return;
+  tempCurveBackup = currentCurveSet();
+  try {
+    window.localStorage.setItem(TEMP_CURVE_STORAGE_KEY, JSON.stringify(tempCurveBackup));
+  } catch (error) { /* 本地存储不可用时只留内存 */ }
+}
+
+function setCurveMode(mode) {
+  activeCurveMode = mode || 'temp';
+  fanOffMode = activeCurveMode === 'off';
+  renderCurveModeStates();
+}
+
+function renderCurveModeStates() {
+  document.querySelectorAll('[data-curve-mode]').forEach((button) => {
+    const active = button.dataset.curveMode === activeCurveMode;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-pressed', active ? 'true' : 'false');
+  });
+  for (let slot = 1; slot <= CURVE_SLOT_COUNT; slot += 1) {
+    const button = $(`curve-custom-${slot}`);
+    if (!button) continue;
+    const active = activeCurveMode === `slot-${slot}`;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-pressed', active ? 'true' : 'false');
+  }
+}
+
+const CURVE_MODE_FIELDS = { hdd: 'hdd_curve', nvme: 'nvme_curve', cpu: 'curve' };
+
+// 用后端配置反推当前属于哪一档：关停 → 预设 → 全速 → 手动（三条都同一恒定值）→ 其余按临时算
+function detectCurveMode(fan = {}) {
+  if (fan.off_mode) return 'off';
+  const samePoints = (curve, rows) => Array.isArray(curve) && curve.length === rows.length
+    && curve.every((point, index) => Math.round(Number(point.temp_c)) === rows[index][0]
+      && Math.round(Number(point.pwm_percent)) === rows[index][1]);
+  for (const mode of CURVE_PRESET_ORDER) {
+    const preset = CURVE_PRESETS[mode].points();
+    if (CURVE_KINDS.every((kind) => samePoints(fan[CURVE_MODE_FIELDS[kind]], preset[kind]))) return mode;
+  }
+  const flatValue = (curve) => {
+    if (!Array.isArray(curve) || !curve.length) return null;
+    const first = Math.round(Number(curve[0].pwm_percent));
+    if (!Number.isFinite(first)) return null;
+    return curve.every((point) => Math.round(Number(point.pwm_percent)) === first) ? first : null;
+  };
+  const flat = CURVE_KINDS.map((kind) => flatValue(fan[CURVE_MODE_FIELDS[kind]]));
+  if (flat.every((value) => value === 100)) return 'full';
+  // 三条曲线都是同一个恒定百分比（且不是 0／100）＝手动档
+  if (flat.every((value) => value !== null && value === flat[0]) && flat[0] > 0 && flat[0] < 100) return 'manual';
+  return 'temp';
+}
+
+// 把一套曲线填进三个编辑器：先切模式再收口，关停档的 0% 才不会被最低转速抬起来
+function applyCurveSetToEditors(curves) {
+  if (!curves) return;
+  CURVE_KINDS.forEach((kind) => {
+    if (!curves[kind]) return;
+    const editor = curveEditors[kind];
+    editor.curve = curves[kind].map((point) => ({ ...point }));
+    editor.selectedIndex = 0;
+    normalizeCurveToControls(kind);
+  });
+}
+
+// 平线：保留温度节点，只把所有转速改成同一个百分比
+function flatCurveSet(percent) {
+  const curves = currentCurveSet();
+  CURVE_KINDS.forEach((kind) => {
+    curves[kind] = curves[kind].map((point) => ({ temp_c: point.temp_c, pwm_percent: percent }));
+  });
+  return curves;
+}
+
 function curvePresetPoints(mode, kind) {
   const preset = CURVE_PRESETS[mode];
   if (!preset) return null;
-  const rows = preset.points(fanMinimumPWM())[kind];
+  const rows = preset.points()[kind];
   return Array.isArray(rows) ? rows.map(([temp_c, pwm_percent]) => ({ temp_c, pwm_percent })) : null;
 }
 
-function applyCurvePreset(mode) {
-  const preset = CURVE_PRESETS[mode];
-  if (!preset) return;
-  const curves = CURVE_KINDS.map((kind) => [kind, curvePresetPoints(mode, kind)]);
-  if (curves.some(([, points]) => !points)) return;
-  if (!window.confirm(`套用「${preset.label}」曲线模式会用新节点替换三条曲线的全部节点，界面上还没保存的手动调整也会被覆盖。确定继续？`)) return;
-  curves.forEach(([kind, points]) => {
-    const editor = curveEditors[kind];
-    editor.curve = points;
-    editor.selectedIndex = 0;
-    normalizeCurveToControls(kind); // 按当前最低转速与紧急温度收口，并重绘
-  });
-  showMessage(`已套用「${preset.label}」曲线模式（${preset.summary}）；节点只改了界面，点「保存风扇控制」后才生效。`, false, 'message-fan');
+// 模式弹窗统一出口：主按钮只改界面，副按钮改完顺手下发保存
+async function applyModeCurves(mode, curves, doneMessage) {
+  setCurveMode(mode);
+  applyCurveSetToEditors(curves);
+  if (doneMessage) showMessage(doneMessage, false, 'message-fan');
 }
 
-// ---- 自定义曲线槽位（三个）：把当前三条曲线存进浏览器本地，随时载回 -------
-// 存的是「三条曲线的节点」，与预设同粒度；载入后仍需点保存风扇控制才下发。
+// 静音 / 平衡 / 性能：三档系统参数，应用并保存一体
+async function applyCurvePreset(mode) {
+  const preset = CURVE_PRESETS[mode];
+  if (!preset) return;
+  const curves = {};
+  for (const kind of CURVE_KINDS) {
+    const points = curvePresetPoints(mode, kind);
+    if (!points) return;
+    curves[kind] = points;
+  }
+  const result = await showAppConfirm({
+    title: `应用「${preset.label}」曲线`,
+    message: `会用「${preset.label}」的节点替换三条曲线的全部节点，界面上还没保存的手动调整也会被覆盖。`,
+    confirmText: '应用',
+    secondaryText: '应用并保存风扇控制',
+  });
+  if (!result) return;
+  backupTempCurves();
+  await applyModeCurves(mode, curves, `已应用「${preset.label}」曲线（${preset.summary}）。`);
+  if (result.secondary) await saveFanConfig();
+}
+
+// 全速：三条曲线全部 100%
+async function applyFullSpeed() {
+  const result = await showAppConfirm({
+    title: '全部风扇全速运转',
+    message: '三条曲线的全部节点会拉满到 100%，风扇立刻按最高转速运行；噪音与功耗都会明显上升。',
+    confirmText: '应用',
+    secondaryText: '应用并保存风扇控制',
+  });
+  if (!result) return;
+  backupTempCurves();
+  await applyModeCurves('full', flatCurveSet(100), '已把三条曲线全部拉到 100%；风扇进入全速。');
+  if (result.secondary) await saveFanConfig();
+}
+
+// 关停：全部 0%，优先级高于最低转速。第二次确认只留一个红色动作——
+// 关停必须落盘才算数，去掉「只改界面不保存」的主按钮，免得用户以为已经停了。
+async function applyShutdown() {
+  const first = await showAppConfirm({
+    title: '关停全部风扇',
+    message: '绑定风扇会立刻停转（0%），最低转速保护被绕过。温度会快速上升，只适合短时间检修或换盘。',
+    confirmText: '继续',
+    danger: true,
+  });
+  if (!first) return;
+  const second = await showAppConfirm({
+    title: '再确认一次：确定要关停风扇？',
+    message: '停转期间硬盘与 NVMe 温度会持续升高，长时间关停可能造成不可逆的硬件损伤。CPU 达到紧急满速温度时仍会自动兜底。',
+    hideConfirm: true,
+    secondaryText: '关停并保存风扇控制',
+    secondaryDanger: true,
+  });
+  if (!second || !second.secondary) return;
+  backupTempCurves();
+  await applyModeCurves('off', flatCurveSet(0), '已把三条曲线全部设为 0%，正在下发关停…');
+  await saveFanConfig();
+}
+
+// 手动：自己填一个百分比，三条曲线变成同值平线
+async function applyManualSpeed() {
+  const suggested = fanOffMode ? DEFAULT_MIN_PWM_PERCENT : fanMinimumPWM();
+  const result = await showAppConfirm({
+    title: '手动设定转速',
+    message: '填一个百分比，三条曲线的全部节点都会设成这个值。',
+    input: { label: '转速百分比（30–100）', value: String(suggested), placeholder: '例如 55', maxLength: 3 },
+    confirmText: '应用',
+    secondaryText: '应用并保存风扇控制',
+  });
+  if (!result) return;
+  const raw = result.secondary ? String(result.value || suggested) : String(result);
+  const percent = Number(raw);
+  if (!Number.isFinite(percent) || percent < 30 || percent > 100) {
+    showMessage('转速百分比需在 30–100 之间。', true, 'message-fan');
+    return;
+  }
+  const value = Math.round(percent);
+  backupTempCurves();
+  await applyModeCurves('manual', flatCurveSet(value), `已把三条曲线全部设为 ${value}%。`);
+  if (result.secondary) await saveFanConfig();
+}
+
+// 临时：回到自己调的那版曲线
+async function applyTempMode() {
+  if (tempCurveBackup) {
+    const result = await showAppConfirm({
+      title: '回到临时曲线',
+      message: '会用进入全速／关停前记下的三条曲线覆盖编辑器。',
+      confirmText: '恢复',
+      secondaryText: '应用并保存风扇控制',
+    });
+    if (!result) return;
+    await applyModeCurves('temp', tempCurveBackup, '已恢复临时曲线。');
+    if (result.secondary) await saveFanConfig();
+    return;
+  }
+  const wasOff = fanOffMode;
+  await applyModeCurves('temp', null, '已切到「临时」：按当前曲线下发，点「保存风扇控制」生效。');
+  // 从关停回来又没有临时备份：把 0% 抬回最低转速，免得一保存就被校验拦下
+  if (wasOff) CURVE_KINDS.forEach(normalizeCurveToControls);
+}
+
+// ---- 自定义曲线按键（三个）：每个按键独立一套曲线 -------------------------
+// 数据结构：{ "1": { name, curves: {hdd,nvme,cpu} | null }, ... }
+// 存在本浏览器（localStorage）；导出成 JSON 可备份、换机搬用。
+// 点按键不直接载入，而是打开操作弹窗：应用 / 保存 / 导出 / 导入 / 改名 / 取消。
 const CURVE_SLOT_COUNT = 3;
 const CURVE_SLOT_STORAGE_KEY = 'tad-fan-curve-slots';
+const CURVE_SLOT_DEFAULT_NAMES = { 1: '自定义 1', 2: '自定义 2', 3: '自定义 3' };
 let curveSlots = loadCurveSlots();
+let curveSlotTarget = 0;
 
 function currentCurveSet() {
   return {
@@ -3116,6 +3422,38 @@ function validCurveSet(curves) {
   return result;
 }
 
+function curveSlotKey(slot) {
+  return String(slot);
+}
+
+// 只有存了曲线的按键才算「已保存」；只改过名的空按键不算。
+function curveSlotEntry(slot) {
+  const record = curveSlots[curveSlotKey(slot)];
+  return record && record.curves ? record : null;
+}
+
+function curveSlotRecord(slot) {
+  return curveSlots[curveSlotKey(slot)] || null;
+}
+
+function curveSlotName(slot) {
+  const record = curveSlotRecord(slot);
+  return (record && record.name) || CURVE_SLOT_DEFAULT_NAMES[slot];
+}
+
+// 旧版本只存了三条曲线本身（没有 name 字段），读进来时补默认名。
+function normalizeSlotRecord(item, slot) {
+  if (!item || typeof item !== 'object') return null;
+  const defaultName = CURVE_SLOT_DEFAULT_NAMES[slot];
+  const rawName = typeof item.name === 'string' ? item.name.trim() : '';
+  const name = rawName || defaultName;
+  const legacyCurves = (item.hdd || item.nvme || item.cpu) ? item : null;
+  const curves = validCurveSet(item.curves && typeof item.curves === 'object' ? item.curves : legacyCurves);
+  // 名字是默认名、又没有曲线 → 当空按键，不必占位
+  if (!curves && name === defaultName) return null;
+  return { name, curves: curves || null };
+}
+
 function loadCurveSlots() {
   const slots = {};
   try {
@@ -3123,11 +3461,11 @@ function loadCurveSlots() {
     const parsed = raw ? JSON.parse(raw) : null;
     if (parsed && typeof parsed === 'object') {
       for (let slot = 1; slot <= CURVE_SLOT_COUNT; slot += 1) {
-        const curves = validCurveSet(parsed[String(slot)]);
-        if (curves) slots[String(slot)] = curves;
+        const record = normalizeSlotRecord(parsed[String(slot)], slot);
+        if (record) slots[String(slot)] = record;
       }
     }
-  } catch (error) { /* 解析失败＝当作三个空槽位 */ }
+  } catch (error) { /* 解析失败＝当作三个空按键 */ }
   return slots;
 }
 
@@ -3143,95 +3481,276 @@ function renderCurveSlotStates() {
   for (let slot = 1; slot <= CURVE_SLOT_COUNT; slot += 1) {
     const button = $(`curve-custom-${slot}`);
     if (!button) continue;
-    const filled = Boolean(curveSlots[String(slot)]);
-    button.classList.toggle('filled', filled);
-    button.title = filled ? `载入自定义 ${slot}（已保存）` : `自定义 ${slot} 还是空的：先点右边的「存」`;
+    const filled = Boolean(curveSlotEntry(slot));
+    button.textContent = curveSlotName(slot);
+    // 已保存曲线的按键不加描边/变色：按键只显示名字，有没有内容看弹窗里的说明
+    button.title = filled
+      ? `打开「${curveSlotName(slot)}」的操作弹窗（已保存曲线）`
+      : `「${curveSlotName(slot)}」还是空的：点开后可把当前曲线保存进来，或导入 JSON`;
   }
 }
 
-function saveCurveSlot(slot) {
-  const key = String(slot);
-  if (curveSlots[key] && !window.confirm(`自定义 ${slot} 里已经有曲线了，保存会用当前三条曲线覆盖它。确定继续？`)) return;
-  curveSlots[key] = currentCurveSet();
-  persistCurveSlots();
-  renderCurveSlotStates();
-  showMessage(`当前三条曲线已存入「自定义 ${slot}」；点「保存风扇控制」后这套曲线才真正生效。`, false, 'message-fan');
+const CURVE_KIND_LABELS = { hdd: 'HDD/SATA', nvme: 'NVMe', cpu: 'CPU' };
+
+function curveSlotSummary(curves) {
+  return CURVE_KINDS
+    .map((kind) => `${CURVE_KIND_LABELS[kind]} ${curves[kind].length} 点`)
+    .join(' · ');
 }
 
-function loadCurveSlot(slot) {
-  const curves = curveSlots[String(slot)];
-  if (!curves) {
-    showMessage(`「自定义 ${slot}」还是空的：先把三条曲线调成想要的样子，再点它右边的「存」。`, true, 'message-fan');
+function openCurveSlotDialog(slot) {
+  if (!slot) return;
+  curveSlotTarget = slot;
+  const entry = curveSlotEntry(slot);
+  const name = curveSlotName(slot);
+  $('curve-slot-title').textContent = name;
+  $('curve-slot-summary').textContent = entry
+    ? `已保存三条曲线：${curveSlotSummary(entry.curves)}。`
+    : '这个按键还是空的：可以「保存」当前曲线进来，也可以「导入」一个 JSON 文件。';
+  $('curve-slot-apply').disabled = !entry;
+  $('curve-slot-apply-save').disabled = !entry;
+  $('curve-slot-export').disabled = !entry;
+  $('curve-slot-modal').hidden = false;
+  requestAnimationFrame(() => { $('curve-slot-apply').focus(); });
+}
+
+function closeCurveSlotDialog() {
+  curveSlotTarget = 0;
+  const modal = $('curve-slot-modal');
+  if (modal) modal.hidden = true;
+}
+
+// 应用：把按键里的曲线填进编辑器（不动硬件，仍需「保存风扇控制」）
+async function applyCurveSlot(slot) {
+  const entry = curveSlotEntry(slot);
+  if (!entry) {
+    showMessage(`「${curveSlotName(slot)}」还是空的，没有可应用的曲线。`, true, 'message-fan');
     return;
   }
-  if (!window.confirm(`载入「自定义 ${slot}」会用槽位里的节点替换三条曲线，界面上还没保存的手动调整会被覆盖。确定继续？`)) return;
-  CURVE_KINDS.forEach((kind) => {
-    const editor = curveEditors[kind];
-    editor.curve = curves[kind].map((point) => ({ ...point }));
-    editor.selectedIndex = 0;
-    normalizeCurveToControls(kind); // 按当前最低转速与紧急温度收口，并重绘
+  const name = curveSlotName(slot);
+  const result = await showAppConfirm({
+    title: `应用「${name}」`,
+    message: '会用这个按键保存的三条曲线替换编辑器里的节点，界面上还没保存的手动调整也会被覆盖。',
+    confirmText: '应用到曲线',
+    secondaryText: '应用并保存风扇控制',
   });
-  showMessage(`已载入「自定义 ${slot}」的曲线；点「保存风扇控制」后生效。`, false, 'message-fan');
+  if (!result) return;
+  closeCurveSlotDialog();
+  backupTempCurves();
+  await applyModeCurves(`slot-${slot}`, entry.curves, `已把「${name}」的曲线填进编辑器；点「保存风扇控制」后生效。`);
+  if (result.secondary) await saveFanConfig();
 }
 
-// ---- 导出曲线参数：把三条曲线与三个全局参数落成 JSON 文件 ------------------
-function fanCurveExportPayload(curves = currentCurveSet()) {
+// 应用并保存：按键里的曲线填进编辑器后立刻下发，不用再回主界面点保存
+async function applyCurveSlotAndSave(slot) {
+  const entry = curveSlotEntry(slot);
+  if (!entry) {
+    showMessage(`「${curveSlotName(slot)}」还是空的，没有可应用的曲线。`, true, 'message-fan');
+    return;
+  }
+  const name = curveSlotName(slot);
+  closeCurveSlotDialog();
+  backupTempCurves();
+  await applyModeCurves(`slot-${slot}`, entry.curves, `已应用「${name}」的曲线。`);
+  await saveFanConfig();
+}
+
+// 保存：用当前三条曲线覆盖按键
+async function saveCurveSlot(slot) {
+  const name = curveSlotName(slot);
+  const existed = Boolean(curveSlotEntry(slot));
+  const ok = await showAppConfirm({
+    title: existed ? `覆盖「${name}」` : `保存到「${name}」`,
+    message: existed
+      ? '这个按键里已经有曲线了，保存会用当前三条曲线覆盖它（按键名字不变）。'
+      : '会把当前三条曲线（含界面上还没保存的调整）存进这个按键，之后可以随时「应用到曲线」回来。',
+    confirmText: existed ? '覆盖保存' : '保存',
+  });
+  if (!ok) return;
+  curveSlots[curveSlotKey(slot)] = { name, curves: currentCurveSet() };
+  persistCurveSlots();
+  renderCurveSlotStates();
+  closeCurveSlotDialog();
+  showMessage(`当前三条曲线已存入「${name}」；点「保存风扇控制」后这套曲线才真正生效。`, false, 'message-fan');
+}
+
+// ---- 曲线参数导出 / 导入 ---------------------------------------------------
+// 导出文件格式（version 2）：
+// { app, kind:'fan-curve-slots', slots:[{ slot, name, curves:{hdd,nvme,cpu} }], ... }
+// 单键导出只是 slots 里只有一项；旧版单曲线文件（kind:'fan-curves'）也能导入。
+function curvePayloadHeader() {
   return {
     app: 'tad-module',
-    kind: 'fan-curves',
-    version: 1,
+    kind: 'fan-curve-slots',
+    version: 2,
     exported_at: new Date().toISOString(),
     app_version: currentStatus?.version || '',
     min_pwm_percent: Number($('fan-min').value),
     emergency_temp_c: Number($('fan-emergency').value),
     poll_seconds: Number($('fan-poll').value),
-    curves: { hdd: curves.hdd, nvme: curves.nvme, cpu: curves.cpu },
   };
 }
 
-function downloadCurveJSON(curves, filePrefix, doneMessage) {
+function downloadCurveSlots(slots, filePrefix, doneMessage) {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const text = JSON.stringify(fanCurveExportPayload(curves), null, 2);
+  const payload = Object.assign(curvePayloadHeader(), { slots });
+  const text = JSON.stringify(payload, null, 2);
   const blob = new Blob([text], { type: 'application/json;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
-  link.href = URL.createObjectURL(blob);
+  link.href = url;
   link.download = `${filePrefix}-${stamp}.json`;
+  link.rel = 'noopener';
   document.body.append(link);
   link.click();
   link.remove();
-  URL.revokeObjectURL(link.href);
+  // 立刻 revoke 会让部分内置浏览器拿到空文件，留几秒再回收
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
   showMessage(doneMessage, false, 'message-fan');
 }
 
-function downloadFanCurves() {
-  downloadCurveJSON(currentCurveSet(), 'tad-module-fan-curves', '当前风扇曲线参数已导出为 JSON 文件。');
-}
-
 function exportCurveSlot(slot) {
-  const curves = curveSlots[String(slot)];
-  if (!curves) {
-    showMessage(`「自定义 ${slot}」还是空的，没有可导出的曲线。`, true, 'message-fan');
+  const entry = curveSlotEntry(slot);
+  if (!entry) {
+    showMessage(`「${curveSlotName(slot)}」还是空的，没有可导出的曲线。`, true, 'message-fan');
     return;
   }
-  downloadCurveJSON(curves, `tad-module-fan-curves-custom-${slot}`, `「自定义 ${slot}」的曲线参数已导出为 JSON 文件。`);
+  downloadCurveSlots(
+    [{ slot, name: entry.name, curves: entry.curves }],
+    `tad-fan-curve-custom-${slot}`,
+    `「${entry.name}」的曲线参数已导出为 JSON 文件。`,
+  );
+}
+
+// 已保存曲线的按键（导出、批量时用；空按键不算）
+function savedCurveSlots() {
+  const slots = [];
+  for (let slot = 1; slot <= CURVE_SLOT_COUNT; slot += 1) {
+    const entry = curveSlotEntry(slot);
+    if (entry) slots.push({ slot, name: entry.name, curves: entry.curves });
+  }
+  return slots;
+}
+
+function parseCurveSlotFile(text) {
+  let data = null;
+  try { data = JSON.parse(text); } catch (error) { return { error: '不是合法的 JSON 文件。' }; }
+  if (!data || typeof data !== 'object') return { error: '文件里没有曲线参数。' };
+  if (Array.isArray(data.slots) && data.slots.length) {
+    const first = data.slots[0];
+    const curves = validCurveSet(first && first.curves);
+    if (!curves) return { error: '文件里的曲线节点不合法：每条曲线要 2–8 个点，温度递增、转速不递减。' };
+    const name = typeof first.name === 'string' ? first.name.trim() : '';
+    return { curves, name, count: data.slots.length };
+  }
+  // 兼容旧版：{ kind:'fan-curves', curves:{...} } 或直接就是三条曲线
+  const curves = validCurveSet(data.curves && typeof data.curves === 'object' ? data.curves : data);
+  if (!curves) return { error: '文件里没有可识别的曲线：每条曲线要 2–8 个点，温度递增、转速不递减。' };
+  return { curves, name: '', count: 1 };
+}
+
+async function importCurveSlotFile(slot, file) {
+  if (!slot || !file) return;
+  let text = '';
+  try {
+    text = await file.text();
+  } catch (error) {
+    showMessage(`读取文件失败：${error.message}`, true, 'message-fan');
+    return;
+  }
+  const parsed = parseCurveSlotFile(text);
+  if (parsed.error) {
+    showMessage(parsed.error, true, 'message-fan');
+    return;
+  }
+  const name = parsed.name || curveSlotName(slot);
+  const extra = parsed.count > 1 ? `\n文件里有 ${parsed.count} 个按键，只导入第一个。` : '';
+  const ok = await showAppConfirm({
+    title: `导入到「${curveSlotName(slot)}」`,
+    message: `会用文件里的三条曲线覆盖这个按键${parsed.name ? `，并把按键改名为「${parsed.name}」` : '（按键名字不变）'}。${extra}`,
+    confirmText: '导入',
+  });
+  if (!ok) return;
+  curveSlots[curveSlotKey(slot)] = { name, curves: parsed.curves };
+  persistCurveSlots();
+  renderCurveSlotStates();
+  closeCurveSlotDialog();
+  showMessage(`已把文件里的曲线导入「${name}」；点这个按键「应用到曲线」可填进编辑器，再点「保存风扇控制」才会下发。`, false, 'message-fan');
+}
+
+async function renameCurveSlot(slot) {
+  const current = curveSlotName(slot);
+  const value = await showAppConfirm({
+    title: '给自定义按键改名',
+    message: `当前名字：${current}。改名只影响显示和导出文件里的名字，不动曲线内容。`,
+    input: {
+      label: '新名字（最多 16 个字）',
+      value: current === CURVE_SLOT_DEFAULT_NAMES[slot] ? '' : current,
+      placeholder: CURVE_SLOT_DEFAULT_NAMES[slot],
+      maxLength: 16,
+    },
+    confirmText: '改名',
+  });
+  if (value === null || value === undefined) return;
+  // 留空不报错：直接退回这个按键的默认名（自定义 1/2/3），符合「清空即复位」的直觉
+  const fallback = CURVE_SLOT_DEFAULT_NAMES[slot];
+  const name = String(value).trim() || fallback;
+  const key = curveSlotKey(slot);
+  const record = curveSlotRecord(slot);
+  if (record) {
+    record.name = name;
+  } else if (name !== fallback) {
+    curveSlots[key] = { name, curves: null };
+  }
+  persistCurveSlots();
+  renderCurveSlotStates();
+  $('curve-slot-title').textContent = name;
+  showMessage(name === fallback
+    ? `没有填写内容，按键已恢复默认名「${name}」。`
+    : `按键已改名为「${name}」。`, false, 'message-fan');
 }
 
 function setupCurvePresets() {
-  CURVE_PRESET_ORDER.forEach((mode) => {
-    const button = $(`curve-preset-${mode}`);
-    if (button) button.addEventListener('click', () => applyCurvePreset(mode));
+  tempCurveBackup = loadTempCurveBackup();
+  document.querySelectorAll('[data-curve-mode]').forEach((button) => {
+    const mode = button.dataset.curveMode;
+    button.addEventListener('click', () => {
+      if (mode === 'quiet' || mode === 'balanced' || mode === 'performance') {
+        applyCurvePreset(mode);
+      } else if (mode === 'full') {
+        applyFullSpeed();
+      } else if (mode === 'off') {
+        applyShutdown();
+      } else if (mode === 'manual') {
+        applyManualSpeed();
+      } else {
+        applyTempMode();
+      }
+    });
   });
-  const exportButton = $('curve-export');
-  if (exportButton) exportButton.addEventListener('click', downloadFanCurves);
   for (let slot = 1; slot <= CURVE_SLOT_COUNT; slot += 1) {
     const loadButton = $(`curve-custom-${slot}`);
-    const saveButton = $(`curve-custom-${slot}-save`);
-    const slotExportButton = $(`curve-custom-${slot}-export`);
-    if (loadButton) loadButton.addEventListener('click', () => loadCurveSlot(slot));
-    if (saveButton) saveButton.addEventListener('click', () => saveCurveSlot(slot));
-    if (slotExportButton) slotExportButton.addEventListener('click', () => exportCurveSlot(slot));
+    if (loadButton) loadButton.addEventListener('click', () => openCurveSlotDialog(slot));
   }
+  $('curve-slot-apply').addEventListener('click', () => applyCurveSlot(curveSlotTarget));
+  $('curve-slot-apply-save').addEventListener('click', () => applyCurveSlotAndSave(curveSlotTarget));
+  $('curve-slot-save').addEventListener('click', () => saveCurveSlot(curveSlotTarget));
+  $('curve-slot-export').addEventListener('click', () => exportCurveSlot(curveSlotTarget));
+  $('curve-slot-rename').addEventListener('click', () => renameCurveSlot(curveSlotTarget));
+  $('curve-slot-import').addEventListener('click', () => $('curve-slot-file').click());
+  $('curve-slot-file').addEventListener('change', (event) => {
+    const file = event.target.files && event.target.files[0];
+    event.target.value = '';
+    importCurveSlotFile(curveSlotTarget, file);
+  });
+  document.querySelectorAll('[data-curve-slot-close]').forEach((element) => {
+    element.addEventListener('click', closeCurveSlotDialog);
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && !$('curve-slot-modal').hidden) closeCurveSlotDialog();
+  });
   renderCurveSlotStates();
+  renderCurveModeStates();
 }
 
 function svgElement(name, attributes = {}, text = '') {
@@ -3363,9 +3882,9 @@ function renderFanChart(kind = 'cpu') {
 // 父类分组：勾选父类 = 整组曲线显隐；▾ 弹窗勾选组内子类（CPU/SATA/NVMe 弹窗
 // 内含“取最高”聚合项）。
 const HISTORY_GROUPS = [
-  { key: 'cpu', label: 'CPU', color: '#3f6ff5', aggregateLabel: '取最高（核心最高）' },
-  { key: 'sata', label: 'SATA', color: '#18a779', aggregateLabel: 'SATA 取最高' },
-  { key: 'nvme', label: 'NVMe', color: '#a25bd7', aggregateLabel: 'NVMe 取最高' },
+  { key: 'cpu', label: 'CPU', color: '#3f6ff5', aggregateLabel: 'CPU最高' },
+  { key: 'sata', label: 'SATA', color: '#18a779', aggregateLabel: 'SATA最高' },
+  { key: 'nvme', label: 'NVMe', color: '#a25bd7', aggregateLabel: 'NVMe最高' },
   { key: 'gpu', label: 'GPU', color: '#e05252' },
   { key: 'nic', label: '网卡', color: '#e6a53c' },
   { key: 'other', label: '其它', color: '#2aa8a8' },
@@ -3424,11 +3943,11 @@ let historyOpenPopoverKey = null; // 当前展开的父类弹窗
 let historyLegendIdentity = '';   // 图例内容标识，未变化时不重建（保护展开弹窗）
 
 let historySeriesEnabled = loadHistorySeriesEnabled(); // 父类开关；未记录的组走默认（见 defaultHistoryGroupEnabled）
-// 历史曲线显隐默认（用户确认）：CPU/SATA/NVMe 只画"取最高"聚合线、风扇组
-// 全画；GPU/网卡/其它默认不画，进图例弹窗按需开——一张图不再默认铺满
-// 全部核心与单盘明细曲线。
+// 历史曲线显隐默认（用户确认）：七个父类默认全开；CPU/SATA/NVMe 只画「最高」
+// 聚合线，GPU 全画，网卡与「其它」默认只画最关心的两个传感器（见下面的
+// defaultHistoryChildSelection）——一张图不被几十条明细曲线铺满。
 function defaultHistoryGroupEnabled(groupKey) {
-  return groupKey === 'cpu' || groupKey === 'sata' || groupKey === 'nvme' || groupKey === 'fan';
+  return HISTORY_GROUPS.some((group) => group.key === groupKey);
 }
 // 只读访问器（渲染与测试用）：直接写 historySeriesEnabled 的路径集中在 setHistoryGroupEnabled。
 function historySeriesEnabledFor(groupKey) {
@@ -3436,6 +3955,42 @@ function historySeriesEnabledFor(groupKey) {
   return value === undefined ? defaultHistoryGroupEnabled(groupKey) : value;
 }
 let historyChildSelection = loadHistoryChildSelection(); // 组内勾选；未记录的组走默认（见 defaultHistoryChildSelection）
+
+// 默认勾选改版（v2）：CPU/SATA/NVMe 改名「…最高」、GPU/网卡/其它默认打开。
+// 老浏览器里存着上一版偏好（只开 CPU/SATA/NVMe、其它组不画），不清掉就永远
+// 看不到新默认，所以按版本号一次性清空显隐与组内勾选，并把新默认推回后端。
+const HISTORY_DEFAULTS_VERSION = 2;
+const HISTORY_DEFAULTS_VERSION_KEY = 'tad-history-defaults-version';
+let historyDefaultsMigrated = false;
+
+function migrateHistoryDefaults() {
+  let stored = 0;
+  let hadLocalPrefs = false;
+  try {
+    stored = Number(window.localStorage.getItem(HISTORY_DEFAULTS_VERSION_KEY)) || 0;
+    hadLocalPrefs = Boolean(
+      window.localStorage.getItem('tad-history-series')
+      || window.localStorage.getItem('tad-history-children')
+      || window.localStorage.getItem('tad-history-disks'),
+    );
+  } catch (error) {
+    stored = 0;
+  }
+  if (stored >= HISTORY_DEFAULTS_VERSION) return false;
+  try { window.localStorage.setItem(HISTORY_DEFAULTS_VERSION_KEY, String(HISTORY_DEFAULTS_VERSION)); }
+  catch (error) { /* 隐私模式下写不进去：本会话仍按新默认画 */ }
+  // 全新浏览器没有旧偏好要清，直接记版本号：让服务端 ui_prefs 照常采纳，
+  // 换设备看到的仍是账号里的勾选。
+  if (!hadLocalPrefs) return false;
+  historySeriesEnabled = {};
+  historyChildSelection = {};
+  saveHistorySeriesEnabled();
+  saveHistoryChildSelection();
+  historyDefaultsMigrated = true;
+  return true;
+}
+
+migrateHistoryDefaults();
 
 // ---- 窗口式回看（30 分钟–24 小时各档，监控录像机式拖动窗口）----
 // 横轴永远只显示所选档位的时间跨度（窗口），背后拉取约 8 倍跨度的数据，
@@ -3620,11 +4175,20 @@ function historyRangeLabel(hours) {
   return minutes > 0 ? `${whole} 小时 ${minutes} 分` : `${whole} 小时`;
 }
 
-// 组内默认（用户确认）：CPU/SATA/NVMe 只勾"取最高"聚合项（__agg__），
-// 其余组（风扇/GPU/网卡/其它）null=全部显示。未记录（新设备/清缓存）时生效；
-// 显式记录（含关组清空的空集合）优先于默认。
+// 组内默认（用户确认）：CPU/SATA/NVMe 只勾「最高」聚合项（__agg__）；
+// GPU 全部显示（null）；网卡默认两条业务口/光模块；「其它」默认主板与 PCB 温度。
+// 未记录的组（新设备/清缓存/默认版本升级）走这里，显式记录优先。
+const HISTORY_DEFAULT_CHILDREN = {
+  cpu: ['__agg__'],
+  sata: ['__agg__'],
+  nvme: ['__agg__'],
+  nic: ['mlx5:sensor0', 'mlx5:Module1'],
+  other: ['spd5118:temp1', 'it8613:temp2'],
+};
+
 function defaultHistoryChildSelection(groupKey) {
-  return groupKey === 'cpu' || groupKey === 'sata' || groupKey === 'nvme' ? new Set(['__agg__']) : null;
+  const ids = HISTORY_DEFAULT_CHILDREN[groupKey];
+  return ids ? new Set(ids) : null;
 }
 
 function historyChildSelectionFor(groupKey) {
@@ -3632,6 +4196,18 @@ function historyChildSelectionFor(groupKey) {
   if (stored === undefined) return defaultHistoryChildSelection(groupKey);
   if (stored === null) return null; // 显式"全部显示"
   return stored instanceof Set ? stored : new Set(stored); // 统一为 Set，调用方用 has()
+}
+
+// 生效的勾选：走默认值、而默认键在这台机器上一条都不存在时（换了网卡、
+// 没插光模块），退回「全部显示」——否则整组默认空着，看起来像坏了。
+// 用户自己勾过的组不猜（哪怕勾成空集合也是他的选择）。
+function historyEffectiveSelection(groupKey, childIDs) {
+  const selection = historyChildSelectionFor(groupKey);
+  if (selection === null) return null;
+  if (historyChildSelection[groupKey] === undefined && !childIDs.some((id) => selection.has(id))) {
+    return null;
+  }
+  return selection;
 }
 
 function setHistoryChildSelection(groupKey, selection) {
@@ -3796,10 +4372,11 @@ function historyTickLabel(ts, stepSeconds) {
 }
 
 // 单系列转点集：value 缺失（0/NaN，休眠或空置）的点直接剔除。
-function historySeriesPoints(samples, pick) {
+// 风扇组例外：0% 是关停档的正常读数，当成缺失会让线在停转那一刻断掉（整段 0 干脆没了）。
+function historySeriesPoints(samples, pick, allowZero = false) {
   return samples.filter((sample) => {
     const value = pick(sample);
-    return Number.isFinite(value) && value > 0;
+    return Number.isFinite(value) && (allowZero ? value >= 0 : value > 0);
   }).map((sample) => ({ ts: sample.ts, value: pick(sample) }));
 }
 
@@ -3815,6 +4392,7 @@ function historyDiskIDs(samples) {
 }
 
 // 有过 rpm>0 或 pwm>0 的才算有效风扇（没接风扇的空通道全 0，排除）。
+// 整段都在关停档时所有通道都是 0：这时退回全部通道，否则「风扇」组一条线都画不出来。
 function historyFanIDs(samples) {
   const fanIDs = [];
   const hasSignal = {};
@@ -3823,7 +4401,8 @@ function historyFanIDs(samples) {
     if (!fanIDs.includes(fan.id)) fanIDs.push(fan.id);
     if (fan.rpm > 0 || fan.pwm_percent > 0) hasSignal[fan.id] = true;
   }));
-  return fanIDs.filter((id) => hasSignal[id]);
+  const signaled = fanIDs.filter((id) => hasSignal[id]);
+  return signaled.length ? signaled : fanIDs;
 }
 
 function historySensorsOfGroup(samples, group) {
@@ -3914,12 +4493,16 @@ function historyChildColor(groupKey, childID, allIDs) {
 function historyGroupSeries(groupKey, samples, intervalSeconds) {
   const windowed = historyIsWindowed(historyRangeHours);
   const childIDs = historyGroupChildIDs(groupKey, samples);
-  const selection = historyChildSelectionFor(groupKey);
+  const selection = historyEffectiveSelection(groupKey, childIDs);
   const visible = (childID) => selection === null || selection.has(childID);
   return childIDs
     .filter((childID) => visible(childID))
     .map((childID) => {
-      const points = historySeriesPoints(samples, (sample) => historyChildValue(groupKey, childID, sample));
+      const points = historySeriesPoints(
+        samples,
+        (sample) => historyChildValue(groupKey, childID, sample),
+        groupKey === 'fan',
+      );
       return {
         id: `${groupKey}:${childID}`,
         color: historyChildColor(groupKey, childID, childIDs),
@@ -4045,9 +4628,7 @@ function renderHistoryChart() {
   renderHistoryLegend();
   renderHistoryScrubBar(scrub, win);
 
-  if (status) {
-    status.textContent = `已记录 ${samples.length} 个采样点 · 更新于 ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`;
-  }
+  if (status) status.textContent = '';
   // 自动刷新重绘会清掉十字线；若鼠标仍悬停在图上，按原位置恢复
   if (historyLastCursorEvent && !$('history-tooltip')?.hidden) showHistoryCursor(historyLastCursorEvent);
 }
@@ -4150,7 +4731,7 @@ function closeHistoryPopovers() {
 
 function fillHistoryPopover(groupKey, popover) {
   const childIDs = historyGroupChildIDs(groupKey, historyRangedSamples);
-  const selection = historyChildSelectionFor(groupKey);
+  const selection = historyEffectiveSelection(groupKey, childIDs);
   const visible = (childID) => selection === null || selection.has(childID);
   popover.replaceChildren();
   if (!childIDs.length) {
@@ -4167,9 +4748,10 @@ function fillHistoryPopover(groupKey, popover) {
     box.type = 'checkbox';
     box.checked = visible(childID);
     box.addEventListener('change', () => {
-      const current = historyChildSelectionFor(groupKey) === null
-        ? new Set(historyGroupChildIDs(groupKey, historyRangedSamples))
-        : new Set(historyChildSelectionFor(groupKey));
+      // 起点必须是「当前屏幕上看到的勾选」（可能来自默认值兜底出的全部），
+      // 否则先取消一条时会把默认那两条又当成全集，勾出反直觉的结果。
+      const effective = historyEffectiveSelection(groupKey, childIDs);
+      const current = effective === null ? new Set(childIDs) : new Set(effective);
       if (box.checked) current.add(childID);
       else current.delete(childID);
       setHistoryChildSelection(groupKey, current);
@@ -4245,6 +4827,12 @@ let historySeriesAdopted = false;
 function applyBackendHistorySeries(prefs) {
   if (historySeriesAdopted) return;
   historySeriesAdopted = true;
+  if (historyDefaultsMigrated) {
+    // 本地刚升到新默认：把空显隐推回后端（服务端旧勾选不能覆盖回来）
+    historyLegendIdentity = '';
+    saveUIPrefsQuietly();
+    return;
+  }
   const series = prefs?.history_series;
   const children = prefs?.history_children;
   if (!series && !children) return;
@@ -4346,8 +4934,8 @@ function historyCursorRows(sample) {
   const rows = [];
   HISTORY_GROUPS.forEach((group) => {
     if (!historySeriesEnabledFor(group.key)) return;
-    const selection = historyChildSelectionFor(group.key);
     const childIDs = historyGroupChildIDs(group.key, historyRangedSamples);
+    const selection = historyEffectiveSelection(group.key, childIDs);
     childIDs.forEach((childID) => {
       if (!(selection === null || selection.has(childID))) return;
       const value = historyChildValue(group.key, childID, sample);
@@ -4583,9 +5171,11 @@ function populateFanDevices(status, keepInputs) {
   });
   if (!keepInputs || rebuild) {
     Object.values(FAN_CURVE_GROUPS).forEach((group) => {
-      const configured = Array.isArray(config[group.configField])
+      // 默认绑定所有风扇：配置里没有（新装、或从没动过）时三条曲线都全选，
+      // 用户手动取消过某几个就照配置来。
+      const configured = Array.isArray(config[group.configField]) && config[group.configField].length
         ? config[group.configField]
-        : (config.device_id ? [config.device_id] : (fans.length === 1 ? [fans[0].id] : []));
+        : fans.map((fan) => fan.id);
       const selected = new Set(configured);
       $(group.containerID).querySelectorAll('input').forEach((input) => { input.checked = selected.has(input.value); });
     });
@@ -4615,6 +5205,8 @@ function fillFanInputs(fan = {}) {
   fillCurve('hdd', fan.hdd_curve || fan.disk_curve, DEFAULT_STORAGE_CURVE);
   fillCurve('nvme', fan.nvme_curve, DEFAULT_STORAGE_CURVE);
   fillFanSlotSelections(fan);
+  // 打开页面时按配置反推当前选中的曲线模式（关停／预设／全速／临时）
+  setCurveMode(detectCurveMode(fan));
 }
 
 function fillHistoryInputs(history = {}) {
@@ -4698,7 +5290,12 @@ $('history-clear').addEventListener('click', async () => {
     : flushed
       ? '长期记录的缓冲已补归档。清空数据库将删除全部在线历史采样，且无法恢复。确定清空？'
       : '清空数据库将删除全部历史采样，且无法恢复。确定清空？';
-  const confirmed = window.confirm(message);
+  const confirmed = await showAppConfirm({
+    title: '清空历史数据库',
+    message,
+    confirmText: '清空数据库',
+    danger: true,
+  });
   if (!confirmed) {
     setBusy(false);
     return; // 取消：补冲刷已生效（或已尝试），在线数据原样保留
@@ -4753,7 +5350,13 @@ $('runlog-export').addEventListener('click', () => {
 });
 
 $('runlog-clear').addEventListener('click', async () => {
-  if (!window.confirm('清空运行日志将删除当前日志与上一代备份，且无法恢复。确定清空？')) return;
+  const ok = await showAppConfirm({
+    title: '清空运行日志',
+    message: '清空运行日志将删除当前日志与上一代备份，且无法恢复。确定清空？',
+    confirmText: '清空日志',
+    danger: true,
+  });
+  if (!ok) return;
   setBusy(true);
   try {
     await request('api/log/clear', { method: 'POST', body: '{}' });
@@ -5282,6 +5885,7 @@ function render(status, keepInputs = false) {
   $('last-error').className = diagnosticError ? 'diagnostic-error' : 'diagnostic-ok';
   renderDiagnostics(status, fanStatus);
   renderStorageVisual(storageStatus);
+  renderStorageMobile(storageStatus);
   renderStorageTable(storageStatus);
   renderFanSlotTemperatures(storageStatus);
   renderFanHardwareWarning(fanStatus);
@@ -5840,7 +6444,10 @@ async function refresh(keepInputs = false) {
 }
 
 function reportPanelValidity(panelID) {
-  const invalid = [...$(panelID).querySelectorAll('[required]')]
+  const controls = $(panelID).querySelectorAll('[required]');
+  // NodeList 才有数值 length；测试桩里拿到的是不可迭代的占位对象，按“没有必填项”处理
+  const list = controls && typeof controls.length === 'number' ? Array.from(controls) : [];
+  const invalid = list
     .find((control) => !control.disabled && !control.checkValidity());
   if (!invalid) return true;
   invalid.reportValidity();
@@ -5863,6 +6470,7 @@ function fanConfigFromInputs() {
     min_pwm_percent: Number($('fan-min').value),
     emergency_temp_c: Number($('fan-emergency').value),
     poll_seconds: Number($('fan-poll').value),
+    off_mode: fanOffMode,
     curve: cpuCurve,
     hdd_curve: hddCurve,
     nvme_curve: nvmeCurve,
@@ -5894,43 +6502,71 @@ $('save-global').addEventListener('click', async () => {
   }
 });
 
-$('save-fan').addEventListener('click', async () => {
-  if (!reportPanelValidity('panel-fan')) return;
+// 保存后该亮哪一档：先按落盘的曲线反推（手动拖节点会落回「临时」），但如果是
+// 刚从某个自定义按键「应用并保存」过来的、曲线还跟按键里一致，就保住那个按键的选中态。
+function curveModeAfterSave(config) {
+  const detected = detectCurveMode(config);
+  const match = /^slot-([1-9])$/.exec(activeCurveMode || '');
+  if (detected !== 'temp' || !match) return detected;
+  const entry = curveSlotEntry(Number(match[1]));
+  if (!entry) return detected;
+  const sameCurve = (left, right) => Array.isArray(left) && Array.isArray(right)
+    && left.length === right.length
+    && left.every((point, index) => Math.round(Number(point.temp_c)) === Math.round(Number(right[index].temp_c))
+      && Math.round(Number(point.pwm_percent)) === Math.round(Number(right[index].pwm_percent)));
+  const same = CURVE_KINDS.every((kind) => sameCurve(config[CURVE_MODE_FIELDS[kind]], entry.curves[kind]));
+  return same ? activeCurveMode : detected;
+}
+
+// 保存并下发风扇控制：按钮与「应用并保存风扇控制」共用同一条路
+async function saveFanConfig() {
+  if (!reportPanelValidity('panel-fan')) return false;
   const config = fanConfigFromInputs();
   if (config.enabled && ![...config.cpu_fan_ids, ...config.hdd_fan_ids, ...config.nvme_fan_ids].length) {
     showMessage('启用风扇曲线前，至少需要为一条温度曲线选择风扇。', true, 'message-fan');
-    return;
+    return false;
   }
   const curves = [
     ['HDD/SATA', config.hdd_curve],
     ['NVMe', config.nvme_curve],
     ['CPU', config.curve],
   ];
+  const pwmFloor = config.off_mode ? 0 : config.min_pwm_percent;
   for (const [label, curve] of curves) {
     if (curve.length < CURVE_MIN_POINTS || curve.length > CURVE_MAX_POINTS) {
       showMessage(`${label}曲线必须包含 ${CURVE_MIN_POINTS}–${CURVE_MAX_POINTS} 个节点。`, true, 'message-fan');
-      return;
+      return false;
     }
-    if (curve.some((point, index) => point.pwm_percent < config.min_pwm_percent
+    if (curve.some((point, index) => point.pwm_percent < pwmFloor
         || (index > 0 && (point.temp_c <= curve[index - 1].temp_c || point.pwm_percent < curve[index - 1].pwm_percent)))) {
-      showMessage(`${label}曲线温度必须严格递增，转速不能随温度升高而下降，且不能低于最低转速。`, true, 'message-fan');
-      return;
+      showMessage(config.off_mode
+        ? `${label}曲线温度必须严格递增，转速不能随温度升高而下降。`
+        : `${label}曲线温度必须严格递增，转速不能随温度升高而下降，且不能低于最低转速。`, true, 'message-fan');
+      return false;
     }
     if (config.emergency_temp_c < curve[curve.length - 1].temp_c) {
       showMessage(`紧急满速温度不能低于最后一个${label}曲线节点。`, true, 'message-fan');
-      return;
+      return false;
     }
   }
   setBusy(true);
   try {
     render(await request('api/config/fan', { method: 'POST', body: JSON.stringify(config) }), true);
-    showMessage('风扇控制与三条温控曲线已保存并应用；其他配置未修改。', false, 'message-fan');
+    // 按刚落盘的配置反推选中档位：手动拖过节点会落回「临时」，关停／全速／预设各自对上
+    setCurveMode(curveModeAfterSave(config));
+    showMessage(config.off_mode
+      ? '风扇控制已保存：关停档生效，绑定风扇已停转。'
+      : '风扇控制与三条温控曲线已保存并应用；其他配置未修改。', false, 'message-fan');
+    return true;
   } catch (error) {
     showMessage(`保存失败：${error.message}`, true, 'message-fan');
+    return false;
   } finally {
     setBusy(false);
   }
-});
+}
+
+$('save-fan').addEventListener('click', () => { saveFanConfig(); });
 
 $('save-gpio').addEventListener('click', async () => {
   if (!commitGPIOScriptEditor()) return;
@@ -5963,7 +6599,13 @@ $('apply-now').addEventListener('click', async () => {
 });
 
 $('restore').addEventListener('click', async () => {
-  if (!window.confirm('确定关闭自动控制，并恢复首次捕获的功耗限制与 BIOS 风扇模式吗？')) return;
+  const ok = await showAppConfirm({
+    title: '关闭自动控制',
+    message: '确定关闭自动控制，并恢复首次捕获的功耗限制与 BIOS 风扇模式吗？',
+    confirmText: '关闭并恢复',
+    danger: true,
+  });
+  if (!ok) return;
   setBusy(true);
   try {
     render(await request('api/restore', { method: 'POST', body: '{}' }));
@@ -6117,7 +6759,8 @@ setupHistoryExport();
 setupSensorNames();
 setupSerialSensor();
 $('gpio-enabled').addEventListener('change', updateGPIOEnabledState);
-$('gpio-refresh-sdcard').addEventListener('click', refreshSDCardManually);
+$('gpio-refresh-sdcard').addEventListener('click', () => refreshSDCardManually());
+$('storage-refresh-sdcard').addEventListener('click', () => refreshSDCardManually($('storage-refresh-sdcard'), $('storage-mobile-status')));
 $('gpio-script-add').addEventListener('click', () => openGPIOScriptEditor());
 $('gpio-script-cancel').addEventListener('click', closeGPIOScriptEditor);
 $('gpio-script-commit').addEventListener('click', commitGPIOScriptEditor);

@@ -40,13 +40,23 @@ func TestDefaultFanConfigIsSafeAndDisabled(t *testing.T) {
 	if cfg.MinPWMPercent != 40 || cfg.EmergencyTempC != 85 || cfg.PollSeconds != 2 {
 		t.Fatalf("unexpected defaults: %+v", cfg)
 	}
-	if len(cfg.Curve) != 4 || cfg.Curve[0].PWMPercent != 40 || cfg.Curve[len(cfg.Curve)-1].PWMPercent != 100 {
-		t.Fatalf("unexpected default curve: %+v", cfg.Curve)
+	// 出厂默认＝系统集成的「平衡」档（8 点 CPU / 8 点 HDD / 4 点 NVMe），
+	// 直接和 builtinFanCurves 对齐，改参数时这里不用跟着改数字。
+	balanced := builtinFanCurves["balanced"]
+	if !fanPointsEqual(cfg.Curve, clampCurvePWM(balanced.CPU, cfg.MinPWMPercent)) {
+		t.Fatalf("unexpected default CPU curve: %+v", cfg.Curve)
 	}
-	for name, curve := range map[string][]FanPoint{"HDD": cfg.HDDCurve, "NVMe": cfg.NVMeCurve} {
-		if len(curve) != 3 || curve[0].TempC != 25 || curve[0].PWMPercent != 40 || curve[1].TempC != 35 || curve[1].PWMPercent != 85 || curve[2].TempC != 50 || curve[2].PWMPercent != 100 {
-			t.Fatalf("unexpected default %s curve: %+v", name, curve)
-		}
+	if !fanPointsEqual(cfg.HDDCurve, clampCurvePWM(balanced.HDD, cfg.MinPWMPercent)) {
+		t.Fatalf("unexpected default HDD curve: %+v", cfg.HDDCurve)
+	}
+	if !fanPointsEqual(cfg.NVMeCurve, clampCurvePWM(balanced.NVMe, cfg.MinPWMPercent)) {
+		t.Fatalf("unexpected default NVMe curve: %+v", cfg.NVMeCurve)
+	}
+	if len(cfg.Curve) != 8 || len(cfg.HDDCurve) != 8 || len(cfg.NVMeCurve) != 4 {
+		t.Fatalf("default curve shape changed: CPU=%d HDD=%d NVMe=%d", len(cfg.Curve), len(cfg.HDDCurve), len(cfg.NVMeCurve))
+	}
+	if cfg.Curve[0].PWMPercent != 40 || cfg.Curve[len(cfg.Curve)-1].PWMPercent != 100 {
+		t.Fatalf("default CPU curve must start at minimum and end at 100%%: %+v", cfg.Curve)
 	}
 	if len(cfg.HDDSlotIDs) != 6 || len(cfg.NVMeSlotIDs) != 4 {
 		t.Fatalf("all storage slots must participate by default: HDD=%v NVMe=%v", cfg.HDDSlotIDs, cfg.NVMeSlotIDs)
@@ -56,16 +66,18 @@ func TestDefaultFanConfigIsSafeAndDisabled(t *testing.T) {
 func TestInterpolatePWMPercent(t *testing.T) {
 	cfg := DefaultFanConfig()
 	curve := cfg.Curve
+	// 出厂默认＝平衡档：20/42/44/60/70/75/80/85 °C → 40/40/47/47/55/65/85/100 %
 	tests := []struct {
 		temp float64
 		want int
 	}{
 		{30, 40},
-		{40, 40},
-		{47.5, 55},
-		{55, 70},
-		{70, 85},
-		{80, 100},
+		{42, 40},
+		{47.5, 47},
+		{55, 47},
+		{70, 55},
+		{75, 65},
+		{80, 85},
 		{85, 100},
 	}
 	for _, test := range tests {
@@ -163,7 +175,7 @@ func TestNormalizeConfigMigratesFanDefaults(t *testing.T) {
 	if !normalizeConfig(&cfg) {
 		t.Fatal("legacy config was not migrated")
 	}
-	if cfg.Fan.Enabled || cfg.Fan.MinPWMPercent != 40 || len(cfg.Fan.Curve) != 4 || len(cfg.Fan.HDDCurve) != 3 || len(cfg.Fan.NVMeCurve) != 3 || len(cfg.Fan.HDDSlotIDs) != 6 || len(cfg.Fan.NVMeSlotIDs) != 4 {
+	if cfg.Fan.Enabled || cfg.Fan.MinPWMPercent != 40 || len(cfg.Fan.Curve) != 8 || len(cfg.Fan.HDDCurve) != 8 || len(cfg.Fan.NVMeCurve) != 4 || len(cfg.Fan.HDDSlotIDs) != 6 || len(cfg.Fan.NVMeSlotIDs) != 4 {
 		t.Fatalf("unexpected migrated fan config: %+v", cfg.Fan)
 	}
 	if normalizeConfig(&cfg) {
@@ -205,7 +217,9 @@ func TestNormalizeConfigUpgradesUntouchedLegacyFanDefaults(t *testing.T) {
 	if cfg.Fan.MinPWMPercent != 40 || cfg.Fan.Curve[0].PWMPercent != 40 || cfg.Fan.HDDCurve[0].PWMPercent != 40 || cfg.Fan.NVMeCurve[0].PWMPercent != 40 {
 		t.Fatalf("旧默认没有整体升到新默认: %+v", cfg.Fan)
 	}
-	if cfg.Fan.Curve[1].PWMPercent != 70 || cfg.Fan.Curve[len(cfg.Fan.Curve)-1].PWMPercent != 100 || cfg.Fan.HDDCurve[1].PWMPercent != 85 {
+	// 升级后就是新的出厂默认（平衡档），逐点对齐
+	want := DefaultFanConfig()
+	if !fanPointsEqual(cfg.Fan.Curve, want.Curve) || !fanPointsEqual(cfg.Fan.HDDCurve, want.HDDCurve) || !fanPointsEqual(cfg.Fan.NVMeCurve, want.NVMeCurve) {
 		t.Fatalf("升级改动了曲线形态: %+v", cfg.Fan)
 	}
 	if normalizeConfig(&cfg) {
@@ -251,8 +265,8 @@ func TestNormalizeConfigMigratesDiskCurveWithoutReplacingCPUCurve(t *testing.T) 
 	if len(cfg.Fan.HDDCurve) != 2 || cfg.Fan.HDDCurve[0].TempC != 28 || cfg.Fan.HDDCurve[1].PWMPercent != 100 {
 		t.Fatalf("legacy disk curve was not copied to HDD: %+v", cfg.Fan.HDDCurve)
 	}
-	if len(cfg.Fan.NVMeCurve) != 3 || cfg.Fan.NVMeCurve[0].PWMPercent != 30 || cfg.Fan.NVMeCurve[1].PWMPercent != 85 {
-		t.Fatalf("NVMe curve did not inherit the configured minimum: %+v", cfg.Fan.NVMeCurve)
+	if !fanPointsEqual(cfg.Fan.NVMeCurve, defaultStorageFanCurve(30)) {
+		t.Fatalf("NVMe curve did not fall back to the balanced default: %+v", cfg.Fan.NVMeCurve)
 	}
 	if cfg.Fan.DiskCurve != nil {
 		t.Fatalf("legacy disk curve was not cleared: %+v", cfg.Fan.DiskCurve)
@@ -264,6 +278,8 @@ func TestNormalizeConfigMigratesDiskCurveWithoutReplacingCPUCurve(t *testing.T) 
 
 func TestNormalizeConfigPreservesExplicitlyDisabledStorageMonitoring(t *testing.T) {
 	cfg := Config{Fan: DefaultFanConfig(), GPIO: DefaultGPIOConfig(), Log: DefaultLogConfig()}
+	// 已经归一化过的配置：传感器默认显示名早已补过，这里不该再被改
+	cfg.SensorNameDefaultsApplied = true
 	cfg.Fan.HDDSlotIDs = []string{}
 	cfg.Fan.NVMeSlotIDs = []string{}
 	cfg.History = HistoryConfig{Enabled: false, MaxSizeMB: 32, RetentionDays: historyDefaultRetentionDays}
@@ -286,15 +302,15 @@ func TestFanTargetsUseHigherCurve(t *testing.T) {
 	cfg.NVMeCurve = []FanPoint{{TempC: 30, PWMPercent: 30}, {TempC: 70, PWMPercent: 90}}
 
 	cpu, hdd, nvme, target := fanTargets(cfg, 60, 25, true, 30, true)
-	if cpu != 65 || hdd != 30 || nvme != 30 || target != 65 {
+	if cpu != 65 || hdd != 40 || nvme != 30 || target != 65 {
 		t.Fatalf("CPU should control cool storage: cpu=%d hdd=%d nvme=%d target=%d", cpu, hdd, nvme, target)
 	}
 	cpu, hdd, nvme, target = fanTargets(cfg, 45, 35, true, 30, true)
-	if cpu != 39 || hdd != 85 || nvme != 30 || target != 85 {
+	if cpu != 39 || hdd != 47 || nvme != 30 || target != 47 {
 		t.Fatalf("HDD should control: cpu=%d hdd=%d nvme=%d target=%d", cpu, hdd, nvme, target)
 	}
 	cpu, hdd, nvme, target = fanTargets(cfg, 45, 25, true, 70, true)
-	if cpu != 39 || hdd != 30 || nvme != 90 || target != 90 {
+	if cpu != 39 || hdd != 40 || nvme != 90 || target != 90 {
 		t.Fatalf("NVMe should control: cpu=%d hdd=%d nvme=%d target=%d", cpu, hdd, nvme, target)
 	}
 	_, hdd, nvme, target = fanTargets(cfg, 45, 0, false, 0, false)
@@ -336,7 +352,8 @@ func TestFanControlSourceReportsAllTiedSources(t *testing.T) {
 
 func TestFanValidationRejectsDecreasingSpeed(t *testing.T) {
 	cfg := DefaultFanConfig()
-	cfg.Curve[2].PWMPercent = 40
+	// 默认 CPU 曲线第 3、4 点都是 47%：把第 4 点压到 40% 就构成递减
+	cfg.Curve[3].PWMPercent = 40
 	if err := (&Manager{}).validateFanLocked(cfg); err == nil {
 		t.Fatal("decreasing PWM curve was accepted")
 	}
@@ -344,7 +361,8 @@ func TestFanValidationRejectsDecreasingSpeed(t *testing.T) {
 
 func TestFanValidationRejectsDecreasingStorageSpeed(t *testing.T) {
 	cfg := DefaultFanConfig()
-	cfg.NVMeCurve[2].PWMPercent = 40
+	// 默认 NVMe 曲线是 40/40/60/70：末点压到 50 就构成递减
+	cfg.NVMeCurve[3].PWMPercent = 50
 	if err := (&Manager{}).validateFanLocked(cfg); err == nil {
 		t.Fatal("decreasing NVMe PWM curve was accepted")
 	}
@@ -1020,5 +1038,323 @@ func TestFanDebugAutoRampDoneAtFullScale(t *testing.T) {
 	}
 	if !entry.Done || entry.Running {
 		t.Fatalf("ramp at unit max should be done, got %+v", entry)
+	}
+}
+
+// 卸载 / 重装：release-fans 必须把风扇写回接管前的 BIOS 自动模式，
+// 同时把配置里的风扇控制关掉——否则重装后服务一启动又会抢回控制权。
+func TestReleaseFansHandsControlBackToBIOS(t *testing.T) {
+	manager := newFanDebugTestManager(t)
+	hwmon := filepath.Join(manager.Root, "sys", "class", "hwmon", "hwmon3")
+	pwm1 := filepath.Join(hwmon, "pwm1")
+	enable1 := filepath.Join(hwmon, "pwm1_enable")
+
+	// 接管前存档：BIOS 自动模式(2) + PWM 102
+	state := originalFanState{
+		Version:    fanStateVersion,
+		CapturedAt: time.Now(),
+		Fans:       []originalFan{{ID: "it8613:hwmon3:fan1", PWM: 102, Mode: 2}},
+	}
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manager.fanStatePath(), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 当前是模块接管中：手动模式 + 自定义 PWM
+	cfg := DefaultFanConfig()
+	cfg.Enabled = true
+	cfg.CPUFanIDs = []string{"it8613:hwmon3:fan1"}
+	if err := manager.SaveFanConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	writeTestValue(t, enable1, "1")
+	writeTestValue(t, pwm1, "200")
+
+	if err := manager.ReleaseFans(); err != nil {
+		t.Fatalf("release fans: %v", err)
+	}
+
+	// 硬件：pwm_enable 回到 BIOS 自动档，PWM 回到接管前的值
+	if got, _ := readInt(enable1); got != 2 {
+		t.Fatalf("pwm1_enable=%d, want 2 (BIOS auto)", got)
+	}
+	if got, _ := readInt(pwm1); got != 102 {
+		t.Fatalf("pwm1=%d, want 102 (captured original)", got)
+	}
+
+	// 配置：风扇控制落盘为关闭，重装后不会自动接管
+	raw, err := os.ReadFile(manager.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saved Config
+	if err := json.Unmarshal(raw, &saved); err != nil {
+		t.Fatal(err)
+	}
+	if saved.Fan.Enabled {
+		t.Fatal("fan control must be disabled on disk after release")
+	}
+	if len(saved.Fan.CPUFanIDs) != 1 || saved.Fan.CPUFanIDs[0] != "it8613:hwmon3:fan1" {
+		t.Fatalf("release must not throw away fan bindings: %+v", saved.Fan.CPUFanIDs)
+	}
+}
+
+// 没有接管过（没有原始状态存档）时 release 也要安全：配置关掉、不报错。
+func TestReleaseFansWithoutCapturedState(t *testing.T) {
+	manager := newFanDebugTestManager(t)
+	cfg := DefaultFanConfig()
+	cfg.Enabled = true
+	cfg.CPUFanIDs = []string{"it8613:hwmon3:fan1"}
+	if err := manager.SaveFanConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.ReleaseFans(); err != nil {
+		t.Fatalf("release without captured state should be a no-op, got %v", err)
+	}
+	raw, err := os.ReadFile(manager.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saved Config
+	if err := json.Unmarshal(raw, &saved); err != nil {
+		t.Fatal(err)
+	}
+	if saved.Fan.Enabled {
+		t.Fatal("fan control must be disabled even without a captured state")
+	}
+}
+
+// 全新安装：三条曲线都要绑到所有有转速反馈的风扇、打开风扇控制、用平衡档。
+func TestBindAllFansDefaultEnablesEveryCurve(t *testing.T) {
+	manager := newFanDebugTestManager(t)
+	if err := manager.BindAllFansDefault(); err != nil {
+		t.Fatalf("bind all fans: %v", err)
+	}
+	raw, err := os.ReadFile(manager.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saved Config
+	if err := json.Unmarshal(raw, &saved); err != nil {
+		t.Fatal(err)
+	}
+	if !saved.Fan.Enabled {
+		t.Fatal("fresh install should enable fan control by default")
+	}
+	// fixture 里 fan1 有 1200 RPM、fan2 是 0 RPM（未接），只绑有反馈的那个
+	for name, ids := range map[string][]string{"cpu": saved.Fan.CPUFanIDs, "hdd": saved.Fan.HDDFanIDs, "nvme": saved.Fan.NVMeFanIDs} {
+		if len(ids) != 1 || ids[0] != "it8613:hwmon3:fan1" {
+			t.Fatalf("%s fan ids = %v, want [it8613:hwmon3:fan1]", name, ids)
+		}
+	}
+	if len(saved.Fan.HDDSlotIDs) != 6 || len(saved.Fan.NVMeSlotIDs) != 4 {
+		t.Fatalf("all storage slots must be bound: HDD=%v NVMe=%v", saved.Fan.HDDSlotIDs, saved.Fan.NVMeSlotIDs)
+	}
+	balanced := builtinFanCurves["balanced"]
+	if !fanPointsEqual(saved.Fan.Curve, clampCurvePWM(balanced.CPU, saved.Fan.MinPWMPercent)) {
+		t.Fatalf("fresh install must use the balanced CPU curve: %+v", saved.Fan.Curve)
+	}
+}
+
+// 关停档：曲线允许整条 0%（最低转速 40% 让位），下发时确实写 0。
+func TestOffModeAllowsZeroPWMAndWritesZero(t *testing.T) {
+	manager := newFanDebugTestManager(t)
+	hwmon := filepath.Join(manager.Root, "sys", "class", "hwmon", "hwmon3")
+	pwm1 := filepath.Join(hwmon, "pwm1")
+
+	cfg := DefaultFanConfig()
+	cfg.Enabled = true
+	cfg.OffMode = true
+	cfg.CPUFanIDs = []string{"it8613:hwmon3:fan1"}
+	for i := range cfg.Curve {
+		cfg.Curve[i].PWMPercent = 0
+	}
+	for i := range cfg.HDDCurve {
+		cfg.HDDCurve[i].PWMPercent = 0
+	}
+	for i := range cfg.NVMeCurve {
+		cfg.NVMeCurve[i].PWMPercent = 0
+	}
+	if err := manager.SaveFanConfig(cfg); err != nil {
+		t.Fatalf("关停档的 0%% 曲线必须被接受: %v", err)
+	}
+	if got, _ := readInt(pwm1); got != 0 {
+		t.Fatalf("关停档应写 0，实际 pwm1=%d", got)
+	}
+
+	// 落盘的 off_mode 要在，重启后仍按关停跑
+	raw, err := os.ReadFile(manager.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saved Config
+	if err := json.Unmarshal(raw, &saved); err != nil {
+		t.Fatal(err)
+	}
+	if !saved.Fan.OffMode {
+		t.Fatal("off_mode 必须落盘，否则重启就退出关停档")
+	}
+}
+
+// 不开关停档时，同样一条 0% 曲线仍要被最低转速拦下。
+func TestZeroPWMWithoutOffModeRejected(t *testing.T) {
+	cfg := DefaultFanConfig()
+	cfg.Enabled = true
+	cfg.CPUFanIDs = []string{"it8613:hwmon3:fan1"}
+	for i := range cfg.Curve {
+		cfg.Curve[i].PWMPercent = 0
+	}
+	if err := (&Manager{}).validateFanLocked(cfg); err == nil {
+		t.Fatal("非关停档的 0% 曲线必须被拒绝")
+	}
+}
+
+// 关停优先级高于最低转速，但压不过紧急温度：CPU 到 85°C 仍要满速兜底。
+func TestOffModeStillFallsBackToFullSpeedOnEmergency(t *testing.T) {
+	manager := newFanDebugTestManager(t)
+	coretemp := filepath.Join(manager.Root, "sys", "class", "hwmon", "hwmon9")
+	writeTestValue(t, filepath.Join(coretemp, "temp1_input"), "90000")
+	pwm1 := filepath.Join(manager.Root, "sys", "class", "hwmon", "hwmon3", "pwm1")
+
+	cfg := DefaultFanConfig()
+	cfg.Enabled = true
+	cfg.OffMode = true
+	cfg.CPUFanIDs = []string{"it8613:hwmon3:fan1"}
+	for i := range cfg.Curve {
+		cfg.Curve[i].PWMPercent = 0
+	}
+	for i := range cfg.HDDCurve {
+		cfg.HDDCurve[i].PWMPercent = 0
+	}
+	for i := range cfg.NVMeCurve {
+		cfg.NVMeCurve[i].PWMPercent = 0
+	}
+	if err := manager.SaveFanConfig(cfg); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	if got, _ := readInt(pwm1); got != 255 {
+		t.Fatalf("超过紧急温度必须满速，实际 pwm1=%d", got)
+	}
+}
+
+// 关停档真的把风扇停住之后，转速反馈变 0 是预期结果：不能再被「无有效转速」判死。
+// 否则周期性应用会走 fail-safe 把风扇拉满，表现就是「关停之后隔一会儿又起转」。
+func TestOffModeKeepsWorkingWhenFanReportsZeroRPM(t *testing.T) {
+	manager := newFanDebugTestManager(t)
+	hwmon := filepath.Join(manager.Root, "sys", "class", "hwmon", "hwmon3")
+	pwm1 := filepath.Join(hwmon, "pwm1")
+	writeTestValue(t, filepath.Join(hwmon, "fan1_input"), "0") // 停转后的真实反馈
+
+	cfg := DefaultFanConfig()
+	cfg.Enabled = true
+	cfg.OffMode = true
+	cfg.CPUFanIDs = []string{"it8613:hwmon3:fan1"}
+	for i := range cfg.Curve {
+		cfg.Curve[i].PWMPercent = 0
+	}
+	for i := range cfg.HDDCurve {
+		cfg.HDDCurve[i].PWMPercent = 0
+	}
+	for i := range cfg.NVMeCurve {
+		cfg.NVMeCurve[i].PWMPercent = 0
+	}
+	if err := manager.SaveFanConfig(cfg); err != nil {
+		t.Fatalf("关停档不该因为 0 转被判死: %v", err)
+	}
+	if got, _ := readInt(pwm1); got != 0 {
+		t.Fatalf("关停档应写 0，实际 pwm1=%d", got)
+	}
+	// 周期性应用同样不能失败：失败会触发 fail-safe 把风扇拉满
+	if err := manager.ApplyFanCurrent(); err != nil {
+		t.Fatalf("周期性应用不能失败（会 fail-safe 拉满）: %v", err)
+	}
+	if got, _ := readInt(pwm1); got != 0 {
+		t.Fatalf("周期性应用之后仍应保持 0，实际 pwm1=%d", got)
+	}
+
+	status := manager.fanStatusLocked(cfg)
+	if !status.OffMode {
+		t.Fatal("状态里要带 off_mode，前端才能把 0 转说成关停而不是接线故障")
+	}
+	if status.TargetPWMPercent != 0 {
+		t.Fatalf("关停档的目标转速应是 0%%，实际 %d%%", status.TargetPWMPercent)
+	}
+	if status.CPUTargetPWMPercent != 0 {
+		t.Fatalf("关停档的 CPU 目标应是 0%%，实际 %d%%", status.CPUTargetPWMPercent)
+	}
+	if status.ControlSource != "" {
+		t.Fatalf("关停档不该报控制来源，实际 %q", status.ControlSource)
+	}
+}
+
+// 反过来：不开「关停」时，0 转的风扇仍然要被拦住（不能因为上面的放宽把保护拆掉）。
+func TestZeroRPMFanStillRejectedWithoutOffMode(t *testing.T) {
+	manager := newFanDebugTestManager(t)
+	hwmon := filepath.Join(manager.Root, "sys", "class", "hwmon", "hwmon3")
+	writeTestValue(t, filepath.Join(hwmon, "fan1_input"), "0")
+
+	cfg := DefaultFanConfig()
+	cfg.Enabled = true
+	cfg.CPUFanIDs = []string{"it8613:hwmon3:fan1"}
+	if err := (&Manager{Root: manager.Root}).validateFanLocked(cfg); err == nil {
+		t.Fatal("非关停档的 0 转风扇必须被判为不可控")
+	}
+}
+
+// 关停把风扇停住（RPM=0）之后切回正常档，必须能重新起转：
+// 保存不能因为「此刻 0 转」被拒（否则永远回不去），下发要真的把 PWM 拉起来，
+// 起转那几秒里周期性下发也不能判失败走 fail-safe。
+func TestLeavingOffModeSpinsFansBackUp(t *testing.T) {
+	manager := newFanDebugTestManager(t)
+	hwmon := filepath.Join(manager.Root, "sys", "class", "hwmon", "hwmon3")
+	pwm1 := filepath.Join(hwmon, "pwm1")
+	fan1 := filepath.Join(hwmon, "fan1_input")
+
+	off := DefaultFanConfig()
+	off.Enabled = true
+	off.OffMode = true
+	off.CPUFanIDs = []string{"it8613:hwmon3:fan1"}
+	for i := range off.Curve {
+		off.Curve[i].PWMPercent = 0
+	}
+	for i := range off.HDDCurve {
+		off.HDDCurve[i].PWMPercent = 0
+	}
+	for i := range off.NVMeCurve {
+		off.NVMeCurve[i].PWMPercent = 0
+	}
+	if err := manager.SaveFanConfig(off); err != nil {
+		t.Fatalf("save off: %v", err)
+	}
+	writeTestValue(t, fan1, "0") // 风扇真的停住了
+
+	on := DefaultFanConfig()
+	on.Enabled = true
+	on.CPUFanIDs = []string{"it8613:hwmon3:fan1"}
+	for i := range on.Curve {
+		on.Curve[i].PWMPercent = 100
+	}
+	if err := manager.SaveFanConfig(on); err != nil {
+		t.Fatalf("关停之后切回正常档必须能保存: %v", err)
+	}
+	if got, _ := readInt(pwm1); got != 255 {
+		t.Fatalf("切回正常档要把 PWM 拉满，实际 pwm1=%d", got)
+	}
+
+	// 风扇还在起转、转速仍是 0 的这段时间，周期性下发不能失败（失败会 fail-safe）
+	if err := manager.ApplyFanCurrent(); err != nil {
+		t.Fatalf("起转过渡期的周期性下发不能失败: %v", err)
+	}
+	if got, _ := readInt(pwm1); got != 255 {
+		t.Fatalf("周期性下发应保持满速，实际 pwm1=%d", got)
+	}
+
+	// 转速回来后一切照旧
+	writeTestValue(t, fan1, "1900")
+	if err := manager.ApplyFanCurrent(); err != nil {
+		t.Fatalf("转速恢复后下发仍应成功: %v", err)
 	}
 }

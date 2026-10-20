@@ -245,8 +245,8 @@ test('默认最低转速 40：前端兜底与后端默认值一致，默认曲�
   assert.match(go, /MinPWMPercent:\s*defaultMinPWMPercent/);
 });
 
-test('预设曲线模式：静音/平衡/性能覆盖三条曲线，且满足保存前的全部校验', () => {
-  const app = loadAppContext({ confirm: () => true });
+test('预设曲线模式：静音/平衡/性能三套系统集成参数都合法且互不相同', async () => {
+  const app = loadAppContext();
   app.element('fan-min').value = '40';
   app.element('fan-emergency').value = '85';
   const curveEditors = app.resolve('curveEditors');
@@ -258,8 +258,15 @@ test('预设曲线模式：静音/平衡/性能覆盖三条曲线，且满足保
     return acc;
   }, {});
 
+  // 套预设要过网页二次确认：点「确定」再等 promise
+  async function apply(mode) {
+    const pending = applyCurvePreset(mode);
+    await app.click('confirm-ok');
+    await pending;
+  }
+
   for (const mode of ['quiet', 'balanced', 'performance']) {
-    applyCurvePreset(mode);
+    await apply(mode);
     for (const kind of kinds) {
       const curve = curveEditors[kind].curve;
       assert.ok(curve.length >= 2 && curve.length <= 8, `${mode}/${kind} 节点数应在 2–8`);
@@ -277,89 +284,150 @@ test('预设曲线模式：静音/平衡/性能覆盖三条曲线，且满足保
     assert.deepEqual(snapshot(), snapshot(), `${mode} 套用两次结果要一致`);
   }
 
-  // 三档要有实质区别：性能档起步高于静音档，静音档起点是最低转速
-  applyCurvePreset('quiet');
+  // 三档必须是三套不同参数：静音起步 40%，性能一上来就是 47%
+  await apply('quiet');
   const quiet = snapshot();
-  applyCurvePreset('performance');
+  await apply('performance');
   const performance = snapshot();
   assert.notEqual(quiet.cpu, performance.cpu, '静音与性能不能是同一套曲线');
-  assert.match(quiet.cpu, /^48\/40,/, '静音档从最低转速起步');
-  assert.match(performance.cpu, /^34\/55,/, '性能档一上来就给更高转速');
+  assert.match(quiet.cpu, /^20\/40,/, '静音档从最低转速起步');
+  assert.match(performance.cpu, /^20\/47,/, '性能档一上来就给更高转速');
+  // 节点数与用户给的系统参数一致：HDD 8 点、NVMe 4 点
+  await apply('balanced');
+  assert.equal(curveEditors.hdd.curve.length, 8, 'HDD 平衡档应为 8 个节点');
+  assert.equal(curveEditors.nvme.curve.length, 4, 'NVMe 平衡档应为 4 个节点');
+  assert.equal(curveEditors.cpu.curve.length, 8, 'CPU 平衡档应为 8 个节点');
 });
 
-test('导出曲线参数：JSON 载荷带三条曲线与三个全局参数', () => {
-  const app = loadAppContext();
-  app.element('fan-min').value = '45';
-  app.element('fan-emergency').value = '90';
-  app.element('fan-poll').value = '3';
-  const payload = app.resolve('fanCurveExportPayload')();
-
-  assert.equal(payload.app, 'tad-module');
-  assert.equal(payload.kind, 'fan-curves');
-  assert.equal(payload.version, 1);
-  assert.match(payload.exported_at, /^\d{4}-\d{2}-\d{2}T/);
-  assert.equal(payload.min_pwm_percent, 45);
-  assert.equal(payload.emergency_temp_c, 90);
-  assert.equal(payload.poll_seconds, 3);
-  assert.equal(payload.curves.hdd.length, 3);
-  assert.equal(payload.curves.nvme.length, 3);
-  assert.equal(payload.curves.cpu.length, 4);
-  assert.equal(payload.curves.cpu[0].pwm_percent, 40);
-
-  // 也可以直接导出某个槽位的曲线（同样的载荷形状）
-  const slotPayload = app.resolve('fanCurveExportPayload')({ cpu: [{ temp_c: 30, pwm_percent: 50 }], hdd: [], nvme: [] });
-  assert.equal(slotPayload.curves.cpu[0].pwm_percent, 50);
-});
-
-test('自定义曲线槽位：空槽位不给载，存入后可载回，坏数据整槽作废', () => {
+test('曲线导出：文件头带全局参数与版本信息，导出全部只收已保存的按键', async () => {
   const store = new Map();
   const localStorage = {
     getItem: (key) => (store.has(key) ? store.get(key) : null),
     setItem: (key, value) => { store.set(key, String(value)); },
     removeItem: (key) => { store.delete(key); },
   };
-  const app = loadAppContext({ localStorage, confirm: () => true });
+  const app = loadAppContext({ localStorage });
+  app.element('fan-min').value = '45';
+  app.element('fan-emergency').value = '90';
+  app.element('fan-poll').value = '3';
+
+  const header = app.resolve('curvePayloadHeader')();
+  assert.equal(header.app, 'tad-module');
+  assert.equal(header.kind, 'fan-curve-slots');
+  assert.equal(header.version, 2);
+  assert.match(header.exported_at, /^\d{4}-\d{2}-\d{2}T/);
+  assert.equal(header.min_pwm_percent, 45);
+  assert.equal(header.emergency_temp_c, 90);
+  assert.equal(header.poll_seconds, 3);
+
+  // 一开始三个键都空：导出全部收集不到东西（跨 realm 数组只比长度）
+  assert.equal(app.resolve('savedCurveSlots')().length, 0);
+
+  // 存进按键 2 后，只收按键 2（不带空按键、不带当前编辑器曲线）
+  app.resolve('openCurveSlotDialog')(2);
+  const pending = app.click('curve-slot-save');
+  await app.click('confirm-ok');
+  await pending;
+  const slots = app.resolve('savedCurveSlots')();
+  assert.equal(slots.length, 1);
+  assert.equal(slots[0].slot, 2);
+  assert.equal(slots[0].name, '自定义 2');
+  assert.ok(slots[0].curves.hdd.length >= 2, '导出的曲线要带完整节点');
+});
+
+test('自定义曲线按键：点开弹窗不写存储，保存/应用/改名各键独立', async () => {
+  const store = new Map();
+  const localStorage = {
+    getItem: (key) => (store.has(key) ? store.get(key) : null),
+    setItem: (key, value) => { store.set(key, String(value)); },
+    removeItem: (key) => { store.delete(key); },
+  };
+  const app = loadAppContext({ localStorage });
   app.element('fan-min').value = '40';
   const curveEditors = app.resolve('curveEditors');
   const stored = () => JSON.parse(store.get('tad-fan-curve-slots') || '{}');
 
-  // 空槽位：点名字只提示，不写存储、不动曲线
+  // 空按键：点一下只开弹窗，不写存储、不动曲线
   const before = curveEditors.cpu.curve.length;
   app.click('curve-custom-1');
-  assert.equal(store.has('tad-fan-curve-slots'), false, '空槽位不该写本地存储');
-  assert.equal(curveEditors.cpu.curve.length, before, '空槽位不该改动当前曲线');
+  assert.equal(store.has('tad-fan-curve-slots'), false, '空按键不该写本地存储');
+  assert.equal(curveEditors.cpu.curve.length, before, '空按键不该改动当前曲线');
+  assert.equal(app.element('curve-slot-title').textContent, '自定义 1');
 
-  // 存：当前三条曲线进槽位 1，槽位按钮标记为「已保存」
-  app.element('fan-min').value = '40';
-  app.resolve('applyCurvePreset')('balanced');
-  app.click('curve-custom-1-save');
+  // 先套「平衡」再存，确保存进去的是有内容的 8 点曲线
+  const pendingPreset = app.resolve('applyCurvePreset')('balanced');
+  await app.click('confirm-ok');
+  await pendingPreset;
+
+  // 保存：当前三条曲线进按键 1（要过二次确认）
+  const pendingSave = app.click('curve-slot-save');
+  await app.click('confirm-ok');
+  await pendingSave;
   const saved = stored()['1'];
-  assert.ok(saved, '槽位 1 应被写入');
-  assert.equal(saved.cpu.length, 4);
-  assert.equal(saved.hdd.length, 3);
-  assert.equal(saved.nvme.length, 3);
-  assert.match(app.element('curve-custom-1').title, /载入自定义 1/);
+  assert.ok(saved, '按键 1 应被写入');
+  assert.equal(saved.name, '自定义 1');
+  assert.equal(saved.curves.cpu.length, 8);
+  assert.equal(saved.curves.hdd.length, 8);
+  assert.equal(saved.curves.nvme.length, 4);
+  assert.match(app.element('curve-custom-1').title, /打开「自定义 1」/);
 
-  // 改坏当前曲线后载回：应恢复槽位里的节点
+  // 应用：把按键里的节点填回编辑器（弹窗关掉后要重新点开按键）
   curveEditors.cpu.curve = [{ temp_c: 20, pwm_percent: 30 }, { temp_c: 95, pwm_percent: 100 }];
   app.click('curve-custom-1');
-  assert.equal(curveEditors.cpu.curve.length, 4, '载入应把槽位里的 4 个节点放回来');
-  assert.equal(curveEditors.cpu.curve[0].pwm_percent, saved.cpu[0].pwm_percent);
-  assert.equal(curveEditors.cpu.curve[0].temp_c, saved.cpu[0].temp_c);
+  const pendingApply = app.click('curve-slot-apply');
+  await app.click('confirm-ok');
+  await pendingApply;
+  assert.equal(curveEditors.cpu.curve.length, 8, '应用应把按键里的 8 个节点放回来');
+  assert.equal(curveEditors.cpu.curve[0].pwm_percent, saved.curves.cpu[0].pwm_percent);
+  assert.equal(curveEditors.cpu.curve[0].temp_c, saved.curves.cpu[0].temp_c);
 
-  // 槽位之间互不干扰
+  // 按键之间互不干扰
   assert.match(app.element('curve-custom-2').title, /还是空的/);
 
-  // 坏数据（节点数不足）整槽作废，不污染曲线编辑器
+  // 改名：只改按键 1 的名字，曲线内容不动
+  app.click('curve-custom-1');
+  const pendingRename = app.click('curve-slot-rename');
+  app.element('confirm-input').value = '夏天用';
+  await app.click('confirm-ok');
+  await pendingRename;
+  assert.equal(stored()['1'].name, '夏天用');
+  assert.equal(stored()['1'].curves.cpu.length, 8);
+  assert.equal(app.element('curve-custom-1').textContent, '夏天用');
+  assert.equal(store.has('tad-fan-curve-slots'), true);
+  assert.equal(Object.keys(stored()).length, 1, '改名不该凭空造出别的按键');
+
+  // 坏数据（节点数不足）整键作废，不污染曲线编辑器
   const broken = loadAppContext({
     localStorage: {
       getItem: () => JSON.stringify({ 1: { cpu: [{ temp_c: 40, pwm_percent: 40 }], hdd: [], nvme: [] } }),
       setItem() {}, removeItem() {},
     },
-    confirm: () => true,
   });
-  assert.equal(Object.keys(broken.resolve('curveSlots')).length, 0, '缺节点的槽位应被丢弃');
+  assert.equal(Object.keys(broken.resolve('curveSlots')).length, 0, '缺节点的按键应被丢弃');
   assert.match(broken.element('curve-custom-1').title, /还是空的/);
+});
+
+test('自定义曲线导入：认得新格式与旧单曲线文件，坏文件给出原因', () => {
+  const app = loadAppContext();
+  const parse = app.resolve('parseCurveSlotFile');
+  const curves = {
+    hdd: [{ temp_c: 20, pwm_percent: 40 }, { temp_c: 50, pwm_percent: 100 }],
+    nvme: [{ temp_c: 20, pwm_percent: 40 }, { temp_c: 55, pwm_percent: 60 }],
+    cpu: [{ temp_c: 20, pwm_percent: 40 }, { temp_c: 80, pwm_percent: 100 }],
+  };
+
+  const fresh = parse(JSON.stringify({ kind: 'fan-curve-slots', version: 2, slots: [{ slot: 1, name: '夜猫子', curves }] }));
+  assert.equal(fresh.name, '夜猫子');
+  assert.equal(fresh.count, 1);
+  assert.equal(fresh.curves.hdd.length, 2);
+
+  // 旧版单曲线文件没有 slots，也能导入（名字留空＝按键名字不变）
+  const legacy = parse(JSON.stringify({ kind: 'fan-curves', version: 1, curves }));
+  assert.equal(legacy.name, '');
+  assert.equal(legacy.curves.cpu[1].pwm_percent, 100);
+
+  assert.match(parse('{ not json').error, /JSON/);
+  assert.match(parse(JSON.stringify({ kind: 'fan-curves', curves: { hdd: [], nvme: [], cpu: [] } })).error, /曲线/);
 });
 
 // ---- 历史温度纯函数 ----
@@ -657,8 +725,12 @@ test('风扇调试参数四舍五入为整数——手输 1.5 这类小数不得
 
 test('清空数据库：点击即补冲刷（取消也发）；确认后 POST api/history/clear 并强制刷新缓存', async () => {
   const cancelled = recordingFetch(() => ({ ok: true, flushed: false }));
-  const cancelledApp = loadAppContext({ fetch: cancelled.fetch, confirm: () => false });
-  await cancelledApp.click('history-clear');
+  const cancelledApp = loadAppContext({ fetch: cancelled.fetch });
+  const pendingCancel = cancelledApp.click('history-clear');
+  // 弹窗要等补冲刷的请求回来才打开：先让出事件循环，再点取消
+  await new Promise((resolve) => setImmediate(resolve));
+  await cancelledApp.click('confirm-cancel');
+  await pendingCancel;
   assert.ok(
     cancelled.requests.some((req) => req.url.includes('api/history/archive')),
     '点击瞬间就应补冲刷（取消确认也发）',
@@ -667,7 +739,10 @@ test('清空数据库：点击即补冲刷（取消也发）；确认后 POST ap
 
   const { requests, fetch } = recordingFetch((href) => (href.includes('api/history/archive') ? { ok: true, flushed: true } : href.includes('api/history/clear') ? { ok: true } : { samples: [] }));
   const app = loadAppContext({ fetch });
-  await app.click('history-clear');
+  const pending = app.click('history-clear');
+  await new Promise((resolve) => setImmediate(resolve));
+  await app.click('confirm-ok');
+  await pending;
   const archiveIndex = requests.findIndex((req) => req.url.includes('api/history/archive'));
   const clearIndex = requests.findIndex((req) => req.url.includes('api/history/clear'));
   assert.ok(archiveIndex >= 0, '确认流程也应先补冲刷');
@@ -681,15 +756,15 @@ test('清空数据库：点击即补冲刷（取消也发）；确认后 POST ap
 });
 
 test('清空数据库：补冲刷失败时弹窗明示后果，用户确认仍可清空', async () => {
-  const confirms = [];
   const { requests, fetch } = recordingFetch((href) => (href.includes('api/history/archive') ? { ok: false, error: 'HDD 不可写' } : href.includes('api/history/clear') ? { ok: true } : { samples: [] }));
-  const app = loadAppContext({
-    fetch,
-    confirm: (message) => { confirms.push(message); return true; },
-  });
-  await app.click('history-clear');
+  const app = loadAppContext({ fetch });
+  const pending = app.click('history-clear');
+  await new Promise((resolve) => setImmediate(resolve));
+  // 网页弹窗（不是原生 confirm）：文案写在 confirm-message 里
+  assert.match(app.element('confirm-message').textContent, /冲刷失败/, '弹窗应明示冲刷失败与数据丢失后果');
+  await app.click('confirm-ok');
+  await pending;
   assert.equal(requests.filter((req) => req.url.includes('api/history/clear')).length, 1, '用户确认后仍应清空');
-  assert.match(confirms[0], /冲刷失败/, '弹窗应明示冲刷失败与数据丢失后果');
 });
 
 test('档位记忆挂后端：切档 POST api/config/ui-prefs；首帧采纳后端档位，手动切过后不被覆盖', async () => {
@@ -761,6 +836,29 @@ test('历史分组子类：空通道过滤、组别归类、聚合项与勾选�
   assert.equal(aggOnly.length, 1, '只勾聚合项时应只有一条线');
   assert.equal(aggOnly[0].id, 'sata:__agg__');
   assert.equal(aggOnly[0].color, '#18a779');
+});
+
+test('风扇曲线：转速 0% 的点照样画（关停档不能整段消失）', () => {
+  const historyGroupSeries = resolve('historyGroupSeries');
+  const historySeriesPoints = resolve('historySeriesPoints');
+  const pick = (sample) => sample.fans[0].pwm_percent;
+  const samples = [
+    { ts: 0, fans: [{ id: 'it8613:fan1', rpm: 1200, pwm_percent: 45 }] },
+    { ts: 60, fans: [{ id: 'it8613:fan1', rpm: 0, pwm_percent: 0 }] },
+    { ts: 120, fans: [{ id: 'it8613:fan1', rpm: 0, pwm_percent: 0 }] },
+  ];
+  // 温度类仍然把 0 当缺失，风扇组把 0 当正常读数
+  assert.equal(historySeriesPoints(samples, () => 0).length, 0);
+  assert.equal(historySeriesPoints(samples, pick, true).length, 3);
+
+  const series = historyGroupSeries('fan', samples, 60);
+  assert.equal(series.length, 1, '风扇组要有线');
+  const values = series[0].segments.flat().map((point) => point.value);
+  assert.equal(values[0], 45);
+  assert.equal(values[values.length - 1], 0, '停转之后的 0% 不能被丢掉');
+
+  // 整段都是 0（一直停在关停档）：通道也不能被当成空通道过滤掉
+  assert.equal(historyGroupSeries('fan', samples.slice(1), 60).length, 1);
 });
 
 test('父类取消勾选连带清空子类勾选，重新勾上后子类为空', () => {
@@ -842,12 +940,16 @@ test('运行日志：保存校验并 POST /api/config/log；导出发起下载�
   assert.equal(saves.length, 1);
   assert.deepEqual(JSON.parse(saves[0].init.body), { max_size_mb: 32 });
   assert.match(element('runlog-status').textContent, /32 MB/);
-  // 清空:取消不发
-  const cancelled = loadAppContext({ fetch: recordingFetch(() => ({})).fetch, confirm: () => false });
-  await cancelled.click('runlog-clear');
+  // 清空:取消不发（网页弹窗，点「取消」）
+  const cancelled = loadAppContext({ fetch: recordingFetch(() => ({})).fetch });
+  const pendingCancel = cancelled.click('runlog-clear');
+  await cancelled.click('confirm-cancel');
+  await pendingCancel;
   assert.equal(requests.filter((req) => req.url.includes('api/log/clear')).length, 0, '取消确认不应清空');
   // 确认后清空
-  await click('runlog-clear');
+  const pendingClear = click('runlog-clear');
+  await click('confirm-ok');
+  await pendingClear;
   const clears = requests.filter((req) => req.url.includes('api/log/clear'));
   assert.equal(clears.length, 1);
   assert.equal(clears[0].init.method, 'POST');
@@ -1009,36 +1111,40 @@ test('串口传感器状态行（多设备）：未保存/未启用/等待/已�
   );
 });
 
-test('历史曲线默认显隐：温度组只开聚合线+风扇全开，GPU/网卡/其它默认关', () => {
+test('历史曲线默认显隐：七组全开，CPU/SATA/NVMe 只画「最高」聚合线', () => {
   const defaultHistoryGroupEnabled = resolve('defaultHistoryGroupEnabled');
   const defaultHistoryChildSelection = resolve('defaultHistoryChildSelection');
-  for (const key of ['cpu', 'sata', 'nvme', 'fan']) {
+  for (const key of ['cpu', 'sata', 'nvme', 'gpu', 'nic', 'other', 'fan']) {
     assert.equal(defaultHistoryGroupEnabled(key), true, `${key} 默认应展示`);
   }
-  for (const key of ['gpu', 'nic', 'other']) {
-    assert.equal(defaultHistoryGroupEnabled(key), false, `${key} 默认应关闭`);
-  }
-  // 温度组默认只勾聚合项
+  // 温度组默认只勾「最高」聚合项
   for (const key of ['cpu', 'sata', 'nvme']) {
     const selection = defaultHistoryChildSelection(key);
-    assert.equal(selection.size, 1, `${key} 默认只勾聚合`);
+    assert.equal(selection.size, 1, `${key} 默认只勾最高`);
     assert.equal(selection.has('__agg__'), true, `${key} 默认勾 __agg__`);
   }
-  // 风扇等组默认全部显示
-  for (const key of ['fan', 'gpu', 'nic', 'other']) {
-    assert.equal(defaultHistoryChildSelection(key), null, `${key} 默认全部显示`);
-  }
+  // GPU 与风扇默认全部显示
+  assert.equal(defaultHistoryChildSelection('gpu'), null, 'GPU 默认全部显示');
+  assert.equal(defaultHistoryChildSelection('fan'), null, '风扇默认全部显示');
+  // 网卡 / 其它默认只勾最关心的两个传感器
+  assert.equal([...defaultHistoryChildSelection('nic')].join(','), 'mlx5:sensor0,mlx5:Module1');
+  assert.equal([...defaultHistoryChildSelection('other')].join(','), 'spd5118:temp1,it8613:temp2');
+  // 聚合项文案：CPU最高 / SATA最高 / NVMe最高
+  const labels = Array.from(resolve('HISTORY_GROUPS')).slice(0, 3).map((group) => group.aggregateLabel);
+  assert.equal(labels.join('|'), 'CPU最高|SATA最高|NVMe最高');
 });
 
 test('历史曲线显隐：未记录走默认，显式记录优先', () => {
   const historySeriesEnabledFor = resolve('historySeriesEnabledFor');
   const historyChildSelectionFor = resolve('historyChildSelectionFor');
-  // 未记录：默认（温度组开+聚合、其它组关）；用 nvme 验证——共享 vm 状态
+  // 未记录：默认（七组全开、温度组只勾聚合）；用 nvme 验证——共享 vm 状态
   // 里 sata 已被前序测试写过显式值
   assert.equal(historySeriesEnabledFor('nvme'), true);
-  assert.equal(historySeriesEnabledFor('gpu'), false);
+  assert.equal(historySeriesEnabledFor('gpu'), true, 'GPU 现在默认打开');
   const nvmeDefault = historyChildSelectionFor('nvme');
   assert.equal(nvmeDefault.has('__agg__'), true);
+  // 网卡默认只勾两条
+  assert.equal(historyChildSelectionFor('nic').size, 2);
   // 显式记录：优先于默认
   const setHistoryGroupEnabled = resolve('setHistoryGroupEnabled');
   setHistoryGroupEnabled('gpu', true);
@@ -1047,6 +1153,10 @@ test('历史曲线显隐：未记录走默认，显式记录优先', () => {
   assert.equal(historySeriesEnabledFor('nvme'), false);
   const cleared = historyChildSelectionFor('nvme');
   assert.equal(cleared.size, 0, '关组后子类勾选应为空集合');
+  // 默认勾的传感器一个都不在这台机器上时退回「全部显示」，别让整组空着
+  const historyEffectiveSelection = resolve('historyEffectiveSelection');
+  assert.equal(historyEffectiveSelection('nic', ['mlx5:sensor0', 'mlx5:Module1', 'r8169:temp1']).size, 2);
+  assert.equal(historyEffectiveSelection('nic', ['r8169:temp1']), null);
 });
 
 test('历史曲线偏好：服务端 ui_prefs 采纳一次，轮询/旧值不冲掉本地修改', () => {
@@ -1756,4 +1866,341 @@ test('「保存按钮控制」先把自动备份编辑器里的草稿收进来�
     Array.isArray(payload.autos) && payload.autos.some((rule) => rule.name === '归档到移动盘'),
     '编辑器草稿要落进提交的 autos'
   );
+});
+
+// ---- 曲线模式：静音/平衡/性能/临时/全速/关停/手动 ---------------------------
+const nextTick = () => new Promise((resolve) => setImmediate(resolve));
+
+function curvePercents(app) {
+  const editors = app.resolve('curveEditors');
+  return Array.from(app.resolve('CURVE_KINDS'))
+    .map((kind) => editors[kind].curve.map((point) => point.pwm_percent));
+}
+
+test('曲线模式：全速一次确认拉满 100%，关停必须两次确认才归零', async () => {
+  const { fetch } = recordingFetch(() => ({}));
+  const app = loadAppContext({ fetch });
+  app.element('fan-min').value = '40';
+  app.element('fan-emergency').value = '85';
+
+  const full = app.resolve('applyFullSpeed')();
+  await nextTick();
+  await app.click('confirm-ok');
+  await full;
+  curvePercents(app).forEach((list) => list.forEach((pwm) => assert.equal(pwm, 100, '全速档所有节点都该是 100%')));
+  assert.equal(app.resolve('activeCurveMode'), 'full');
+
+  const off = app.resolve('applyShutdown')();
+  await nextTick();
+  await app.click('confirm-ok');
+  await nextTick();
+  assert.equal(app.resolve('fanOffMode'), false, '第一次确认不得直接关停');
+  assert.ok(curvePercents(app).every((list) => list.every((pwm) => pwm === 100)), '第二次确认前曲线不能被改动');
+
+  // 第二次确认只剩一个红色动作「关停并保存风扇控制」：主按钮被藏起来
+  assert.equal(app.element('confirm-ok').hidden, true, '关停弹窗不该再有「确认关停」主按钮');
+  await app.click('confirm-secondary');
+  await off;
+  curvePercents(app).forEach((list) => list.forEach((pwm) => assert.equal(pwm, 0, '关停档所有节点都该是 0%')));
+  assert.equal(app.resolve('activeCurveMode'), 'off');
+  assert.equal(app.resolve('fanOffMode'), true, '关停档要允许 0% 通过曲线校验');
+  // 关停的优先级高于最低转速：下限降到 0
+  assert.equal(app.resolve('fanMinimumPWM')(), 0);
+});
+
+test('曲线模式：关停在第一次确认点取消，曲线与模式都不变', async () => {
+  const app = loadAppContext();
+  app.element('fan-min').value = '40';
+  app.element('fan-emergency').value = '85';
+  const before = JSON.stringify(curvePercents(app));
+
+  const off = app.resolve('applyShutdown')();
+  await nextTick();
+  await app.click('confirm-cancel');
+  await off;
+  assert.equal(JSON.stringify(curvePercents(app)), before, '取消后曲线必须原样');
+  assert.equal(app.resolve('fanOffMode'), false);
+});
+
+test('曲线模式：手动填百分比生成同值平线，越界输入被拦下', async () => {
+  const app = loadAppContext();
+  app.element('fan-min').value = '40';
+  app.element('fan-emergency').value = '85';
+
+  const rejected = app.resolve('applyManualSpeed')();
+  await nextTick();
+  app.element('confirm-input').value = '20'; // 低于 30% 下限
+  await app.click('confirm-ok');
+  await rejected;
+  assert.equal(app.resolve('activeCurveMode'), 'temp', '越界不该切换模式');
+
+  const applied = app.resolve('applyManualSpeed')();
+  await nextTick();
+  app.element('confirm-input').value = '55';
+  await app.click('confirm-ok');
+  await applied;
+  curvePercents(app).forEach((list) => list.forEach((pwm) => assert.equal(pwm, 55, '三条曲线应全部为 55%')));
+  assert.equal(app.resolve('activeCurveMode'), 'manual');
+});
+
+test('曲线模式：「临时」回到进入全速前的曲线', async () => {
+  const app = loadAppContext();
+  app.element('fan-min').value = '40';
+  app.element('fan-emergency').value = '85';
+  const before = JSON.stringify(curvePercents(app));
+
+  const full = app.resolve('applyFullSpeed')();
+  await nextTick();
+  await app.click('confirm-ok');
+  await full;
+  assert.notEqual(JSON.stringify(curvePercents(app)), before);
+
+  const temp = app.resolve('applyTempMode')();
+  await nextTick();
+  await app.click('confirm-ok');
+  await temp;
+  assert.equal(JSON.stringify(curvePercents(app)), before, '临时档要还原进入全速前的曲线');
+  assert.equal(app.resolve('activeCurveMode'), 'temp');
+});
+
+test('应用并保存风扇控制：副按钮直接下发 config/fan，关停带 off_mode', async () => {
+  const { requests, fetch } = recordingFetch((href) => (href.includes('api/config/fan') ? {} : {}));
+  const app = loadAppContext({ fetch });
+  app.element('fan-min').value = '40';
+  app.element('fan-emergency').value = '85';
+
+  const pending = app.resolve('applyShutdown')();
+  await nextTick();
+  await app.click('confirm-ok');
+  await nextTick();
+  await app.click('confirm-secondary');
+  await pending;
+
+  const post = requests.find((req) => req.url.includes('api/config/fan'));
+  assert.ok(post, '点「关停并保存风扇控制」应直接提交风扇配置');
+  const body = JSON.parse(post.init.body);
+  assert.equal(body.off_mode, true, '关停档要带 off_mode 让后端绕过最低转速');
+  assert.ok(body.curve.every((point) => point.pwm_percent === 0));
+  assert.ok(body.hdd_curve.every((point) => point.pwm_percent === 0));
+  assert.ok(body.nvme_curve.every((point) => point.pwm_percent === 0));
+});
+
+test('应用并保存风扇控制：预设弹窗的副按钮同样直接下发，且不带 off_mode', async () => {
+  const { requests, fetch } = recordingFetch(() => ({}));
+  const app = loadAppContext({ fetch });
+  app.element('fan-min').value = '40';
+  app.element('fan-emergency').value = '85';
+
+  const pending = app.resolve('applyCurvePreset')('performance');
+  await nextTick();
+  await app.click('confirm-secondary');
+  await pending;
+
+  const post = requests.find((req) => req.url.includes('api/config/fan'));
+  assert.ok(post, '「应用并保存风扇控制」要提交配置');
+  const body = JSON.parse(post.init.body);
+  assert.equal(body.off_mode, false);
+  assert.equal(body.curve[0].pwm_percent, 47, '性能档 CPU 第一档是 47%');
+  assert.equal(app.resolve('activeCurveMode'), 'performance');
+});
+
+test('关停档：0 转提示改成「因为设置曲线模式为关停」，不再往接线上带', () => {
+  const app = loadAppContext();
+  const notice = '因为设置曲线模式为关停，风扇转速反馈为 0 RPM。请尽快取消此模式以免损坏硬件。';
+  const stopped = { driver_detected: true, active: true, off_mode: true, fans: [{ id: 'it8613:fan1', rpm: 0, pwm_percent: 0 }] };
+  const issues = app.resolve('healthIssues')({ supported: true }, stopped, {}, {}).join('\n');
+  assert.match(issues, /因为设置曲线模式为关停，风扇转速反馈为 0 RPM/);
+  assert.doesNotMatch(issues, /请检查风扇接线/);
+
+  app.resolve('renderFanHardwareWarning')(stopped);
+  assert.equal(app.element('fan-warning-description').textContent, notice);
+  assert.equal(app.element('fan-warning-title').textContent, '风扇已按「关停」档停转');
+
+  // 没开关停档时还是接线/驱动提示
+  const normal = { driver_detected: true, active: true, fans: [{ id: 'it8613:fan1', rpm: 0, pwm_percent: 0 }] };
+  const normalIssues = app.resolve('healthIssues')({ supported: true }, normal, {}, {}).join('\n');
+  assert.match(normalIssues, /请检查风扇接线或驱动状态/);
+  app.resolve('renderFanHardwareWarning')(normal);
+  assert.equal(app.element('fan-warning-description').textContent, '已发现风扇通道，请检查单风扇接线、BIOS 模式或驱动状态。');
+});
+
+test('自定义按键：应用并保存风扇控制一点即下发（不用再回主界面点保存）', async () => {
+  const { requests, fetch } = recordingFetch(() => ({}));
+  const app = loadAppContext({ fetch });
+  // 首屏那次 refresh() 会比用例先落地：等它跑完再动手，否则它会把档位重置成「临时」
+  await nextTick();
+  app.element('fan-min').value = '40';
+  app.element('fan-emergency').value = '85';
+
+  // 先把当前曲线存进按键 1
+  app.click('curve-custom-1');
+  const pendingSave = app.click('curve-slot-save');
+  await app.click('confirm-ok');
+  await pendingSave;
+
+  // 弹窗里新增的绿底按钮：应用 + 直接下发，不用回主界面再点保存
+  app.click('curve-custom-1');
+  const pendingApply = app.click('curve-slot-apply-save');
+  await pendingApply;
+  const post = requests.find((req) => req.url.includes('api/config/fan'));
+  assert.ok(post, '「应用并保存风扇控制」要直接提交风扇配置');
+  const body = JSON.parse(post.init.body);
+  assert.ok(body.curve.length >= 2, '下发的 CPU 曲线要带完整节点');
+  assert.equal(body.off_mode, false);
+  assert.equal(app.resolve('activeCurveMode'), 'slot-1');
+});
+
+test('改名：留空不报错，自动填回「自定义 1/2/3」', async () => {
+  const store = new Map();
+  const localStorage = {
+    getItem: (key) => (store.has(key) ? store.get(key) : null),
+    setItem: (key, value) => { store.set(key, String(value)); },
+    removeItem: (key) => { store.delete(key); },
+  };
+  const app = loadAppContext({ localStorage });
+  app.click('curve-custom-2');
+
+  // 先改成一个真名字
+  let pending = app.click('curve-slot-rename');
+  await nextTick();
+  app.element('confirm-input').value = '静音老曲线';
+  await app.click('confirm-ok');
+  await pending;
+  assert.equal(app.element('curve-slot-title').textContent, '静音老曲线');
+
+  // 再留空改名：自动回落默认名，不报错
+  pending = app.click('curve-slot-rename');
+  await nextTick();
+  app.element('confirm-input').value = '   ';
+  await app.click('confirm-ok');
+  await pending;
+  assert.equal(app.element('curve-slot-title').textContent, '自定义 2');
+  assert.equal(JSON.parse(store.get('tad-fan-curve-slots'))['2'].name, '自定义 2', '留空要落成默认名');
+});
+
+test('曲线模式按键：页面里十个按键的先后顺序固定为 静音/平衡/性能/临时/全速/关停/手动/自定义 1-3', () => {
+  const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
+  const start = html.indexOf('class="curve-modes"');
+  const end = html.indexOf('class="curve-editors"');
+  assert.ok(start > 0 && end > start, 'index.html 里应有 curve-modes 区块');
+  const block = html.slice(start, end);
+  const ids = [...block.matchAll(/<button id="([^"]+)"/g)].map((match) => match[1]);
+  assert.deepEqual(ids, [
+    'curve-mode-quiet',
+    'curve-mode-balanced',
+    'curve-mode-performance',
+    'curve-mode-temp',
+    'curve-mode-full',
+    'curve-mode-off',
+    'curve-mode-manual',
+    'curve-custom-1',
+    'curve-custom-2',
+    'curve-custom-3',
+  ], '模式按键顺序与分组要一次固定下来，导出按钮已移除，按键组里只剩十个模式键');
+});
+
+test('页面：导出所有的按键已删除，自定义弹窗里改叫「应用到曲线」并新增绿底「应用并保存风扇控制」', () => {
+  const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
+  assert.equal(html.includes('curve-export'), false, '整页不该再有「导出所有自定义曲线参数」按键');
+  assert.match(html, /id="curve-slot-apply"[^>]*>应用到曲线</);
+  assert.match(html, /id="curve-slot-apply-save"[^>]*class="confirm-save"[^>]*>应用并保存风扇控制</);
+});
+
+test('曲线模式选中态：切到全速后只有「全速」带 active', () => {
+  const buttons = ['quiet', 'balanced', 'performance', 'temp', 'full', 'off', 'manual'].map((mode) => {
+    const classes = new Set();
+    return {
+      dataset: { curveMode: mode },
+      classes,
+      classList: {
+        toggle: (name, on) => { if (on) classes.add(name); else classes.delete(name); },
+      },
+      setAttribute() {},
+      addEventListener() {},
+    };
+  });
+  const app = loadAppContext({
+    querySelectorAll: (selector) => (selector === '[data-curve-mode]' ? buttons : []),
+  });
+  const setCurveMode = app.resolve('setCurveMode');
+  setCurveMode('full');
+  assert.deepEqual(buttons.filter((button) => button.classes.has('active')).map((button) => button.dataset.curveMode), ['full']);
+  setCurveMode('off');
+  assert.deepEqual(buttons.filter((button) => button.classes.has('active')).map((button) => button.dataset.curveMode), ['off']);
+  assert.equal(app.resolve('fanOffMode'), true, '关停档同时要放开 0% 的曲线下限');
+});
+
+test('模式反推：手动恒定值识别为 manual，拖过节点落回 temp，关停优先', () => {
+  const app = loadAppContext();
+  const detect = app.resolve('detectCurveMode');
+  const flat = (pwm) => [{ temp_c: 20, pwm_percent: pwm }, { temp_c: 85, pwm_percent: pwm }];
+  assert.equal(detect({ curve: flat(55), hdd_curve: flat(55), nvme_curve: flat(55) }), 'manual');
+  assert.equal(detect({ curve: flat(100), hdd_curve: flat(100), nvme_curve: flat(100) }), 'full');
+  assert.equal(detect({ curve: flat(55), hdd_curve: flat(60), nvme_curve: flat(55) }), 'temp');
+  assert.equal(detect({ off_mode: true, curve: flat(55), hdd_curve: flat(55), nvme_curve: flat(55) }), 'off');
+});
+
+test('硬盘面板：移动设备区块在槽位图之后、表格之前，带「刷新 SD 卡」按键', () => {
+  const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
+  assert.match(html, /id="storage-mobile-list"/);
+  assert.match(html, /id="storage-refresh-sdcard"[^>]*>刷新 SD 卡</);
+  const visualAt = html.indexOf('id="storage-visual"');
+  const mobileAt = html.indexOf('id="storage-mobile"');
+  const tableAt = html.indexOf('<tbody id="storage-body">');
+  assert.ok(visualAt > 0 && mobileAt > visualAt && tableAt > mobileAt, '移动设备区块应紧跟在槽位图之后');
+});
+
+test('硬盘面板刷新 SD 卡：走与按键映射同一个接口，结果回填到面板', async () => {
+  const { requests, fetch } = recordingFetch((href) => {
+    if (href.includes('api/gpio/refresh-sdcard')) return { summary: '已重新识别 1 个 USB 读卡器（2-1.4）' };
+    return {};
+  });
+  const app = loadAppContext({ fetch });
+  await app.click('storage-refresh-sdcard');
+  const call = requests.find((item) => item.url.includes('api/gpio/refresh-sdcard'));
+  assert.ok(call, '应发出刷新 SD 卡请求');
+  assert.equal(call.init.method, 'POST');
+  assert.match(app.element('storage-mobile-status').textContent, /已重新识别/);
+});
+
+test('移动设备图标：SD 卡与 U 盘各画一套，未知类型按 U 盘处理', () => {
+  const app = loadAppContext();
+  const icon = app.resolve('mobileDeviceIcon');
+  assert.ok(icon('sd'));
+  assert.ok(icon('usb'));
+  assert.ok(icon('harddisk'), '未知类型也要给出图标，不能是 undefined');
+});
+
+test('刷新 SD 卡：没读到介质时面板保持静默，按键映射页回到自己的说明', async () => {
+  const { fetch } = recordingFetch((href) => (href.includes('api/gpio/refresh-sdcard') ? { summary: '' } : {}));
+  const app = loadAppContext({ fetch });
+  await app.click('storage-refresh-sdcard');
+  // 面板里不再出现「没有读到存储介质…」这类提示，状态行留空
+  assert.equal(app.element('storage-mobile-status').textContent, '');
+  // 按键映射页那一行带着原来说明文字，空结果时用它兜底
+  const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
+  assert.match(html, /id="gpio-sdcard-status"[^>]*data-idle="[^"]+"/);
+});
+
+test('风扇模式弹窗：绿色「应用并保存风扇控制」排在最右边的按钮位', () => {
+  const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
+  const start = html.indexOf('<footer class="confirm-actions">');
+  const actionBar = html.slice(start, html.indexOf('</footer>', start));
+  const order = ['confirm-cancel', 'confirm-ok', 'confirm-secondary'].map((id) => actionBar.indexOf(`id="${id}"`));
+  assert.ok(order.every((index) => index >= 0), '三个按钮都要在确认弹窗里');
+  assert.ok(order[0] < order[1] && order[1] < order[2], '顺序应为 取消 → 主按钮 → 绿色保存按钮');
+  // 自定义曲线弹窗的绿底按钮同样贴右（foot 行 flex-end）
+  assert.ok(html.indexOf('class="curve-slot-foot"') > 0, '自定义曲线弹窗要有 foot 行');
+});
+
+test('移动设备渲染：没有设备与多设备两种情况都不报错', () => {
+  const app = loadAppContext();
+  const render = app.resolve('renderStorageMobile');
+  render({});
+  render({
+    mobile: [
+      { device: '/dev/sdf', name: 'SanDisk Extreme', kind: 'sd', kind_label: 'SD 卡', size_label: '59.5 GiB' },
+      { device: '/dev/sdg', name: 'Kingston', kind: 'usb', kind_label: 'U 盘', size_label: '28.9 GiB', mount_point: '/vol02/USB' },
+    ],
+  });
 });

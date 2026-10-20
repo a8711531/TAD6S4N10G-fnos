@@ -33,7 +33,7 @@
       } catch (error) { /* localStorage 不可用时跟随系统 */ }
     })();
   </script>
-  <link rel="stylesheet" href="styles.css?v=0.10.38">
+  <link rel="stylesheet" href="styles.css?v=0.10.48">
   <script>
     // 样式自愈：升级包后浏览器可能仍持有带长缓存的远古样式表（无 CSS 变量，
     // 表现为图表坐标线消失、文字变黑、主题切换无反应）。绕过缓存拉取服务端
@@ -112,6 +112,15 @@
               <span id="storage-updated" class="table-meta">等待刷新</span>
             </div>
             <div id="storage-visual" class="storage-visual" aria-label="硬盘机箱槽位图"></div>
+            <section id="storage-mobile" class="storage-mobile" aria-labelledby="storage-mobile-heading">
+              <div class="storage-mobile-head">
+                <h3 id="storage-mobile-heading">移动设备</h3>
+                <span id="storage-mobile-count" class="storage-mobile-count">未检测到</span>
+                <span id="storage-mobile-status" class="storage-mobile-status" role="status" aria-live="polite"></span>
+                <button id="storage-refresh-sdcard" type="button" class="ghost">刷新 SD 卡</button>
+              </div>
+              <div id="storage-mobile-list" class="storage-mobile-list"></div>
+            </section>
             <div class="table-scroll">
               <table class="status-table storage-table">
                 <thead><tr><th class="storage-col-slot">仓位</th><th class="storage-col-state">状态</th><th class="storage-col-activity">活动</th><th class="storage-col-util">繁忙度</th><th class="storage-col-device"><span class="storage-head-device">设备</span><span class="storage-head-model">型号</span></th><th class="storage-col-purpose">用途</th><th class="storage-col-health">健康</th><th class="storage-col-temp">温度</th></tr></thead>
@@ -149,7 +158,7 @@
             <div class="panel-heading fan-heading">
               <div>
                 <h2 id="fan-heading">HDD/SATA、NVMe 与 CPU 三温控曲线</h2>
-                <p>三条曲线分别计算目标转速，始终采用较高值；传感器异常或达到紧急温度时自动满速。</p>
+                <p>三条曲线分别计算目标转速，始终采用较高值；出厂默认按「平衡」曲线绑定全部风扇与硬盘，传感器异常或达到紧急温度时自动满速。</p>
               </div>
               <label class="toggle"><input id="fan-enabled" type="checkbox"><span></span>启用风扇曲线</label>
             </div>
@@ -179,33 +188,18 @@
               <button id="curve-tab-cpu" type="button" class="curve-tab" role="tab" aria-selected="false" aria-controls="cpu-curve-editor">CPU</button>
             </div>
 
-            <div class="curve-presets" role="group" aria-label="预设曲线模式与曲线导出">
-              <span class="curve-presets-label">曲线模式</span>
-              <button id="curve-preset-quiet" type="button" class="curve-preset">静音</button>
-              <button id="curve-preset-balanced" type="button" class="curve-preset">平衡</button>
-              <button id="curve-preset-performance" type="button" class="curve-preset">性能</button>
-              <span class="curve-presets-hint">点一下即替换三条曲线的全部节点，之后仍需点“保存风扇控制”才会生效</span>
-              <button id="curve-export" type="button" class="curve-export">导出曲线参数</button>
-            </div>
-
-            <div class="curve-presets curve-slots" role="group" aria-label="自定义曲线槽位">
-              <span class="curve-presets-label">自定义曲线</span>
-              <span class="curve-slot">
-                <button id="curve-custom-1" type="button" class="curve-slot-load">自定义 1</button>
-                <button id="curve-custom-1-save" type="button" class="curve-slot-mini" title="把当前三条曲线存进自定义 1">存</button>
-                <button id="curve-custom-1-export" type="button" class="curve-slot-mini" title="把自定义 1 的曲线导出成 JSON 文件">导</button>
-              </span>
-              <span class="curve-slot">
-                <button id="curve-custom-2" type="button" class="curve-slot-load">自定义 2</button>
-                <button id="curve-custom-2-save" type="button" class="curve-slot-mini" title="把当前三条曲线存进自定义 2">存</button>
-                <button id="curve-custom-2-export" type="button" class="curve-slot-mini" title="把自定义 2 的曲线导出成 JSON 文件">导</button>
-              </span>
-              <span class="curve-slot">
-                <button id="curve-custom-3" type="button" class="curve-slot-load">自定义 3</button>
-                <button id="curve-custom-3-save" type="button" class="curve-slot-mini" title="把当前三条曲线存进自定义 3">存</button>
-                <button id="curve-custom-3-export" type="button" class="curve-slot-mini" title="把自定义 3 的曲线导出成 JSON 文件">导</button>
-              </span>
-              <span class="curve-presets-hint">「存」＝把当前三条曲线记进槽位，「导」＝单独导出该槽位；槽位保存在本浏览器，导出成 JSON 即可备份或换机搬用</span>
+            <div class="curve-modes" role="group" aria-label="曲线模式">
+              <span class="curve-modes-label">曲线模式</span>
+              <button id="curve-mode-quiet" type="button" class="curve-mode" data-curve-mode="quiet">静音</button>
+              <button id="curve-mode-balanced" type="button" class="curve-mode" data-curve-mode="balanced">平衡</button>
+              <button id="curve-mode-performance" type="button" class="curve-mode" data-curve-mode="performance">性能</button>
+              <button id="curve-mode-temp" type="button" class="curve-mode" data-curve-mode="temp">临时</button>
+              <button id="curve-mode-full" type="button" class="curve-mode" data-curve-mode="full">全速</button>
+              <button id="curve-mode-off" type="button" class="curve-mode" data-curve-mode="off">关停</button>
+              <button id="curve-mode-manual" type="button" class="curve-mode" data-curve-mode="manual">手动</button>
+              <button id="curve-custom-1" type="button" class="curve-mode" data-curve-slot="1">自定义 1</button>
+              <button id="curve-custom-2" type="button" class="curve-mode" data-curve-slot="2">自定义 2</button>
+              <button id="curve-custom-3" type="button" class="curve-mode" data-curve-slot="3">自定义 3</button>
             </div>
 
             <div class="curve-editors">
@@ -214,7 +208,7 @@
                   <h3 id="disk-curve-heading">HDD/SATA 温度曲线</h3>
                   <span>取已勾选前置仓的最高温度</span>
                 </div>
-                <svg id="disk-curve-chart" class="curve-chart" viewBox="0 0 640 260" role="application" tabindex="0" aria-label="可拖拽的 HDD 温控曲线" aria-describedby="disk-curve-help"></svg>
+                <svg id="disk-curve-chart" class="curve-chart" viewBox="0 0 640 260" role="application" tabindex="0" aria-label="可拖拽的 HDD 温控曲线"></svg>
                 <div class="curve-toolbar">
                   <div class="curve-actions">
                     <button id="disk-curve-add" type="button">+ 增加节点</button>
@@ -228,14 +222,13 @@
                   <p>取消勾选后，该槽位温度不再影响风扇；温度缓存约每 60 秒更新。</p>
                   <div id="hdd-slot-options" class="curve-slot-options"></div>
                 </fieldset>
-                <p id="disk-curve-help">默认 25°C 使用最低转速、35°C 使用 85%、50°C 使用 100%；温度来自前置 SATA 仓。</p>
               </section>
               <section id="nvme-curve-editor" class="curve-editor" role="tabpanel" aria-labelledby="nvme-curve-heading" data-curve-kind="nvme" hidden>
                 <div class="curve-editor-heading">
                   <h3 id="nvme-curve-heading">NVMe 温度曲线</h3>
                   <span>取已勾选 M.2 槽的最高温度</span>
                 </div>
-                <svg id="nvme-curve-chart" class="curve-chart" viewBox="0 0 640 260" role="application" tabindex="0" aria-label="可拖拽的 NVMe 温控曲线" aria-describedby="nvme-curve-help"></svg>
+                <svg id="nvme-curve-chart" class="curve-chart" viewBox="0 0 640 260" role="application" tabindex="0" aria-label="可拖拽的 NVMe 温控曲线"></svg>
                 <div class="curve-toolbar">
                   <div class="curve-actions">
                     <button id="nvme-curve-add" type="button">+ 增加节点</button>
@@ -249,14 +242,13 @@
                   <p>取消勾选后，该槽位温度不再影响风扇；全部取消则停用 NVMe 温控曲线。</p>
                   <div id="nvme-slot-options" class="curve-slot-options"></div>
                 </fieldset>
-                <p id="nvme-curve-help">默认沿用硬盘温控阈值，可独立拖拽调整；温度来自四个 M.2 槽位。</p>
               </section>
               <section id="cpu-curve-editor" class="curve-editor" role="tabpanel" aria-labelledby="cpu-curve-heading" data-curve-kind="cpu" hidden>
                 <div class="curve-editor-heading">
                   <h3 id="cpu-curve-heading">CPU 温度曲线</h3>
                   <span>读取 coretemp 最高值</span>
                 </div>
-                <svg id="fan-curve-chart" class="curve-chart" viewBox="0 0 640 260" role="application" tabindex="0" aria-label="可拖拽的 CPU 温控曲线" aria-describedby="curve-help"></svg>
+                <svg id="fan-curve-chart" class="curve-chart" viewBox="0 0 640 260" role="application" tabindex="0" aria-label="可拖拽的 CPU 温控曲线"></svg>
                 <div class="curve-toolbar">
                   <div class="curve-actions">
                     <button id="curve-add" type="button">+ 增加节点</button>
@@ -265,7 +257,6 @@
                   <strong id="curve-selected">—</strong>
                 </div>
                 <fieldset class="curve-fan-selector"><legend>CPU 曲线控制的风扇</legend><div id="cpu-fan-options" class="curve-fan-options"></div></fieldset>
-                <p id="curve-help">拖动圆点调整 CPU 温度和转速；支持 2–8 个节点，也可使用方向键微调。</p>
               </section>
             </div>
             <p class="notice curve-notice">最终转速 = HDD/SATA、NVMe 与 CPU 三条曲线目标的最高值；某类盘温暂不可用时，该曲线不参与控制。</p>
@@ -279,7 +270,7 @@
             <div class="panel-heading">
               <div>
                 <h2 id="history-heading">历史温度</h2>
-                <p>温度（左轴，°C）与风扇转速（右轴，占满量程百分比）随时间的变化；采样开关、保存天数等更多设置在“&lt;/&gt; 调试”页的“历史温度与风扇控制”。</p>
+                <p>采样开关、保存天数等更多设置在“&lt;/&gt; 调试”页的“历史温度与风扇控制”。</p>
               </div>
               <div class="history-range" role="group" aria-label="时间范围">
                 <div class="history-range-slider">
@@ -305,7 +296,6 @@
             </div>
             <div id="history-tooltip" class="history-tooltip" role="status" hidden></div>
             <p id="history-status" class="inline-status"></p>
-            <p class="notice">数据由插件后台每分钟采样一次并写入本地数据库，按设置的保存天数保留；采样开关、大小上限与保存天数在“&lt;/&gt; 调试”页的“历史温度与风扇控制”中。插件停止运行期间不采集，重启后曲线会出现断口；长时间范围下服务端会自动按峰值聚合，温度曲线展示区间内的最高温；30 分钟至 24 小时各档支持在图上左右拖动，回看约 8 倍于所选跨度的历史记录。</p>
           </section>
           <section class="card debug-panel" id="fan-debug-card" aria-labelledby="fan-debug-heading" hidden>
             <div class="panel-heading">
@@ -351,7 +341,7 @@
             <p id="message-gpio" class="message" role="status" aria-live="polite"></p>
             <div class="gpio-sdcard-row">
               <button id="gpio-refresh-sdcard" type="button">刷新 SD 卡</button>
-              <span id="gpio-sdcard-status" class="inline-status" role="status" aria-live="polite">USB 读卡器换卡后迟迟认不出来时点这里（与按一下网络键同一个动作）。</span>
+              <span id="gpio-sdcard-status" class="inline-status" role="status" aria-live="polite" data-idle="USB 读卡器换卡后迟迟认不出来时点这里（与按一下网络键同一个动作）。">USB 读卡器换卡后迟迟认不出来时点这里（与按一下网络键同一个动作）。</span>
             </div>
             <div class="gpio-sdcard-row">
               <label class="toggle"><input id="gpio-storage-notify" type="checkbox"><span></span>存储设备插入提示音</label>
@@ -843,6 +833,26 @@
       </footer>
     </div>
   </div>
+  <div id="curve-slot-modal" class="app-modal curve-slot-modal" hidden>
+    <div class="app-modal-backdrop" data-curve-slot-close></div>
+    <div class="app-modal-dialog curve-slot-dialog" role="dialog" aria-modal="true" aria-labelledby="curve-slot-title">
+      <h3 id="curve-slot-title">自定义 1</h3>
+      <p id="curve-slot-summary" class="curve-slot-summary"></p>
+      <div class="curve-slot-actions">
+        <button id="curve-slot-apply" type="button" class="primary">应用到曲线</button>
+        <button id="curve-slot-save" type="button">保存</button>
+        <button id="curve-slot-export" type="button">导出</button>
+        <button id="curve-slot-import" type="button">导入</button>
+        <button id="curve-slot-rename" type="button">改名</button>
+        <button id="curve-slot-cancel" type="button" class="ghost" data-curve-slot-close>取消</button>
+      </div>
+      <div class="curve-slot-foot">
+        <p class="curve-slot-hint">应用到曲线＝把按键里的曲线填进编辑器（还要点「保存风扇控制」才下发）；保存＝用当前三条曲线覆盖这个按键。</p>
+        <button id="curve-slot-apply-save" type="button" class="confirm-save">应用并保存风扇控制</button>
+      </div>
+      <input id="curve-slot-file" type="file" accept="application/json,.json" hidden>
+    </div>
+  </div>
   <div id="app-confirm" class="app-modal confirm-modal" hidden>
     <div class="app-modal-backdrop" data-confirm-close></div>
     <div class="app-modal-dialog confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title">
@@ -858,9 +868,10 @@
       <footer class="confirm-actions">
         <button id="confirm-cancel" type="button">取消</button>
         <button id="confirm-ok" type="button" class="primary">确定</button>
+        <button id="confirm-secondary" type="button" class="confirm-secondary" hidden></button>
       </footer>
     </div>
   </div>
-  <script src="app.js?v=0.10.38" defer></script>
+  <script src="app.js?v=0.10.48" defer></script>
 </body>
 </html>

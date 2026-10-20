@@ -1,6 +1,16 @@
 #!/bin/sh
 set -u
 
+# 先把风扇控制权交还 BIOS：写回接管前的 PWM 与 pwm*_enable 模式（通常是 BIOS
+# 自动档），并把配置里的风扇控制置为关闭——否则重装后服务一启动又会接管。
+# 这里失败只警告，不阻断卸载：用户至少得能把这个包卸掉。
+if ! "${TRIM_APPDEST}/bin/tad-module" release-fans \
+  --config "${TRIM_PKGETC}/config.json" \
+  --state "${TRIM_PKGVAR}/original-state.json"; then
+  echo "交还风扇控制权失败；卸载完成后请在 BIOS 里确认风扇为自动模式，或重启一次让 BIOS 重新接管。" \
+    >"${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+fi
+
 "${TRIM_APPDEST}/bin/tad-module" restore \
   --config "${TRIM_PKGETC}/config.json" \
   --state "${TRIM_PKGVAR}/original-state.json" || {

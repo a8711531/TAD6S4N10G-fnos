@@ -37,6 +37,10 @@ func main() {
 		err = apply(os.Args[2:])
 	case "restore":
 		err = restore(os.Args[2:])
+	case "release-fans":
+		err = releaseFans(os.Args[2:])
+	case "bind-all-fans":
+		err = bindAllFans(os.Args[2:])
 	case "version":
 		fmt.Println(version)
 	default:
@@ -104,8 +108,33 @@ func restore(args []string) error {
 	return err
 }
 
-func probe(args []string) error {
-	set := flag.NewFlagSet("probe", flag.ContinueOnError)
+// releaseFans 把风扇控制权交还 BIOS：只处理风扇，不动功耗限制。
+// 卸载时跑它，重装后服务读到 Fan.Enabled=false 就不会一启动又接管风扇。
+func releaseFans(args []string) error {
+	manager, _, err := commonFlags("release-fans", args)
+	if err != nil {
+		return err
+	}
+	if err := requireRoot(); err != nil {
+		return err
+	}
+	return manager.ReleaseFans()
+}
+
+// bindAllFans 只在全新安装时跑：三条曲线都绑上所有风扇、打开风扇控制，
+// 曲线用出厂默认的平衡档。卸载重装时配置还在，不会调用它。
+func bindAllFans(args []string) error {
+	manager, _, err := commonFlags("bind-all-fans", args)
+	if err != nil {
+		return err
+	}
+	if err := requireRoot(); err != nil {
+		return err
+	}
+	return manager.BindAllFansDefault()
+}
+
+func probe(args []string) error {	set := flag.NewFlagSet("probe", flag.ContinueOnError)
 	root := set.String("sys-root", "/", "alternate system root")
 	asJSON := set.Bool("json", false, "JSON output")
 	if err := set.Parse(args); err != nil {
