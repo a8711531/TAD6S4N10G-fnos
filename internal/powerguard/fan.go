@@ -478,6 +478,36 @@ func (m *Manager) fanSpinUpGraceLocked() bool {
 // 单个通道 0 转仍按跳过处理（接口未接风扇或被反插），不触发本错误。
 var errNoUsableFan = errors.New("所有选中的风扇都读不到转速（可能未接风扇或接口被反插），请检查接线后重新选择")
 
+// errOffModeAlarm 关停档（维修模式）下检测到紧急温度或温度源失效：按维修安全
+// 策略风扇保持停转不起转——关停档是用户手动开启的检修状态（两重确认+顶部常驻
+// 警告），此刻风扇突然起转可能伤到正在操作的人——只保持界面错误状态并用蜂鸣器
+// 急促报警。该错误不触发 fail-safe 拉满，也不阻止配置保存。
+var errOffModeAlarm = errors.New("关停档维修安全报警")
+
+const (
+	// fanOffAlarmChimeHz 报警音频率：高于按键确认（440Hz）与存储提示（880Hz），
+	// 一听就知道是报警；连续 fanOffAlarmChimeBeeps 声短促音。
+	fanOffAlarmChimeHz    = 1760
+	fanOffAlarmChimeMS    = 150
+	fanOffAlarmChimeBeeps = 5
+	// fanOffAlarmChimeInterval 蜂鸣报警节流：报警持续期间每隔这么久重响一次。
+	fanOffAlarmChimeInterval = 20 * time.Second
+)
+
+// chimeOffModeAlarmLocked 关停档超温/温度源失效的蜂鸣报警：急促高频短音，后台
+// 播放不阻塞控制循环；蜂鸣器不在时尽力而为（错误被忽略，界面报警状态仍在）。
+func (m *Manager) chimeOffModeAlarmLocked() {
+	if time.Since(m.fanOffAlarmChimeAt) < fanOffAlarmChimeInterval {
+		return
+	}
+	m.fanOffAlarmChimeAt = time.Now()
+	tones := make([]GPIOToneSpec, fanOffAlarmChimeBeeps)
+	for i := range tones {
+		tones[i] = GPIOToneSpec{FrequencyHz: fanOffAlarmChimeHz, DurationMS: fanOffAlarmChimeMS}
+	}
+	go func() { _ = m.PlayStorageChime(tones) }()
+}
+
 func (m *Manager) validateFanLocked(cfg *FanConfig) error {
 	if cfg.MinPWMPercent < 30 || cfg.MinPWMPercent > 100 {
 		return errors.New("fan min_pwm_percent must be between 30 and 100")
@@ -1346,15 +1376,30 @@ func (m *Manager) applyFanLocked(cfg FanConfig) error {
 
 	lastTarget := 0
 	var errs []error
-	var skipped []string // 本轮因 0 转速被跳过的风扇（汇总后去重写一次日志）
+	var skipped []string   // 本轮因 0 转速被跳过的风扇（汇总后去重写一次日志）
+	var offAlarms []string // 关停档维修安全报警（汇总后统一报错+蜂鸣，风扇保持停转）
+	if cfg.OffMode && emergency {
+		hottest := 0.0
+		if cpuErr == nil {
+			hottest = max(hottest, cpuTemperature)
+		}
+		if hddAvailable {
+			hottest = max(hottest, hddTemperature)
+		}
+		if nvmeAvailable {
+			hottest = max(hottest, nvmeTemperature)
+		}
+		offAlarms = append(offAlarms, fmt.Sprintf("关停档下检测到紧急温度 %.1f°C（阈值 %.1f°C），按维修安全策略风扇保持停转，请立即处理", hottest, cfg.EmergencyTempC))
+	}
 	for id, sources := range selected {
 		fan := byID[id]
 		if _, taken := m.fanDebugTakenOver[id]; taken {
 			continue // 被调试接管:脱离曲线控制,由调试接口锁定转速
 		}
-		// 关停档：直接写 0%，不再看最低转速与曲线。但温度源保护与普通模式
-		// 相同——该风扇选中的源一个都读不到时，说明控制环成了瞎子，继续停转
-		// 不再安全，必须翻到满速并报错；紧急温度同样翻满速。
+		// 关停档（维修/检修模式，开启有两重确认+顶部常驻警告）：直接写 0%，
+		// 不再看最低转速与曲线。维修安全策略：紧急温度、温度源失效都不再翻
+		// 满速——检修过程中风扇突然起转可能伤到正在操作的人——一律保持停转，
+		// 改为界面错误状态 + 蜂鸣器急促报警（见 errOffModeAlarm）。
 		if cfg.OffMode {
 			sourceAvailable := false
 			for _, source := range sources {
@@ -1368,11 +1413,8 @@ func (m *Manager) applyFanLocked(cfg FanConfig) error {
 				}
 			}
 			target := 0
-			if emergency || !sourceAvailable {
-				target = 100
-				if !sourceAvailable {
-					errs = append(errs, fmt.Errorf("no selected temperature source is available for fan %s; forced to full speed", id))
-				}
+			if !sourceAvailable {
+				offAlarms = append(offAlarms, fmt.Sprintf("关停档下风扇 %s 选中的温度源全部不可用，按维修安全策略保持停转", id))
 			}
 			if err := setFanPWM(fan, target); err != nil {
 				errs = append(errs, fmt.Errorf("set fan %s to %d%%: %w", id, target, err))
@@ -1423,6 +1465,16 @@ func (m *Manager) applyFanLocked(cfg FanConfig) error {
 	if cpuErr == nil {
 		m.fanLastTemp = cpuTemperature
 	}
+	if len(offAlarms) > 0 {
+		// 关停档维修安全报警：风扇已按 0% 写完保持停转，这里只做报警——日志
+		// 去重、蜂鸣节流、错误经 errOffModeAlarm 上抛（调用方置 fanLastError，
+		// 不走 fail-safe 拉满，也不阻塞配置保存）。
+		msg := strings.Join(offAlarms, "；")
+		m.logf("fan: %s（已蜂鸣报警）", msg)
+		m.chimeOffModeAlarmLocked()
+		return fmt.Errorf("%w: %s", errOffModeAlarm, msg)
+	}
+	m.fanOffAlarmChimeAt = time.Time{} // 无报警时清零节流，下次报警立即响
 	return nil
 }
 
@@ -1511,12 +1563,8 @@ func interpolatePWMPercent(points []FanPoint, tempC float64, minimum int, emerge
 
 func fanTargets(cfg FanConfig, cpuTemperature, hddTemperature float64, hddAvailable bool, nvmeTemperature float64, nvmeAvailable bool) (int, int, int, int) {
 	if cfg.OffMode {
-		// 关停档整条曲线写 0%，只有紧急温度会翻成满速
-		if cpuTemperature >= cfg.EmergencyTempC ||
-			(hddAvailable && hddTemperature >= cfg.EmergencyTempC) ||
-			(nvmeAvailable && nvmeTemperature >= cfg.EmergencyTempC) {
-			return 100, 100, 100, 100
-		}
+		// 关停档维修安全策略：一律写 0%——紧急温度也不再翻满速（改为蜂鸣报警，
+		// 见 errOffModeAlarm），检修过程中风扇突然起转可能伤到正在操作的人。
 		return 0, 0, 0, 0
 	}
 	cpuTarget := interpolatePWMPercent(cfg.Curve, cpuTemperature, cfg.MinPWMPercent, cfg.EmergencyTempC)
@@ -1764,39 +1812,14 @@ func (m *Manager) fanStatusLocked(cfg FanConfig) FanControlStatus {
 	}
 	result.DiskTemperatureC = max(result.HDDTemperatureC, result.NVMeTemperatureC)
 	if cfg.OffMode {
-		// 关停档实际下发就是 0%（只有紧急温度会翻成满速）。别用「曲线 + 最低转速」
-		// 算出来的 40% 当目标，否则界面显示 40% 而风扇其实停着，两边互相打架。
-		// 与 applyFanLocked 的保护保持一致：选中的温度源一个都读不到时，实际会
-		// 写满速并报错，这里也显示满速，不让界面与现实打架。
-		selectedSources := map[string]bool{}
-		for _, sources := range selected {
-			for _, source := range sources {
-				selectedSources[source] = true
-			}
-		}
-		anySourceAvailable := false
-		for source := range selectedSources {
-			switch source {
-			case "cpu":
-				anySourceAvailable = anySourceAvailable || cpuErr == nil
-			case "hdd":
-				anySourceAvailable = anySourceAvailable || hddAvailable
-			case "nvme":
-				anySourceAvailable = anySourceAvailable || nvmeAvailable
-			}
-		}
-		target := 0
-		if result.CPUTemperatureC >= cfg.EmergencyTempC ||
-			(result.HDDTemperatureC > 0 && result.HDDTemperatureC >= cfg.EmergencyTempC) ||
-			(result.NVMeTemperatureC > 0 && result.NVMeTemperatureC >= cfg.EmergencyTempC) ||
-			!anySourceAvailable {
-			target = 100
-		}
-		result.CPUTargetPWMPercent = target
-		result.HDDTargetPWMPercent = target
-		result.NVMeTargetPWMPercent = target
-		result.DiskTargetPWMPercent = target
-		result.TargetPWMPercent = target
+		// 关停档实际下发恒为 0%（维修安全策略：紧急温度/温度源失效也只蜂鸣
+		// 报警、保持停转，见 errOffModeAlarm）。别用「曲线 + 最低转速」算出来
+		// 的 40% 当目标，否则界面显示 40% 而风扇其实停着，两边互相打架。
+		result.CPUTargetPWMPercent = 0
+		result.HDDTargetPWMPercent = 0
+		result.NVMeTargetPWMPercent = 0
+		result.DiskTargetPWMPercent = 0
+		result.TargetPWMPercent = 0
 		result.ControlSource = ""
 		return result
 	}

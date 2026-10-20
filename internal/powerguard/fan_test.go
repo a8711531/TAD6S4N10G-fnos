@@ -1212,12 +1212,16 @@ func TestZeroPWMWithoutOffModeRejected(t *testing.T) {
 	}
 }
 
-// 关停优先级高于最低转速，但压不过紧急温度：CPU 到 85°C 仍要满速兜底。
-func TestOffModeStillFallsBackToFullSpeedOnEmergency(t *testing.T) {
+// 维修安全策略：关停档是用户手动开启的维修/检修状态（两重确认+顶部常驻警告），
+// 超高温度下风扇也绝不能起转——突然起转可能伤到正在操作的人——保持停转，改用
+// 蜂鸣器急促报警 + 界面错误状态；保存配置本身必须成功（否则高温设备开不了关停档）。
+func TestOffModeEmergencyKeepsFansStoppedAndAlarms(t *testing.T) {
 	manager := newFanDebugTestManager(t)
 	coretemp := filepath.Join(manager.Root, "sys", "class", "hwmon", "hwmon9")
 	writeTestValue(t, filepath.Join(coretemp, "temp1_input"), "90000")
-	pwm1 := filepath.Join(manager.Root, "sys", "class", "hwmon", "hwmon3", "pwm1")
+	hwmon := filepath.Join(manager.Root, "sys", "class", "hwmon", "hwmon3")
+	pwm1 := filepath.Join(hwmon, "pwm1")
+	writeTestValue(t, pwm1, "10")
 
 	cfg := DefaultFanConfig()
 	cfg.Enabled = true
@@ -1233,10 +1237,31 @@ func TestOffModeStillFallsBackToFullSpeedOnEmergency(t *testing.T) {
 		cfg.NVMeCurve[i].PWMPercent = 0
 	}
 	if err := manager.SaveFanConfig(cfg); err != nil {
-		t.Fatalf("save: %v", err)
+		t.Fatalf("关停档超温是正当维修场景，保存必须成功: %v", err)
 	}
-	if got, _ := readInt(pwm1); got != 255 {
-		t.Fatalf("超过紧急温度必须满速，实际 pwm1=%d", got)
+	if got, _ := readInt(pwm1); got != 0 {
+		t.Fatalf("维修安全策略：紧急温度下风扇必须保持停转，实际 pwm1=%d", got)
+	}
+	manager.mu.Lock()
+	alarm := manager.fanLastError
+	manager.mu.Unlock()
+	if !strings.Contains(alarm, "紧急温度") || !strings.Contains(alarm, "维修安全策略") {
+		t.Fatalf("必须保持紧急温度报警状态，实际 %q", alarm)
+	}
+
+	// 温度回落：报警清除，风扇保持停转。
+	writeTestValue(t, filepath.Join(coretemp, "temp1_input"), "50000")
+	if err := manager.ApplyFanCurrent(); err != nil {
+		t.Fatalf("温度回落后不应再报警: %v", err)
+	}
+	manager.mu.Lock()
+	alarm = manager.fanLastError
+	manager.mu.Unlock()
+	if alarm != "" {
+		t.Fatalf("温度回落后报警应清除，实际 %q", alarm)
+	}
+	if got, _ := readInt(pwm1); got != 0 {
+		t.Fatalf("关停档风扇应保持停转，实际 pwm1=%d", got)
 	}
 }
 

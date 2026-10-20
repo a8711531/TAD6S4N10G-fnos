@@ -242,6 +242,10 @@ type Manager struct {
 	fanOffWasActive bool
 	fanOffExitedAt  time.Time
 
+	// fanOffAlarmChimeAt 关停档维修安全报警（errOffModeAlarm）的上次蜂鸣时刻，
+	// 按 fanOffAlarmChimeInterval 节流，避免报警期间蜂鸣器连响不停。
+	fanOffAlarmChimeAt time.Time
+
 	// 0 转风扇屏蔽/跳过日志的去重键：控制周期每 2 秒跑一轮，同一组风扇问题
 	// 只在集合变化（或恢复后再次出现）时写一次日志，避免刷满运行日志。
 	fanFilteredLogKey string
@@ -734,8 +738,14 @@ func (m *Manager) SaveFanConfig(fan FanConfig) error {
 		err = m.applyFanLocked(cfg.Fan)
 	}
 	if err != nil {
-		m.lastError = err.Error()
-		return err
+		if errors.Is(err, errOffModeAlarm) {
+			// 关停档超温正是维修场景：配置有效且已落盘，风扇保持停转，报警经
+			// fanLastError 呈现——不算保存失败，否则用户在高温设备上根本开不了关停档。
+			m.fanLastError = err.Error()
+		} else {
+			m.lastError = err.Error()
+			return err
+		}
 	}
 	m.lastError = ""
 	m.lastApply = time.Now()
