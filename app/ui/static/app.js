@@ -2069,22 +2069,6 @@ async function runAutoBackup(ruleID, dryRun = false, definition = null) {
 // 不暴露系统目录，避免小白把备份目标指到乱七八糟的地方；确有需要时可用
 // 「高级」模式浏览整个文件系统（有明确的风险提示与二次确认）。
 
-const PLACE_GROUP_ORDER = ['personal', 'team', 'external', 'remote'];
-const PLACE_GROUP_TITLES = {
-  personal: '我的文件',
-  team: '团队文件',
-  external: '外接存储',
-  remote: '远程挂载',
-};
-const PLACE_GROUP_ICONS = { personal: '🏠', team: '👥', external: '🔌', remote: '☁️' };
-// 四类位置固定显示（空的也显示），否则用户会以为功能缺失；每类给一句说明为什么是空的。
-const PLACE_GROUP_EMPTY = {
-  personal: '暂无',
-  team: '还没有创建共享文件夹',
-  external: '未检测到可移动介质',
-  remote: '没有远程挂载',
-};
-
 async function openPathPicker(role, startLocation = null) {
   pathPicker.role = role;
   pathPicker.allowFile = role === 'source';
@@ -2152,146 +2136,144 @@ function renderPathPicker(data) {
   updatePathPickerSelectLabel();
 }
 
+// 容量文字与硬盘测试工具完全一套：「63.1 GB 可用 36%」；网盘虚标容量
+// （rclone 一律报 ~1 PiB）按「容量未知」处理。
+const TIB = 1024 * 1024 * 1024 * 1024;
+const FAKE_CAPACITY_MIN = 900 * TIB;
+const CAPACITY_WHY = {
+  cloud: '网盘挂载不上报可用空间（rclone / WebDAV 对网盘一律返回空容量），所以只能显示「容量未知」。',
+  cache: '这个远程挂载走本地缓存，不上报可用空间，所以只能显示「容量未知」。',
+  direct: '挂载端没有上报可用空间，所以显示「容量未知」。',
+};
+
+function isFakeCapacity(bytes) {
+  return bytes >= FAKE_CAPACITY_MIN;
+}
+
+function placeCapacityText(place) {
+  const free = place.free_bytes || 0;
+  const total = place.total_bytes || 0;
+  if (free > 0 && !isFakeCapacity(free)) {
+    const pct = total > 0 ? Math.round(free / total * 100) : 0;
+    return {
+      text: `${formatByteSize(free)} 可用 ${pct}%`,
+      title: `可用 ${formatByteSize(free)} / 共 ${formatByteSize(total)}`,
+      unknown: false,
+    };
+  }
+  if (place.kind === 'remote') {
+    return { text: '容量未知', title: CAPACITY_WHY[place.mode] || CAPACITY_WHY.direct, unknown: true };
+  }
+  return { text: '—', title: '没能读到这个位置的容量信息。', unknown: true };
+}
+
 function placeMetaText(place) {
   const parts = [];
   if (place.subtitle) parts.push(place.subtitle);
   if (place.read_only) parts.push('只读');
-  if (place.total_bytes) parts.push(`剩余 ${formatByteSize(place.free_bytes || 0)}`);
   return parts.join(' · ');
 }
 
 function renderPathPlaces(places, insideID) {
-  const aside = $('path-picker-places');
-  aside.replaceChildren();
-  const groups = {};
+  const list = $('path-picker-places');
+  list.replaceChildren();
+  if (!places.length) {
+    const empty = document.createElement('li');
+    empty.className = 'empty';
+    empty.textContent = '没有找到可用的存储卷';
+    list.append(empty);
+    return;
+  }
   places.forEach((place) => {
-    if (!groups[place.kind]) groups[place.kind] = [];
-    groups[place.kind].push(place);
-  });
-  PLACE_GROUP_ORDER.forEach((kind) => {
-    const items = groups[kind] || [];
-    const group = document.createElement('div');
-    group.className = 'place-group';
-    const title = document.createElement('p');
-    title.className = 'place-group-title';
-    title.textContent = `${PLACE_GROUP_ICONS[kind]} ${PLACE_GROUP_TITLES[kind]}`;
-    group.append(title);
-    if (!items.length) {
-      const empty = document.createElement('p');
-      empty.className = 'place-empty';
-      empty.textContent = PLACE_GROUP_EMPTY[kind] || '暂无';
-      group.append(empty);
-      aside.append(group);
-      return;
+    const li = document.createElement('li');
+    li.className = `place-item${insideID && place.id === insideID ? ' active' : ''}${place.kind === 'external' ? ' removable' : ''}`;
+    li.title = `${place.path}${place.read_only ? '（只读）' : ''}`;
+    // 第一行：名称 + 剩余容量（右对齐），与硬盘测试工具的选目录列表同一套排法
+    const row = document.createElement('div');
+    row.className = 'pl-row';
+    const name = document.createElement('span');
+    name.className = 'pl-name';
+    name.textContent = place.name;
+    row.append(name);
+    const cap = placeCapacityText(place);
+    if (cap.text) {
+      const free = document.createElement('span');
+      free.className = `pl-free${cap.unknown ? ' unknown' : ''}`;
+      free.textContent = cap.text;
+      free.title = cap.title;
+      row.append(free);
     }
-    items.forEach((place) => {
-      const button = document.createElement('button');
-      button.type = 'button';
-      button.className = `place-item${insideID && place.id === insideID ? ' active' : ''}${place.kind === 'external' ? ' removable' : ''}`;
-      button.title = `${place.path}${place.read_only ? '（只读）' : ''}`;
-      const name = document.createElement('span');
-      name.className = 'place-name';
-      name.textContent = place.name;
-      button.append(name);
-      const meta = placeMetaText(place);
-      if (meta) {
-        const sub = document.createElement('span');
-        sub.className = 'place-sub';
-        sub.textContent = meta;
-        button.append(sub);
-      }
+    li.append(row);
+    // 第二行：身份信息（用户名 / 可移动介质 / 远程挂载 · 只读），远程挂载右侧带改名
+    const meta = placeMetaText(place);
+    if (meta || place.kind === 'remote') {
+      const subRow = document.createElement('div');
+      subRow.className = 'pl-row sub';
+      const sub = document.createElement('span');
+      sub.className = 'pl-sub';
+      sub.textContent = meta;
+      sub.hidden = !meta;
+      subRow.append(sub);
       if (place.kind === 'remote') {
-        const rename = document.createElement('span');
-        rename.className = 'place-rename';
-        rename.textContent = '✎ 改显示名';
+        const rename = document.createElement('button');
+        rename.type = 'button';
+        rename.className = 'rename';
+        rename.textContent = '改名';
         rename.title = '给这个远程挂载设置一个看得懂的名字（例如：夸克网盘）';
         rename.addEventListener('click', (event) => {
           event.stopPropagation();
           promptRemoteAlias(place);
         });
-        button.append(rename);
+        subRow.append(rename);
       }
-      button.addEventListener('click', () => browsePathTo(place.path, 'places'));
-      group.append(button);
-    });
-    aside.append(group);
+      li.append(subRow);
+    }
+    // 与硬盘测试工具一致：点存储空间直接进入卷内用户目录（home），不停在卷根
+    li.addEventListener('click', () => browsePathTo(place.home || place.path, 'places'));
+    list.append(li);
   });
 }
 
+// 路径栏照搬硬盘测试工具：一条灰底横条里放当前完整路径（单行省略）。
 function renderPathCrumbs(data) {
-  const nav = $('path-picker-crumbs');
-  nav.replaceChildren();
-  const home = document.createElement('button');
-  home.type = 'button';
-  home.textContent = '位置';
-  home.addEventListener('click', () => browsePathTo('', 'places'));
-  nav.append(home);
-  if (data.mode !== 'browse' || !data.path) return;
-
-  const place = (data.places || []).find((item) => item.id === data.inside);
-  const base = place ? place.path : '/';
-  const baseLabel = place ? `${PLACE_GROUP_ICONS[place.kind] || ''}${place.name}` : '全部目录';
-  const append = (label, target) => {
-    const separator = document.createElement('span');
-    separator.className = 'crumb-sep';
-    separator.textContent = '/';
-    nav.append(separator);
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.textContent = label;
-    button.addEventListener('click', () => browsePathTo(target, pathPicker.scope));
-    nav.append(button);
-  };
-  if (base !== '/' || data.path === '/') append(baseLabel, base);
-  const rest = data.path === base ? '' : data.path.slice(base === '/' ? 1 : base.length + 1);
-  let accumulated = base === '/' ? '' : base;
-  rest.split('/').filter(Boolean).forEach((part) => {
-    accumulated += `/${part}`;
-    append(part, accumulated);
-  });
+  const code = $('path-picker-path');
+  const hint = $('path-picker-hint');
+  const placesMode = data.mode !== 'browse';
+  code.textContent = placesMode ? '从左侧选择存储位置' : (data.path || '/');
+  code.title = placesMode ? '从左侧选择存储位置' : (data.path || '/');
+  if (hint) {
+    const place = (data.places || []).find((item) => item.id === data.inside);
+    const readOnly = !placesMode && place && place.read_only;
+    hint.textContent = readOnly ? '该位置只读' : '';
+    hint.hidden = !readOnly;
+  }
 }
 
 function renderPathEntries(data, placesMode) {
   const list = $('path-picker-entries');
   list.replaceChildren();
   if (placesMode) {
-    const guide = document.createElement('div');
-    guide.className = 'path-picker-guide';
-    const heading = document.createElement('p');
-    heading.textContent = '请从左侧选择一个位置开始：';
-    guide.append(heading);
-    PLACE_GROUP_ORDER.forEach((kind) => {
-      const count = (data.places || []).filter((place) => place.kind === kind).length;
-      const line = document.createElement('p');
-      line.className = 'path-picker-guide-item';
-      line.textContent = `${PLACE_GROUP_ICONS[kind]} ${PLACE_GROUP_TITLES[kind]}${count ? `（${count}）` : '（暂无）'}`;
-      guide.append(line);
-    });
-    const tip = document.createElement('p');
-    tip.className = 'path-picker-guide-tip';
-    tip.textContent = '备份只建议放在这四类位置里，系统目录不开放选择。';
-    guide.append(tip);
+    const guide = document.createElement('li');
+    guide.className = 'empty';
+    guide.textContent = '请从左侧选择一个存储位置';
     list.append(guide);
     return;
   }
   const entries = data.entries || [];
   if (!entries.length) {
-    const empty = document.createElement('p');
-    empty.className = 'gpio-script-empty';
-    empty.textContent = '（空目录）';
+    const empty = document.createElement('li');
+    empty.className = 'empty';
+    empty.textContent = '（没有子目录）';
     list.append(empty);
     return;
   }
   entries.forEach((entry) => {
-    const row = document.createElement('button');
-    row.type = 'button';
-    row.className = `path-entry${entry.is_dir ? ' is-dir' : ' is-file'}${entry.is_volume || entry.is_place ? ' is-volume' : ''}`;
-    const icon = document.createElement('span');
-    icon.className = 'path-entry-icon';
+    const row = document.createElement('li');
+    row.className = `path-entry${entry.is_dir ? ' is-dir' : ' is-file'}${entry.read_only ? ' locked' : ''}`;
     const name = document.createElement('span');
     name.className = 'path-entry-name';
     name.textContent = entry.name;
-    row.append(icon, name);
+    row.append(name);
     if (!entry.is_dir) {
       const size = document.createElement('span');
       size.className = 'path-entry-meta';
@@ -2309,6 +2291,7 @@ function renderPathEntries(data, placesMode) {
       badge.textContent = entry.read_only ? '只读卷' : '卷';
       row.append(badge);
     }
+    if (entry.read_only && entry.is_dir) row.title = '无写权限';
     row.addEventListener('click', () => {
       if (entry.is_dir) browsePathTo(entry.path, pathPicker.scope);
       else if (pathPicker.allowFile) selectPathFile(entry.path, row);
@@ -2328,7 +2311,7 @@ function updatePathPickerSelectLabel() {
   const button = $('path-picker-select');
   if (!pathPicker.path) {
     button.disabled = true;
-    button.textContent = '选择当前目录';
+    button.textContent = pathPicker.role === 'source' ? '使用当前目录作为源' : '使用当前目录作为目标';
     return;
   }
   button.disabled = false;
@@ -6979,3 +6962,15 @@ if (themeToggle) {
 CURVE_KINDS.forEach(renderFanChart);
 refresh();
 setInterval(() => refresh(true), 5000);
+
+// 动态隐藏滚动条：悬停淡入由 CSS 负责，这里补「正在滚动」这一路——
+// 滚轮/触屏滚动时滑块短暂露出，停下 0.7s 后淡出。滚动事件不冒泡，
+// 挂捕获阶段，弹窗里的存储位置／目录列表也能收到。
+let scrollbarTimer = null;
+window.addEventListener('scroll', () => {
+  const root = document.documentElement;
+  if (!root || !root.classList) return;
+  root.classList.add('scr-on');
+  if (scrollbarTimer) clearTimeout(scrollbarTimer);
+  scrollbarTimer = setTimeout(() => root.classList.remove('scr-on'), 700);
+}, { passive: true, capture: true });

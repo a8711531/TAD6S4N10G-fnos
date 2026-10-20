@@ -21,6 +21,8 @@
   --chart-grid: rgba(72, 82, 102, .12);
   --chart-axis: #8a919c;
   --sidebar-hover: rgba(255, 255, 255, .55);
+  --sb-thumb: rgba(11, 11, 12, .12);
+  --sb-thumb-hover: rgba(11, 11, 12, .22);
   --radius: 10px;
   --radius-sm: 6px;
 
@@ -52,6 +54,8 @@
   --chart-grid: rgba(255, 255, 255, .25);
   --chart-axis: #c5cbd4;
   --sidebar-hover: rgba(255, 255, 255, .08);
+  --sb-thumb: rgba(255, 255, 255, .12);
+  --sb-thumb-hover: rgba(255, 255, 255, .22);
 }
 
 * { box-sizing: border-box; }
@@ -2616,12 +2620,18 @@ button.danger {
 
 /* --- 目录浏览 / 卷选择对话框 --- */
 
+/* 卷选择对话框仍是 头/提示/列表/子目录/脚 五行；浏览弹窗把面包屑挪进了
+   body，只有 头/双栏/警告/脚 四行，单独用 #path-picker 圈定。 */
 .path-picker-modal .path-picker-dialog {
   width: min(800px, 100%);
   max-height: min(84vh, 700px);
   gap: 10px;
   overflow: hidden;
   grid-template-rows: auto auto minmax(220px, 1fr) auto auto;
+}
+
+#path-picker .path-picker-dialog {
+  grid-template-rows: auto minmax(240px, 1fr) auto auto;
 }
 
 .path-picker-head {
@@ -2635,223 +2645,185 @@ button.danger {
 
 .path-picker-head button { height: 28px; }
 
-.path-picker-crumbs {
+/* 目录浏览弹窗：整体照搬硬盘测试工具「选择测试目录」的窗体——
+   左右两个带边框的列盒子、栏头一条灰底标题/路径条、列表在盒子内滚动。
+   底部仍是原来的四个按键（右下角）。 */
+.path-picker-body {
   display: flex;
-  flex-wrap: wrap;
-  gap: 2px;
-  align-items: center;
-  padding: 6px 8px;
+  gap: 12px;
+  align-items: stretch;
+  min-height: 0;
+}
+
+.picker-col {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
   border: 1px solid var(--line);
   border-radius: 8px;
+  overflow: hidden;
+  background: var(--surface);
+}
+
+.picker-col.places-col { flex: 0 0 220px; }
+.picker-col.entries-col { flex: 1 1 auto; min-width: 0; }
+
+.col-title {
+  flex: 0 0 auto;
+  padding: 7px 10px;
+  color: var(--muted);
+  border-bottom: 1px solid var(--line);
   background: var(--surface-muted);
   font-size: 12px;
 }
 
-.path-picker-crumbs button {
-  height: 22px;
-  padding: 0 6px;
+/* 位置列表 */
+.places,
+.dirs {
+  flex: 1 1 auto;
+  min-height: 0;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  overflow: auto;
+  /* 字号与硬盘测试工具一致（其正文字号 14px）；本页基准是 16px，必须显式压回 */
+  font-size: 14px;
+}
+
+.places li,
+.dirs li {
+  padding: 7px 9px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.places li:hover,
+.dirs li:hover { background: var(--surface-muted); }
+
+.places li.active { background: var(--primary); color: #fff; }
+.places li.active .pl-free,
+.places li.active .pl-sub,
+.places li.active .pl-name { color: rgba(255, 255, 255, .88); }
+.places li.active .rename { color: #fff; }
+
+.pl-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.pl-row.sub { margin-top: 2px; }
+
+.pl-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pl-free {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 11px;
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* 容量未知：虚线下划线 + 问号光标，悬停看原因（与硬盘测试工具一致） */
+.pl-free.unknown {
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+  cursor: help;
+}
+
+.pl-sub {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 远程挂载的改名入口：小字、不抢宽度 */
+.places .rename {
+  flex: 0 0 auto;
+  height: auto;
+  margin-left: auto;
+  padding: 1px 7px;
   border: 0;
-  border-radius: 4px;
+  border-radius: 5px;
   color: var(--primary);
   background: transparent;
+  font-size: 11px;
+}
+
+.places .rename:hover { background: rgba(0, 0, 0, .06); text-decoration: underline; }
+[data-theme="dark"] .places .rename:hover { background: rgba(255, 255, 255, .1); }
+
+.places .empty,
+.dirs .empty {
+  color: var(--muted);
   font-size: 12px;
+  cursor: default;
 }
 
-.path-picker-crumbs button:hover { background: var(--primary-soft); }
-.path-picker-crumbs .crumb-sep { color: var(--muted); }
-
-.path-picker-body {
-  display: grid;
-  grid-template-columns: 200px minmax(0, 1fr);
-  gap: 10px;
-  min-height: 0;
+/* 路径栏：当前完整路径（单行省略）+ 只读提示 */
+.path-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-muted);
 }
 
-.path-picker-places {
-  display: grid;
-  gap: 10px;
-  align-content: start;
-  min-height: 0;
-  padding-right: 2px;
-  overflow: auto;
+.path-bar code {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-body);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.place-group {
-  display: grid;
-  gap: 4px;
-}
-
-.place-group-title {
-  margin: 0;
-  padding: 0 2px;
+.path-hint {
+  flex: 0 0 auto;
   color: var(--muted);
   font-size: 11px;
-  font-weight: 600;
-  letter-spacing: .02em;
+  white-space: nowrap;
 }
 
-/* 没有内容的位置分类也要显示出来，说明「这里为什么是空的」，
-   否则用户会以为功能缺失。 */
-.place-empty {
-  margin: 0;
-  padding: 6px 10px;
-  border: 1px dashed var(--line);
+/* 「↑ 上级」照硬盘测试工具放在路径栏最左边（底部只剩三个操作按键） */
+.path-bar button {
+  flex: 0 0 auto;
+  height: 24px;
+  padding: 0 10px;
   border-radius: 6px;
-  color: var(--muted);
-  font-size: 11px;
+  font-size: 11.5px;
+  line-height: 1;
 }
 
-/* 全局 button 钉了 32px 高，位置条目有两行（名称+副标题），必须恢复自适应高度，
-   否则文字会被拦腰截断。 */
-.place-item {
-  display: grid;
-  gap: 2px;
-  height: auto;
-  width: 100%;
-  padding: 7px 10px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  color: var(--text-body);
-  background: var(--surface);
-  font-size: 12.5px;
-  line-height: 1.35;
-  text-align: left;
-}
-
-.place-item:hover { border-color: var(--primary); color: var(--primary); }
-
-.place-item.active {
-  border-color: var(--primary);
-  color: var(--primary);
-  background: var(--primary-soft);
-}
-
-.place-item.removable {
-  border-style: dashed;
-}
-
-/* 远程挂载条目上的「改名」入口（span，按钮里不能再嵌按钮） */
-.place-rename {
-  justify-self: start;
-  color: var(--primary);
-  font-size: 11px;
-  cursor: pointer;
-  opacity: .8;
-}
-
-.place-rename:hover { opacity: 1; text-decoration: underline; }
-
-/* 高级（原生目录）模式：隐藏位置侧栏，让目录内容占满整行 */
-.path-picker-body.advanced { grid-template-columns: minmax(0, 1fr); }
-.path-picker-body.advanced .path-picker-places { display: none; }
-
-/* 高级按钮做成红色警示样式：这个入口能碰整个文件系统，值得被看见 */
-#path-picker-advanced {
-  color: var(--danger);
-  border-color: #f0c9c6;
-  background: #fff7f6;
-}
-
-#path-picker-advanced:hover {
-  border-color: var(--danger);
-  background: #ffefec;
-}
-
-[data-theme="dark"] #path-picker-advanced {
-  color: #f19d97;
-  border-color: #6b3a37;
-  background: #2c1b19;
-}
-
-[data-theme="dark"] #path-picker-advanced:hover { border-color: #a0524c; }
-
-.place-name {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-weight: 500;
-}
-
-.place-sub {
-  overflow: hidden;
-  color: var(--muted);
-  font-size: 11px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.path-picker-warning {
-  margin: 0;
-  padding: 8px 10px;
-  border: 1px solid #d9a441;
-  border-radius: 8px;
-  color: #8a5b00;
-  background: #fff6e0;
-  font-size: 12px;
-  line-height: 1.5;
-}
-
-[data-theme="dark"] .path-picker-warning {
-  border-color: #6b5526;
-  color: #f0cf8a;
-  background: #2c2415;
-}
-
-.path-picker-guide {
-  display: grid;
-  gap: 6px;
-  align-content: start;
-  padding: 12px 14px;
-  color: var(--text-body);
-  font-size: 13px;
-}
-
-.path-picker-guide p { margin: 0; }
-.path-picker-guide-item { color: var(--text-body); }
-.path-picker-guide-tip { color: var(--muted); font-size: 12px; }
-
-.path-picker-entries {
-  display: grid;
-  gap: 2px;
-  align-content: start;
-  min-height: 0;
-  padding: 4px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--surface);
-  overflow: auto;
-}
-
+/* 目录内容：纯名称行（目录带结尾斜杠），只读项变淡 */
 .path-entry {
   display: flex;
   gap: 8px;
   align-items: center;
-  width: 100%;
-  height: 32px;
-  padding: 0 8px;
-  border: 0;
-  border-radius: 6px;
   color: var(--text-body);
-  background: transparent;
-  font-size: 13px;
-  text-align: left;
 }
 
-.path-entry:hover { background: var(--surface-muted); }
-.path-entry.selected { color: var(--primary); background: var(--primary-soft); }
-
-.path-entry-icon {
-  flex: 0 0 auto;
-  width: 14px;
-  height: 11px;
-  border-radius: 2px;
-  background: var(--line-strong);
-}
-
-.path-entry.is-dir .path-entry-icon { background: var(--primary); }
+.path-entry.locked { opacity: .55; }
 
 .path-entry-name {
   flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2872,15 +2844,62 @@ button.danger {
   font-size: 10px;
 }
 
-.path-picker-foot {
-  display: flex;
-  gap: 12px;
-  align-items: center;
-  justify-content: space-between;
+.path-entry.selected { color: var(--primary); background: var(--primary-soft); }
+
+/* 卷选择对话框：自己的带框列表（与浏览弹窗分开，互不影响） */
+#volume-picker-list {
+  display: grid;
+  gap: 2px;
+  align-content: start;
+  min-height: 0;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  overflow: auto;
 }
 
-.path-picker-foot .actions { padding: 0; justify-content: flex-end; }
-.path-picker-foot .inline-status { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+#volume-picker-list .path-entry {
+  width: 100%;
+  min-height: 30px;
+  padding: 5px 9px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  text-align: left;
+  justify-self: stretch;
+}
+
+#volume-picker-list .path-entry:hover { background: var(--surface-muted); }
+#volume-picker-list .path-entry.selected { color: var(--primary); background: var(--primary-soft); }
+
+#volume-picker-list .path-entry-icon {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 11px;
+  border-radius: 2px;
+  background: var(--primary);
+}
+
+/* 高级（原生目录）模式：隐藏左侧位置栏，目录列表占满 */
+.path-picker-body.advanced .places-col { display: none; }
+
+.path-picker-warning {
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid #d9a441;
+  border-radius: 8px;
+  color: #8a5b00;
+  background: #fff6e0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+[data-theme="dark"] .path-picker-warning {
+  border-color: #6b5526;
+  color: #f0cf8a;
+  background: #2c2415;
+}
 
 #path-picker-advanced.active {
   border-color: #d9a441;
@@ -3006,3 +3025,40 @@ button.danger {
 
 [data-theme="dark"] .backup-job-card .delete-script { color: #f39a9a; border-color: #6b3532; background: #2c1615; }
 [data-theme="dark"] .path-entry:hover { background: var(--surface-muted); }
+
+
+/* ── 滚动条：与硬盘测试工具/飞牛同款动态隐藏式 ─────────────
+   轨道常驻透明，滑块默认全透明；鼠标移入内容区淡入、移开淡出，
+   正在滚动时（html.scr-on，见 app.js）短暂露出。8px 细条圆角。 */
+html::-webkit-scrollbar,
+html *::-webkit-scrollbar { width: 8px; height: 8px; }
+
+html::-webkit-scrollbar-track,
+html *::-webkit-scrollbar-track { background: transparent; }
+
+html::-webkit-scrollbar-corner,
+html *::-webkit-scrollbar-corner { background: transparent; }
+
+html::-webkit-scrollbar-thumb,
+html *::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 6px;
+  transition: background-color .4s ease;
+}
+
+html:hover::-webkit-scrollbar-thumb,
+html *:hover::-webkit-scrollbar-thumb,
+html.scr-on::-webkit-scrollbar-thumb,
+html.scr-on *::-webkit-scrollbar-thumb { background: var(--sb-thumb); }
+
+html::-webkit-scrollbar-thumb:hover,
+html *::-webkit-scrollbar-thumb:hover,
+html.scr-on::-webkit-scrollbar-thumb:hover,
+html.scr-on *::-webkit-scrollbar-thumb:hover { background: var(--sb-thumb-hover); }
+
+/* Firefox：用标准属性退化（没有淡出动画） */
+@supports not selector(::-webkit-scrollbar) {
+  html, body { scrollbar-width: thin; scrollbar-color: transparent transparent; }
+  html:hover, body:hover,
+  html.scr-on, body.scr-on { scrollbar-color: var(--sb-thumb) transparent; }
+}

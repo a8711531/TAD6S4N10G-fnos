@@ -75,30 +75,40 @@ func TestBackupPlacesBuildsFnosCategories(t *testing.T) {
 		byKind[place.Kind] = append(byKind[place.Kind], place)
 	}
 
-	personal := byKind[BackupPlacePersonal]
-	if len(personal) != 1 || personal[0].Path != "/vol1/1000" || personal[0].Name != "我的文件" {
-		t.Fatalf("我的文件识别不正确: %+v", personal)
+	// 显示文字与硬盘测试工具完全一套：内置卷本身就是一个位置，叫「存储空间 N」，
+	// 点进去默认落在用户目录（home），并带容量
+	volumes := byKind[BackupPlaceVolume]
+	if len(volumes) != 1 || volumes[0].Path != "/vol1" || volumes[0].Name != "存储空间 1" {
+		t.Fatalf("存储空间识别不正确: %+v", volumes)
 	}
-
-	team := byKind[BackupPlaceTeam]
-	if len(team) != 1 || team[0].Path != "/vol1/电影" {
-		t.Fatalf("团队文件应只包含 /vol1/电影（系统目录必须过滤）: %+v", team)
+	if volumes[0].Home != "/vol1/1000" {
+		t.Fatalf("存储空间应带用户目录 home: %+v", volumes[0])
+	}
+	if volumes[0].TotalBytes == 0 {
+		t.Fatalf("存储空间应带容量: %+v", volumes[0])
 	}
 
 	external := byKind[BackupPlaceExternal]
 	if len(external) != 1 || external[0].Path != "/media/usb0" || !external[0].Removable {
 		t.Fatalf("外接存储识别不正确: %+v", external)
 	}
+	if external[0].Name != "外接存储" || external[0].Subtitle != "usb0" {
+		t.Fatalf("外接存储第一行应是「外接存储」、第二行是设备名: %+v", external[0])
+	}
 
 	remote := byKind[BackupPlaceRemote]
 	if len(remote) != 1 || remote[0].Path != "/vol02/1000-1-2056118d" {
 		t.Fatalf("远程挂载识别不正确: %+v", remote)
 	}
+	// 测试环境读不到飞牛配置，兜底是「远程挂载 · <挂载目录名>」
+	if remote[0].Name != "远程挂载 · 1000-1-2056118d" {
+		t.Fatalf("远程挂载兜底命名不正确: %+v", remote[0])
+	}
 
-	// 卷根 /vol1 本身、以及存放远程挂载的 /vol02 都不能被当成内部存储卷。
+	// 存放远程挂载的 /vol02 不能被当成内部存储卷；卷根下的系统目录也不单列。
 	for _, place := range places {
 		switch place.Path {
-		case "/vol1", "/vol02", "/vol1/@appdata", "/vol1/@appshare", "/vol1/docker", "/vol1/thumb", "/vol1/.cache.trim-sysrestore":
+		case "/vol02", "/vol1/@appdata", "/vol1/@appshare", "/vol1/docker", "/vol1/thumb", "/vol1/.cache.trim-sysrestore", "/vol1/电影":
 			t.Fatalf("不该出现在位置列表里: %+v", place)
 		}
 	}
@@ -107,11 +117,11 @@ func TestBackupPlacesBuildsFnosCategories(t *testing.T) {
 func TestBackupPlacesOrderFollowsFnosSidebar(t *testing.T) {
 	manager := backupPlacesFakeManager(t)
 	places := manager.BackupPlaces()
-	if len(places) < 4 {
+	if len(places) < 3 {
 		t.Fatalf("位置数量不足: %+v", places)
 	}
-	order := []string{places[0].Kind, places[1].Kind, places[2].Kind, places[3].Kind}
-	want := []string{BackupPlacePersonal, BackupPlaceTeam, BackupPlaceExternal, BackupPlaceRemote}
+	order := []string{places[0].Kind, places[1].Kind, places[2].Kind}
+	want := []string{BackupPlaceVolume, BackupPlaceRemote, BackupPlaceExternal}
 	for i := range want {
 		if order[i] != want[i] {
 			t.Fatalf("位置顺序应为 %v，实际 %v", want, order)
@@ -121,19 +131,20 @@ func TestBackupPlacesOrderFollowsFnosSidebar(t *testing.T) {
 
 func TestPlacePathOwnerPicksDeepestPlace(t *testing.T) {
 	places := []BackupPlace{
-		{ID: "personal:/vol1/1000", Path: "/vol1/1000", Kind: BackupPlacePersonal},
-		{ID: "team:/vol1/photo", Path: "/vol1/photo", Kind: BackupPlaceTeam},
+		{ID: "volume:/vol1", Path: "/vol1", Kind: BackupPlaceVolume},
+		{ID: "team:/vol1/photo", Path: "/vol1/photo", Kind: "team"},
 	}
 	cases := []struct {
 		path string
 		want string
 	}{
-		{"/vol1/1000", "personal:/vol1/1000"},
-		{"/vol1/1000/照片/2024", "personal:/vol1/1000"},
+		{"/vol1/1000", "volume:/vol1"},
+		{"/vol1/1000/照片/2024", "volume:/vol1"},
 		{"/vol1/photo", "team:/vol1/photo"},
-		{"/vol1", ""},
+		// 卷根本身就是位置（与硬盘测试工具一致）
+		{"/vol1", "volume:/vol1"},
 		{"/etc", ""},
-		{"/vol1/10000", ""}, // 前缀相同但不是同一层，不能误判
+		{"/vol1/10000", "volume:/vol1"}, // 卷位置覆盖整个卷树，含深层目录
 	}
 	for _, test := range cases {
 		if got := placePathOwner(places, test.path); got != test.want {
@@ -158,7 +169,8 @@ func TestBackupBrowseScopesControlReach(t *testing.T) {
 	}
 
 	// 系统目录在默认范围里进不去，一律退回位置总览，避免小白误入。
-	for _, path := range []string{"/", "/etc", "/vol1", "/vol02"} {
+	// 卷根与硬盘测试工具一致是可选位置，可以浏览（内部目录已过滤）。
+	for _, path := range []string{"/", "/etc", "/vol02"} {
 		result, err := manager.BrowseBackupPath(path, "")
 		if err != nil {
 			t.Fatalf("%s 应安全退回总览而不是报错: %v", path, err)
@@ -168,19 +180,25 @@ func TestBackupBrowseScopesControlReach(t *testing.T) {
 		}
 	}
 
-	// 位置内部可以正常下钻，并且到位置根目录时 parent 为空（＝回到位置总览）。
+	// 位置内部可以正常下钻；与硬盘测试工具一样，「上级」可以一直到卷根
+	//（卷根也是位置），再往上才回到位置总览。
 	root, err := manager.BrowseBackupPath("/vol1/1000", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if root.Mode != "browse" || root.Path != "/vol1/1000" {
-		t.Fatalf("我的文件根目录应可浏览: %+v", root)
+		t.Fatalf("用户目录应可浏览: %+v", root)
 	}
-	if root.Parent != "" {
-		t.Fatalf("位置根目录的上一级应为位置总览，实际 %q", root.Parent)
+	if root.Parent != "/vol1" || root.Inside != "volume:/vol1" {
+		t.Fatalf("用户目录的上一级应是卷根: %+v", root)
 	}
-	if root.Inside != "personal:/vol1/1000" {
-		t.Fatalf("inside 标识不正确: %q", root.Inside)
+
+	volumeTop, err := manager.BrowseBackupPath("/vol1", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if volumeTop.Mode != "browse" || volumeTop.Inside != "volume:/vol1" || volumeTop.Parent != "" {
+		t.Fatalf("卷根应可浏览且上一级回到位置总览: %+v", volumeTop)
 	}
 
 	child, err := manager.BrowseBackupPath("/vol1/1000/照片", "")
@@ -216,19 +234,19 @@ func TestBackupBrowseScopesControlReach(t *testing.T) {
 		}
 	}
 
-	// 高级模式走到 /vol1 时，其下的 uid 目录应被标记为「位置」。
-	volumeRoot, err := manager.BrowseBackupPath("/vol1", BackupScopeAll)
+	// 高级模式走到 / 时，卷根 /vol1 应被标记为「位置」（位置 = 卷/远程挂载/外接存储根）。
+	fsRoot, err := manager.BrowseBackupPath("/", BackupScopeAll)
 	if err != nil {
 		t.Fatal(err)
 	}
 	marked := false
-	for _, entry := range volumeRoot.Entries {
-		if entry.Name == "1000" && entry.IsPlace {
+	for _, entry := range fsRoot.Entries {
+		if entry.Name == "vol1" && entry.IsPlace {
 			marked = true
 		}
 	}
 	if !marked {
-		t.Fatal("/vol1 下的 1000 应被标记为位置根目录")
+		t.Fatal("/vol1 应被标记为位置根目录")
 	}
 }
 

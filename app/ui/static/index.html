@@ -33,7 +33,7 @@
       } catch (error) { /* localStorage 不可用时跟随系统 */ }
     })();
   </script>
-  <link rel="stylesheet" href="styles.css?v=0.10.48">
+  <link rel="stylesheet" href="styles.css?v=0.10.54">
   <script>
     // 样式自愈：升级包后浏览器可能仍持有带长缓存的远古样式表（无 CSS 变量，
     // 表现为图表坐标线消失、文字变黑、主题切换无反应）。绕过缓存拉取服务端
@@ -796,19 +796,27 @@
         <h3 id="path-picker-title">选择目录</h3>
         <button id="path-picker-close" type="button" class="ghost" data-picker-close>关闭</button>
       </header>
-      <nav id="path-picker-crumbs" class="path-picker-crumbs" aria-label="当前位置"></nav>
-      <div class="path-picker-body">
-        <aside id="path-picker-places" class="path-picker-places" aria-label="位置"></aside>
-        <div id="path-picker-entries" class="path-picker-entries" role="listbox" aria-label="目录内容"></div>
+      <div class="path-picker-body picker">
+        <div class="picker-col places-col">
+          <div class="col-title">存储空间</div>
+          <ul id="path-picker-places" class="places" aria-label="位置"></ul>
+        </div>
+        <div class="picker-col entries-col">
+          <div class="path-bar">
+            <button id="path-picker-up" type="button" class="ghost small" disabled>↑ 上级</button>
+            <code id="path-picker-path">—</code>
+            <span id="path-picker-hint" class="path-hint" hidden></span>
+          </div>
+          <ul id="path-picker-entries" class="dirs" role="listbox" aria-label="目录内容"></ul>
+        </div>
       </div>
       <p id="path-picker-warning" class="path-picker-warning" hidden></p>
       <footer class="path-picker-foot">
         <span id="path-picker-message" class="inline-status" role="status" aria-live="polite"></span>
         <div class="actions">
-          <button id="path-picker-mkdir" type="button" class="ghost">新建文件夹</button>
           <button id="path-picker-advanced" type="button" class="ghost">高级：原生目录模式</button>
-          <button id="path-picker-up" type="button">上一级</button>
-          <button id="path-picker-select" type="button" class="primary">选择当前目录</button>
+          <button id="path-picker-mkdir" type="button" class="ghost">新建文件夹</button>
+          <button id="path-picker-select" type="button" class="primary">使用当前目录作为目标</button>
         </div>
       </footer>
     </div>
@@ -872,6 +880,6 @@
       </footer>
     </div>
   </div>
-  <script src="app.js?v=0.10.48" defer></script>
+  <script src="app.js?v=0.10.54" defer></script>
 </body>
 </html>

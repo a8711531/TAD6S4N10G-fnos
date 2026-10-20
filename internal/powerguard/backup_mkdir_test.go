@@ -58,7 +58,9 @@ func TestCreateBackupDirectoryScopeGuard(t *testing.T) {
 
 	// 不在任何位置里的路径：默认范围一律拒绝（与浏览的退回逻辑不同，这里必须报错，
 	// 否则用户会以为建成功了却找不到）。
-	for _, path := range []string{"/etc", "/vol1", "/vol02", "/", "/vol1/docker"} {
+	// 卷根与硬盘测试工具一致是可选位置，可以在卷根下直接新建；
+	// 飞牛内部目录（docker）即使手敲路径也要拒绝。
+	for _, path := range []string{"/etc", "/vol02", "/", "/vol1/docker"} {
 		if _, err := manager.CreateBackupDirectory(path, "备份", ""); err == nil {
 			t.Fatalf("%s 不该允许新建目录", path)
 		}

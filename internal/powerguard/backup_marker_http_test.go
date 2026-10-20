@@ -133,8 +133,8 @@ func TestHandleBackupBrowseCarriesPlacesAndScope(t *testing.T) {
 	if overview.Mode != "places" || overview.Scope != BackupScopePlaces {
 		t.Fatalf("应为默认 places 总览: %+v", overview)
 	}
-	if len(overview.Places) != 2 {
-		t.Fatalf("应识别出 2 个位置，实际 %+v", overview.Places)
+	if len(overview.Places) != 1 {
+		t.Fatalf("应识别出 1 个位置，实际 %+v", overview.Places)
 	}
 
 	// 进入位置内部
@@ -146,7 +146,7 @@ func TestHandleBackupBrowseCarriesPlacesAndScope(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &inside); err != nil {
 		t.Fatal(err)
 	}
-	if inside.Mode != "browse" || inside.Inside != "personal:/vol1/1000" || inside.Parent != "" {
+	if inside.Mode != "browse" || inside.Inside != "volume:/vol1" || inside.Parent != "/vol1" {
 		t.Fatalf("位置内部浏览结果不正确: %+v", inside)
 	}
 

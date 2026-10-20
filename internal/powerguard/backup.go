@@ -79,7 +79,9 @@ var (
 	// 个人空间根目录 /vol1/1000：同步模式会把目标里多余的文件删掉，
 	// 直接指到整个「我的文件」等于清空个人空间，必须要求再往下选一层。
 	backupPersonalRootPat = regexp.MustCompile(`^/vol[0-9]+/[0-9]+$`)
-	backupRsyncOnce       struct {
+	// 卷根下的第一层子目录（共享文件夹等）——移动类模式不许整层搬走
+	backupTeamRootPat = regexp.MustCompile(`^/vol[0-9]+/[^/]+$`)
+	backupRsyncOnce   struct {
 		path string
 		err  error
 		done bool
@@ -171,14 +173,15 @@ type BackupBrowseResult struct {
 	Volumes []BackupVolume      `json:"volumes"`
 }
 
-// BackupPlace 一个「位置」入口，与飞牛文件管理器左侧的分类一一对应：
-// 我的文件（internal 卷里的用户个人空间）、团队文件（共享目录）、
-// 外接存储（U 盘/移动硬盘）、远程挂载（云盘与网络位置）。
+// BackupPlace 一个「位置」入口，与硬盘测试工具「选择测试目录」的存储空间列表
+// 一一对应：存储空间 N（内置卷，点击落到卷内用户目录）、外接存储（U 盘/移动硬盘）、
+// 远程挂载（云盘与网络位置）。
 type BackupPlace struct {
 	ID         string `json:"id"`
 	Name       string `json:"name"`
 	Subtitle   string `json:"subtitle,omitempty"`
 	Path       string `json:"path"`
+	Home       string `json:"home,omitempty"`
 	Kind       string `json:"kind"`
 	Removable  bool   `json:"removable,omitempty"`
 	UUID       string `json:"uuid,omitempty"`
@@ -663,8 +666,7 @@ func (m *Manager) resolveBackupLocation(loc BackupLocation) (string, error) {
 
 // 位置分类，用词与飞牛文件管理器保持一致，用户一眼能对上。
 const (
-	BackupPlacePersonal = "personal" // 我的文件
-	BackupPlaceTeam     = "team"     // 团队文件
+	BackupPlaceVolume   = "volume"   // 存储空间 N（内置卷）
 	BackupPlaceExternal = "external" // 外接存储
 	BackupPlaceRemote   = "remote"   // 远程挂载
 )
@@ -825,58 +827,38 @@ func personalPlaceSubtitle(uid string) string {
 	return "用户 " + uid
 }
 
-// BackupPlaces 汇总界面可选的「位置」，顺序与飞牛文件管理器一致。
+// BackupPlaces 汇总界面可选的「位置」，与硬盘测试工具「选择测试目录」完全同一套：
+// 内置卷直接叫「存储空间 N」并带容量（点击落到卷内用户目录），远程挂载用飞牛配置里
+// 的官方名字/网盘品牌，第二行是账号名或 登录名@地址；外接存储叫「外接存储 · 设备名」。
 func (m *Manager) BackupPlaces() []BackupPlace {
-	var personal, team, external, remote []BackupPlace
+	var volumes, external, remote []BackupPlace
+
+	officialNames, officialBrands := remoteInfos()
+	friendly := m.remoteMountFriendlyNames()
+	aliases := m.RemoteAliases()
 
 	for _, root := range m.internalVolumeRoots() {
-		entries, err := os.ReadDir(m.rooted(root))
-		if err != nil {
-			continue
-		}
-		var names []string
-		for _, entry := range entries {
-			if entry.IsDir() {
-				names = append(names, entry.Name())
-			}
-		}
-		sort.Strings(names)
-		for _, name := range names {
-			path := filepath.ToSlash(filepath.Join(root, name))
-			if backupPersonalDirPattern.MatchString(name) {
-				personal = append(personal, BackupPlace{
-					ID:       "personal:" + path,
-					Name:     "我的文件",
-					Subtitle: personalPlaceSubtitle(name),
-					Path:     path,
-					Kind:     BackupPlacePersonal,
-				})
-				continue
-			}
-			if isBackupSystemDirName(name) {
-				continue
-			}
-			team = append(team, BackupPlace{
-				ID:   "team:" + path,
-				Name: name,
-				Path: path,
-				Kind: BackupPlaceTeam,
-			})
-		}
+		total, free := m.backupUsage(root)
+		volumes = append(volumes, BackupPlace{
+			ID:         "volume:" + root,
+			Name:       backupVolumeLabel(root),
+			Path:       root,
+			Home:       m.backupVolumeHome(root),
+			Kind:       BackupPlaceVolume,
+			TotalBytes: total,
+			FreeBytes:  free,
+		})
 	}
 
 	for _, volume := range m.ListBackupVolumes() {
 		if !volume.Removable {
 			continue
 		}
-		name := strings.TrimSpace(volume.Label)
-		if name == "" {
-			name = "外接存储"
-		}
+		device := backupExternalDeviceName(volume.Label, volume.MountPoint)
 		external = append(external, BackupPlace{
 			ID:         "external:" + volume.MountPoint,
-			Name:       name,
-			Subtitle:   "可移动介质",
+			Name:       "外接存储",
+			Subtitle:   backupPlaceSubtitle(device, backupReadOnlyText(volume.ReadOnly)),
 			Path:       volume.MountPoint,
 			Kind:       BackupPlaceExternal,
 			Removable:  true,
@@ -888,28 +870,30 @@ func (m *Manager) BackupPlaces() []BackupPlace {
 		})
 	}
 
-	friendly := m.remoteMountFriendlyNames()
-	aliases := m.RemoteAliases()
 	for _, mount := range m.parseAllMounts() {
 		if !isBackupRemoteFSType(mount.fsType) || mount.mountPoint == "/" {
 			continue
 		}
+		label, sub := backupRemoteDisplay(mount, aliases, friendly, officialNames, officialBrands)
+		total, free := m.backupUsage(mount.mountPoint)
 		remote = append(remote, BackupPlace{
-			ID:       "remote:" + mount.mountPoint,
-			Name:     remoteMountDisplayName(mount.mountPoint, friendly, aliases),
-			Subtitle: "远程挂载",
-			Path:     mount.mountPoint,
-			Kind:     BackupPlaceRemote,
-			ReadOnly: mount.readOnly,
+			ID:         "remote:" + mount.mountPoint,
+			Name:       label,
+			Subtitle:   sub,
+			Path:       mount.mountPoint,
+			Kind:       BackupPlaceRemote,
+			ReadOnly:   mount.readOnly,
+			TotalBytes: total,
+			FreeBytes:  free,
 		})
 	}
 	sort.SliceStable(remote, func(i, j int) bool { return remote[i].Path < remote[j].Path })
 
-	places := make([]BackupPlace, 0, len(personal)+len(team)+len(external)+len(remote))
-	places = append(places, personal...)
-	places = append(places, team...)
-	places = append(places, external...)
+	// 顺序也与硬盘测试工具一致：存储空间 → 远程挂载 → 外接存储
+	places := make([]BackupPlace, 0, len(volumes)+len(external)+len(remote))
+	places = append(places, volumes...)
 	places = append(places, remote...)
+	places = append(places, external...)
 	return places
 }
 
@@ -1242,8 +1226,17 @@ func (m *Manager) CreateBackupDirectory(path, name, scope string) (BackupMkdirRe
 	if clean == "/" {
 		return result, errors.New("不能直接在文件系统根目录下新建文件夹，请先进到具体位置")
 	}
-	if scope == BackupScopePlaces && placePathOwner(m.BackupPlaces(), clean) == "" {
-		return result, errors.New("该目录不在可选位置内，可先切到原生目录模式")
+	if scope == BackupScopePlaces {
+		if placePathOwner(m.BackupPlaces(), clean) == "" {
+			return result, errors.New("该目录不在可选位置内，可先切到原生目录模式")
+		}
+		// 卷位置覆盖整棵卷树，但飞牛的内部目录（@appdata、docker、thumb…）
+		// 仍然不许落脚——浏览时它们是隐藏的，手敲路径也要挡住。
+		for _, segment := range strings.Split(strings.Trim(clean, "/"), "/") {
+			if isBackupHiddenEntryName(segment) {
+				return result, errors.New("该目录不在可选位置内，可先切到原生目录模式")
+			}
+		}
 	}
 	info, err := os.Stat(m.rooted(clean))
 	if err != nil {
@@ -1333,8 +1326,14 @@ func (m *Manager) moveSourceGuard(src string) error {
 	if backupVolumeRootPat.MatchString(slash) {
 		return errors.New("移动类模式会删除源里的文件，不能以整个存储卷为源，请在卷内选择具体目录")
 	}
+	if backupPersonalRootPat.MatchString(slash) {
+		return errors.New("移动类模式会删除源里的文件，源不能是整个「我的文件」根目录，请在它下面选择具体目录")
+	}
+	if backupTeamRootPat.MatchString(slash) {
+		return errors.New("移动类模式会删除源里的文件，源不能是整个共享文件夹根目录，请在它下面选择具体目录")
+	}
 	if isPlaceRoot(m.BackupPlaces(), slash) {
-		return errors.New("移动类模式会删除源里的文件，源不能是整个「我的文件」「团队文件」或远程挂载根目录，请在它下面选择具体目录")
+		return errors.New("移动类模式会删除源里的文件，源不能是远程挂载根目录，请在它下面选择具体目录")
 	}
 	return nil
 }

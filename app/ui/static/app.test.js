@@ -1253,6 +1253,17 @@ test('浏览对话框：后端拒绝时保留原目录并显示原因', async ()
   assert.match(app.element('path-picker-message').textContent, /已存在/);
 });
 
+test('浏览对话框位置列表：剩余容量属于第一行（右对齐），第二行只留身份信息', () => {
+  const app = loadAppContext();
+  const meta = app.resolve('placeMetaText');
+  const place = { subtitle: '可移动介质', total_bytes: 31124881408, free_bytes: 31017926656 };
+  // 容量不再混进第二行小字：它要在名称那一行右对齐，参考硬盘测试工具的选目录列表
+  assert.equal(meta(place), '可移动介质', '第二行不应包含「剩余 …」容量');
+  assert.equal(meta({ ...place, read_only: true }), '可移动介质 · 只读');
+  assert.equal(meta({ subtitle: '远程挂载', read_only: true, total_bytes: 1 }), '远程挂载 · 只读');
+  assert.equal(meta({}), '', '什么都没有时就空着');
+});
+
 
 test('复制方式：两种备份卡片选项与顺序一致（转移归档排第二）', () => {
   const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
