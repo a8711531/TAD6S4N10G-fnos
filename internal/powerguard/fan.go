@@ -472,7 +472,12 @@ func (m *Manager) fanSpinUpGraceLocked() bool {
 	return time.Since(m.fanOffExitedAt) < fanSpinUpGraceWindow
 }
 
-func (m *Manager) validateFanLocked(cfg FanConfig) error {
+// errNoUsableFan 所有选中的风扇都读不到转速：保存配置时拒绝（防止静默存下
+// 无风扇可用的配置）；运行时周期应用识别该错误后跳过本周期，不报错也不
+// fail-safe 拉满——机器没有可控风扇时刷屏报错没有任何意义。
+var errNoUsableFan = errors.New("所有选中的风扇都读不到转速（可能未接风扇或接口被反插），请检查接线后重新选择")
+
+func (m *Manager) validateFanLocked(cfg *FanConfig) error {
 	m.noteOffModeStateLocked(cfg.OffMode)
 	if cfg.MinPWMPercent < 30 || cfg.MinPWMPercent > 100 {
 		return errors.New("fan min_pwm_percent must be between 30 and 100")
@@ -501,7 +506,7 @@ func (m *Manager) validateFanLocked(cfg FanConfig) error {
 	if !cfg.Enabled {
 		return nil
 	}
-	selected := selectedFanSources(cfg)
+	selected := selectedFanSources(*cfg)
 	if len(selected) == 0 {
 		return errors.New("at least one fan must be selected when fan control is enabled")
 	}
@@ -513,6 +518,7 @@ func (m *Manager) validateFanLocked(cfg FanConfig) error {
 	for _, fan := range fans {
 		available[fan.ID] = fan
 	}
+	var dead []string
 	for id := range selected {
 		fan, ok := available[id]
 		if !ok {
@@ -524,12 +530,59 @@ func (m *Manager) validateFanLocked(cfg FanConfig) error {
 			continue
 		}
 		// 刚退出关停档的风扇从 0 转自然起转需要几秒到几十秒，宽限期内读到的
-		// 0 转速不算「通道接不到风扇」；宽限期过后仍然 0 转才按故障拒绝。
+		// 0 转速不算「通道接不到风扇」；宽限期过后仍然 0 转才按故障处理。
 		if fan.RPM <= 0 && !m.fanSpinUpGraceLocked() {
-			return fmt.Errorf("fan %s reports no valid RPM and cannot be controlled safely", fan.ID)
+			dead = append(dead, id)
+		}
+	}
+	// 选中的风扇里读不到转速的（接口没接风扇、风扇被拔掉或反插到别的通道），
+	// 自动从配置里剔除而不是报错——用户反插接口后旧通道不再阻塞保存。
+	sort.Strings(dead) // map 遍历顺序不稳定，排序后日志去重键才一致
+	m.logFanIssueLocked(&m.fanFilteredLogKey, dead, "风扇 %s 读不到转速，已从配置中自动屏蔽（可能未接风扇或接口被反插）")
+	if len(dead) > 0 {
+		cfg.CPUFanIDs = removeStringSlice(cfg.CPUFanIDs, dead)
+		cfg.HDDFanIDs = removeStringSlice(cfg.HDDFanIDs, dead)
+		cfg.NVMeFanIDs = removeStringSlice(cfg.NVMeFanIDs, dead)
+		selected = selectedFanSources(*cfg)
+		if len(selected) == 0 {
+			return errNoUsableFan
 		}
 	}
 	return nil
+}
+
+// logFanIssueLocked 风扇问题日志去重：控制周期每几秒跑一轮，同一组风扇的同一
+// 问题只在首次（或集合变化后）写一次日志；ids 为空时重置去重键，风扇恢复后
+// 再次出现问题会重新记录。format 必须且只能含一个 %s（用于风扇 ID 列表）。
+func (m *Manager) logFanIssueLocked(key *string, ids []string, format string) {
+	if len(ids) == 0 {
+		*key = ""
+		return
+	}
+	joined := strings.Join(ids, "、")
+	if *key == joined {
+		return
+	}
+	*key = joined
+	m.logf(format, joined)
+}
+
+// removeStringSlice 从切片里删除指定元素，返回新切片。
+func removeStringSlice(slice, remove []string) []string {
+	if len(remove) == 0 {
+		return slice
+	}
+	blocked := make(map[string]bool, len(remove))
+	for _, id := range remove {
+		blocked[id] = true
+	}
+	result := make([]string, 0, len(slice))
+	for _, id := range slice {
+		if !blocked[id] {
+			result = append(result, id)
+		}
+	}
+	return result
 }
 
 func validateFanSlotIDs(name, kind string, ids []string) error {
@@ -1161,7 +1214,14 @@ func (m *Manager) ApplyFanCurrent() error {
 		m.fanLastError = ""
 		return nil
 	}
-	if err := m.validateFanLocked(cfg.Fan); err != nil {
+	if err := m.validateFanLocked(&cfg.Fan); err != nil {
+		if errors.Is(err, errNoUsableFan) {
+			// 运行时周期应用：所有选中风扇都读不到转速（接口未接风扇或被反插）时
+			// 本周期没有可控风扇——跳过即可，不报错也不 fail-safe 拉满，否则控制
+			// 循环会把同一错误一直刷到状态里（保存配置时仍会拦下这种配置）。
+			m.fanLastError = ""
+			return nil
+		}
 		return m.setFanFailureLocked(err)
 	}
 	if err := m.applyFanLocked(cfg.Fan); err != nil {
@@ -1277,6 +1337,7 @@ func (m *Manager) applyFanLocked(cfg FanConfig) error {
 
 	lastTarget := 0
 	var errs []error
+	var skipped []string // 本轮因 0 转速被跳过的风扇（汇总后去重写一次日志）
 	for id, sources := range selected {
 		fan := byID[id]
 		if _, taken := m.fanDebugTakenOver[id]; taken {
@@ -1312,9 +1373,10 @@ func (m *Manager) applyFanLocked(cfg FanConfig) error {
 			continue
 		}
 		// 刚退出关停档的风扇从 0 转自然起转需要几秒到几十秒，宽限期内读到的
-		// 0 转速不算「通道接不到风扇」；宽限期过后仍然 0 转按故障 fail-safe。
+		// 0 转速不算「通道接不到风扇」；宽限期过后仍然 0 转的通道按故障处理——
+		// 不再报错拉满，而是直接跳过（该接口可能没接风扇或被反插到别的通道）。
 		if fan.RPM <= 0 && !m.fanSpinUpGraceLocked() {
-			errs = append(errs, fmt.Errorf("fan %s reports no valid RPM", id), setFanPWM(fan, 100))
+			skipped = append(skipped, id)
 			continue
 		}
 		target := 0
@@ -1342,6 +1404,8 @@ func (m *Manager) applyFanLocked(cfg FanConfig) error {
 		}
 		lastTarget = max(lastTarget, target)
 	}
+	sort.Strings(skipped)
+	m.logFanIssueLocked(&m.fanSkippedLogKey, skipped, "风扇 %s 读不到转速，本次控制跳过（可能未接风扇或接口被反插）")
 	if err := errors.Join(errs...); err != nil {
 		return err
 	}

@@ -242,6 +242,11 @@ type Manager struct {
 	fanOffWasActive bool
 	fanOffExitedAt  time.Time
 
+	// 0 转风扇屏蔽/跳过日志的去重键：控制周期每 2 秒跑一轮，同一组风扇问题
+	// 只在集合变化（或恢复后再次出现）时写一次日志，避免刷满运行日志。
+	fanFilteredLogKey string
+	fanSkippedLogKey  string
+
 	// 风扇调试模式（运行时状态，不落盘；重启即恢复曲线控制）
 	fanDebugTakenOver       map[string]int
 	fanDebugUnits           map[string]string // 被接管风扇的调节单位(percent/pwm),与 TakenOver 同键 // 被调试接管的风扇 ID → 调试转速(%);接管的风扇不受任何曲线控制
@@ -715,7 +720,7 @@ func (m *Manager) SaveFanConfig(fan FanConfig) error {
 	previous := cfg.Fan
 	cfg.Fan = fan
 	normalizeConfig(&cfg)
-	if err := m.validateFanLocked(cfg.Fan); err != nil {
+	if err := m.validateFanLocked(&cfg.Fan); err != nil {
 		m.lastError = err.Error()
 		return err
 	}
@@ -854,7 +859,7 @@ func (m *Manager) BindAllFansDefault() error {
 	cfg.Fan.DeviceID = ids[0]
 	cfg.Fan.Enabled = true
 	// 只校验风扇段：这个命令不下发功耗限制，不该因为 RAPL 暂时读不到就整条失败
-	if err := m.validateFanLocked(cfg.Fan); err != nil {
+	if err := m.validateFanLocked(&cfg.Fan); err != nil {
 		return err
 	}
 	if err := m.saveConfigLocked(cfg); err != nil {
@@ -897,7 +902,7 @@ func (m *Manager) validateLocked(cfg Config) error {
 	if err := m.validateGlobalLocked(cfg); err != nil {
 		return err
 	}
-	if err := m.validateFanLocked(cfg.Fan); err != nil {
+	if err := m.validateFanLocked(&cfg.Fan); err != nil {
 		return err
 	}
 	return validateGPIOConfig(cfg.GPIO)

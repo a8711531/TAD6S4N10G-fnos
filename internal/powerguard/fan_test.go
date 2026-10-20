@@ -354,7 +354,7 @@ func TestFanValidationRejectsDecreasingSpeed(t *testing.T) {
 	cfg := DefaultFanConfig()
 	// 默认 CPU 曲线第 3、4 点都是 47%：把第 4 点压到 40% 就构成递减
 	cfg.Curve[3].PWMPercent = 40
-	if err := (&Manager{}).validateFanLocked(cfg); err == nil {
+	if err := (&Manager{}).validateFanLocked(&cfg); err == nil {
 		t.Fatal("decreasing PWM curve was accepted")
 	}
 }
@@ -363,7 +363,7 @@ func TestFanValidationRejectsDecreasingStorageSpeed(t *testing.T) {
 	cfg := DefaultFanConfig()
 	// 默认 NVMe 曲线是 40/40/60/70：末点压到 50 就构成递减
 	cfg.NVMeCurve[3].PWMPercent = 50
-	if err := (&Manager{}).validateFanLocked(cfg); err == nil {
+	if err := (&Manager{}).validateFanLocked(&cfg); err == nil {
 		t.Fatal("decreasing NVMe PWM curve was accepted")
 	}
 }
@@ -371,18 +371,18 @@ func TestFanValidationRejectsDecreasingStorageSpeed(t *testing.T) {
 func TestFanValidationRejectsInvalidOrDuplicateStorageSlots(t *testing.T) {
 	cfg := DefaultFanConfig()
 	cfg.HDDSlotIDs = []string{"front-1", "front-1"}
-	if err := (&Manager{}).validateFanLocked(cfg); err == nil {
+	if err := (&Manager{}).validateFanLocked(&cfg); err == nil {
 		t.Fatal("duplicate HDD slot was accepted")
 	}
 	cfg = DefaultFanConfig()
 	cfg.NVMeSlotIDs = []string{"front-1"}
-	if err := (&Manager{}).validateFanLocked(cfg); err == nil {
+	if err := (&Manager{}).validateFanLocked(&cfg); err == nil {
 		t.Fatal("HDD slot was accepted as NVMe slot")
 	}
 	cfg = DefaultFanConfig()
 	cfg.HDDSlotIDs = []string{}
 	cfg.NVMeSlotIDs = []string{}
-	if err := (&Manager{}).validateFanLocked(cfg); err != nil {
+	if err := (&Manager{}).validateFanLocked(&cfg); err != nil {
 		t.Fatalf("explicitly disabling storage monitoring was rejected: %v", err)
 	}
 }
@@ -1207,7 +1207,7 @@ func TestZeroPWMWithoutOffModeRejected(t *testing.T) {
 	for i := range cfg.Curve {
 		cfg.Curve[i].PWMPercent = 0
 	}
-	if err := (&Manager{}).validateFanLocked(cfg); err == nil {
+	if err := (&Manager{}).validateFanLocked(&cfg); err == nil {
 		t.Fatal("非关停档的 0% 曲线必须被拒绝")
 	}
 }
@@ -1299,8 +1299,39 @@ func TestZeroRPMFanStillRejectedWithoutOffMode(t *testing.T) {
 	cfg := DefaultFanConfig()
 	cfg.Enabled = true
 	cfg.CPUFanIDs = []string{"it8613:hwmon3:fan1"}
-	if err := (&Manager{Root: manager.Root}).validateFanLocked(cfg); err == nil {
-		t.Fatal("非关停档的 0 转风扇必须被判为不可控")
+	// 非关停档下选中的风扇 0 转，保存时自动剔除而不是报错——用户反插接口后
+	// 旧通道不再阻塞配置保存。但全部剔除后没有可用风扇时，必须报错。
+	if err := (&Manager{Root: manager.Root}).validateFanLocked(&cfg); err == nil {
+		t.Fatal("所有选中风扇都 0 转时必须报错")
+	}
+}
+
+// 所有选中的风扇都 0 转时，保存必须报错——不能静默保存一个「没有可用风扇」的配置。
+func TestAllSelectedFansZeroRPMRejected(t *testing.T) {
+	manager := newFanDebugTestManager(t)
+	hwmon := filepath.Join(manager.Root, "sys", "class", "hwmon", "hwmon3")
+	writeTestValue(t, filepath.Join(hwmon, "fan1_input"), "0")
+
+	cfg := DefaultFanConfig()
+	cfg.Enabled = true
+	cfg.CPUFanIDs = []string{"it8613:hwmon3:fan1"}
+	if err := (&Manager{Root: manager.Root}).validateFanLocked(&cfg); err == nil {
+		t.Fatal("所有选中风扇都 0 转时必须报错")
+	}
+}
+
+// 部分风扇 0 转、部分正常时，只剔除 0 转的，保留正常的。
+func TestPartialZeroRPMFanFiltered(t *testing.T) {
+	manager := newFanDebugTestManager(t)
+
+	cfg := DefaultFanConfig()
+	cfg.Enabled = true
+	cfg.CPUFanIDs = []string{"it8613:hwmon3:fan1", "it8613:hwmon3:fan2"}
+	if err := (&Manager{Root: manager.Root}).validateFanLocked(&cfg); err != nil {
+		t.Fatalf("部分风扇 0 转时应自动剔除而非报错: %v", err)
+	}
+	if len(cfg.CPUFanIDs) != 1 || cfg.CPUFanIDs[0] != "it8613:hwmon3:fan1" {
+		t.Fatalf("应只保留有转速的风扇，实际 %+v", cfg.CPUFanIDs)
 	}
 }
 
@@ -1398,13 +1429,23 @@ func TestZeroRPMRejectedAfterSpinUpGraceExpires(t *testing.T) {
 	manager.fanOffExitedAt = time.Now().Add(-fanSpinUpGraceWindow - time.Second)
 	manager.mu.Unlock()
 
-	if err := manager.ApplyFanCurrent(); err == nil {
-		t.Fatal("宽限期过后仍然 0 转的风扇必须按故障处理")
+	// 宽限期过后仍然 0 转：运行时跳过该风扇（不再报错拉满），保存时自动剔除。
+	beforeApply, _ := readInt(pwm1)
+	if err := manager.ApplyFanCurrent(); err != nil {
+		t.Fatalf("宽限期过后 0 转风扇应被跳过而非报错: %v", err)
 	}
-	if got, _ := readInt(pwm1); got != 255 {
-		t.Fatalf("0 转故障应 fail-safe 拉满，实际 pwm1=%d", got)
+	// 风扇保持原样（不 fail-safe 拉满）
+	if got, _ := readInt(pwm1); got != beforeApply {
+		t.Fatalf("0 转风扇应被跳过而非拉满，pwm1 从 %d 被改写为 %d", beforeApply, got)
 	}
-	if err := manager.SaveFanConfig(on); err == nil {
-		t.Fatal("宽限期过后保存也应被拒（0 转通道不可控）")
+	if got, _ := readInt(pwm1); got == 255 {
+		t.Fatal("0 转风扇被 fail-safe 拉满到 100%")
+	}
+	// 保存时重新构建配置（上次的 on 已被修改）
+	on2 := DefaultFanConfig()
+	on2.Enabled = true
+	on2.CPUFanIDs = []string{"it8613:hwmon3:fan1"}
+	if err := manager.SaveFanConfig(on2); err == nil {
+		t.Fatal("宽限期过后保存应报错（全部剔除后无可用风扇）")
 	}
 }
