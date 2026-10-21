@@ -6,7 +6,9 @@ import (
 	"errors"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -288,6 +290,78 @@ func TestAutoBackupJobForVolume(t *testing.T) {
 	}
 	if job.Source.Path != "/media/usb0" || job.KeepSourceNames || len(job.ExtraSources) != 0 {
 		t.Fatalf("整块卷应保持老语义: %+v", job)
+	}
+}
+
+// makeBackupTestDirLink 在测试目录里创建指向 target 的目录链接。Linux 用符号
+// 链接；Windows 普通用户没有创建符号链接的权限，退回不需要管理员权限的目录联接。
+func makeBackupTestDirLink(t *testing.T, link, target string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err == nil {
+		return
+	}
+	if runtime.GOOS == "windows" {
+		if err := exec.Command("cmd", "/c", "mklink", "/J", link, target).Run(); err == nil {
+			return
+		}
+	}
+	t.Skip("当前环境无法创建目录链接（需要符号链接权限或目录联接支持），跳过链接回归")
+}
+
+// 「backup → .」：卷内子目录其实是一个指向卷根的目录链接。词法校验看不出问题，
+// 但 rsync 的 --delete 会以真正的卷根为目标删除无关文件。必须在启动 rsync
+// 之前就拒绝，且卷里没参与本次备份的文件必须原样保留。
+func TestAutoBackupRejectsSymlinkedVolumeSubBeforeRsync(t *testing.T) {
+	manager := autoBackupFakeManager(t)
+	if _, err := manager.MarkAutoBackupVolume("/media/usb0", ""); err != nil {
+		t.Fatalf("打标失败: %v", err)
+	}
+	makeBackupTestDirLink(t, filepath.Join(manager.Root, "media", "usb0", "backup"), filepath.Join(manager.Root, "media", "usb0"))
+	autoBackupWrite(t, manager, "media/usb0/DCIM/keep.txt", "不参与本次备份，不能被删")
+
+	rule := GPIOAutoBackup{
+		ID: "photos", Name: "照片", Direction: BackupDirectionToVolume,
+		Fixed: BackupLocation{Kind: "path", Path: "/vol1/1000/照片"},
+		Mode:  BackupModeSync, VolumeSub: "backup",
+	}
+	result, err := manager.RunAutoBackupJob(context.Background(), rule, false)
+	if err == nil {
+		t.Fatal("指向卷根的目录链接应当被拒绝")
+	}
+	if !strings.Contains(err.Error(), "卷内目标路径") || !strings.Contains(err.Error(), "已拒绝") {
+		t.Fatalf("错误应说明链接路径在执行前被拒绝（而不是走到 rsync）：%v", err)
+	}
+	if result.Files != 0 {
+		t.Fatalf("拒绝时不应传输任何文件: %+v", result)
+	}
+	if _, statErr := os.Stat(filepath.Join(manager.Root, "media", "usb0", "DCIM", "keep.txt")); statErr != nil {
+		t.Fatalf("无关文件不应被同步删除: %v", statErr)
+	}
+}
+
+// 内置存储即便被硬件/sysfs 报成 removable（eMMC、SD 引导的机器上可能发生），
+// 也不允许打标：打标只针对 U 盘 / 移动硬盘。
+func TestAutoBackupMarkRejectsBuiltinVolumeEvenIfRemovable(t *testing.T) {
+	manager := autoBackupFakeManager(t)
+	// 把内置卷伪装成可移动设备：/dev/sdc1 在这套夹具里 removable=1。
+	mounts := "/dev/sdc1 /vol1 ext4 rw,relatime 0 0\n/dev/sdd1 /media/usb0 ext4 rw,relatime 0 0\n"
+	if err := os.WriteFile(filepath.Join(manager.Root, "proc", "mounts"), []byte(mounts), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := manager.MarkAutoBackupVolume("/vol1/1000", ""); err == nil {
+		t.Fatal("内置存储不应允许打标")
+	}
+	if _, _, err := manager.AddAutoBackupSub("/vol1/1000/照片"); err == nil {
+		t.Fatal("内置存储不应允许子目录打标")
+	}
+
+	device := autoBackupDevice(t, manager, "/dev/sdc1")
+	if device.Removable {
+		t.Fatalf("内置存储不应作为可打标设备展示: %+v", device)
+	}
+	if device.Marked {
+		t.Fatalf("内置存储不应显示为已打标: %+v", device)
 	}
 }
 

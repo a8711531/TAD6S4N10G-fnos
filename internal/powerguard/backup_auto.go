@@ -518,7 +518,9 @@ func autoBackupWriteError(err error) error {
 func (m *Manager) listAutoBackupVolumes() []AutoBackupVolume {
 	var volumes []AutoBackupVolume
 	for _, volume := range m.ListBackupVolumes() {
-		if !volume.Removable {
+		// 打标只针对 U 盘 / 移动硬盘。内置存储（/vol1、/vol2…）一律排除，
+		// 即使某些硬件（eMMC / SD 引导）把它报成 removable 也不允许打标。
+		if !volume.Removable || backupBuiltinVolume(volume.MountPoint) {
 			continue
 		}
 		entry := AutoBackupVolume{
@@ -968,14 +970,20 @@ func (m *Manager) AutoBackupDevices() []AutoBackupDevice {
 			Device: volume.Device, MountPoint: volume.MountPoint,
 			Label: volume.Label, UUID: volume.UUID, ReadOnly: volume.ReadOnly,
 		}
-		mark, marked, legacy, markErr := m.readAutoBackupMark(entry)
+		// 内置存储不在打标范围内：不读标记（历史上误留下的也不显示为已打标），
+		// 并强制 removable=false，前端据此只展示「内置存储 · 不支持打标」。
+		builtin := backupBuiltinVolume(volume.MountPoint)
+		mark, marked, legacy, markErr := AutoBackupMark{}, false, false, error(nil)
+		if !builtin {
+			mark, marked, legacy, markErr = m.readAutoBackupMark(entry)
+		}
 		identity := entry.identity()
 		if identity != "" {
 			seen[identity] = true
 		}
 		device := AutoBackupDevice{
 			Identity: identity, Marked: marked, Online: true, Legacy: legacy,
-			ReadOnly: volume.ReadOnly, Removable: volume.Removable,
+			ReadOnly: volume.ReadOnly, Removable: volume.Removable && !builtin,
 			Device: volume.Device, MountPoint: volume.MountPoint,
 			Label: volume.Label, UUID: volume.UUID,
 		}
@@ -998,6 +1006,13 @@ func (m *Manager) AutoBackupDevices() []AutoBackupDevice {
 		})
 	}
 	return devices
+}
+
+// backupBuiltinVolume 判断挂载点是不是飞牛的内置存储空间（/vol1、/vol2…）。
+// 自动备份打标只针对 U 盘 / 移动硬盘：内置卷不允许打标，也不作为可打标设备展示。
+func backupBuiltinVolume(mountPoint string) bool {
+	clean := filepath.ToSlash(filepath.Clean(strings.TrimSpace(mountPoint)))
+	return backupInternalVolumePattern.MatchString(clean)
 }
 
 // backupDeviceFSType 判断一个卷算不算「存储设备」：网络/云盘挂载与虚拟文件系统
@@ -1076,6 +1091,79 @@ func autoBackupJobForVolume(rule GPIOAutoBackup, volume AutoBackupVolume) (GPIOB
 	return job, nil
 }
 
+// autoBackupVolumeTargetGuard 在启动 rsync 之前按真实文件系统复核「往打标卷里
+// 备份」的卷内目标。词法检查只能看出字面路径：卷内 `backup` 若是指向 `.` 的目录
+// 链接，`VolumeSub=backup` 在清理后仍是「普通子目录」，但 rsync 的 `--delete`
+// 会以真正的卷根为目标，删掉没参与本次备份的文件。
+//
+// 两道闸：
+//   - 卷内路径的每一段都不能是符号链接（Windows 目录联接同样落入 ModeSymlink）；
+//   - 已存在的目标目录不能与卷根是同一个目录（os.SameFile 覆盖链接与绑定挂载）。
+//
+// 尾部尚不存在的目录由 MkdirAll 按字面路径创建，不会经过链接，因此直接放行。
+func (m *Manager) autoBackupVolumeTargetGuard(volume AutoBackupVolume, sub string) error {
+	root := filepath.ToSlash(filepath.Clean(volume.MountPoint))
+	rootInfo, err := os.Stat(m.rooted(root))
+	if err != nil {
+		return fmt.Errorf("打标卷当前不可访问：%v", err)
+	}
+	if !rootInfo.IsDir() {
+		return fmt.Errorf("打标卷的挂载点不是目录：%s", volume.displayName())
+	}
+	rel := strings.Trim(strings.TrimSpace(filepath.ToSlash(sub)), "/")
+	current := root
+	for _, part := range strings.Split(rel, "/") {
+		if part == "" || part == "." {
+			continue
+		}
+		current = strings.TrimRight(current, "/") + "/" + part
+		info, statErr := os.Lstat(m.rooted(current))
+		if statErr != nil {
+			if os.IsNotExist(statErr) {
+				return nil
+			}
+			return fmt.Errorf("无法检查卷内目标路径 %s：%v", current, statErr)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("卷内目标路径 %s 是符号链接，已拒绝：请改选一个真实子目录（链接可能指向卷根）", current)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("卷内目标路径 %s 不是普通目录（可能是目录联接），已拒绝：请改选一个真实子目录", current)
+		}
+		if os.SameFile(info, rootInfo) {
+			return fmt.Errorf("卷内目标路径 %s 与卷根是同一个目录，已拒绝", current)
+		}
+	}
+	if rel == "" {
+		return nil
+	}
+	// 上面逐段拒绝链接/联接；这里再用解析后的真实路径兜底，确保目标确实是卷根
+	// 的严格子目录（也能覆盖绑定挂载这类 Lstat 看不出来的别名）。
+	realRoot, rootErr := filepath.EvalSymlinks(m.rooted(root))
+	if rootErr != nil {
+		return fmt.Errorf("无法解析打标卷的真实路径：%v", rootErr)
+	}
+	realTarget, targetErr := filepath.EvalSymlinks(m.rooted(root + "/" + rel))
+	if targetErr != nil {
+		if os.IsNotExist(targetErr) {
+			return nil
+		}
+		return fmt.Errorf("无法解析卷内目标路径 %s：%v", current, targetErr)
+	}
+	targetInfo, statErr := os.Stat(realTarget)
+	if statErr != nil {
+		return fmt.Errorf("无法检查卷内目标路径 %s：%v", current, statErr)
+	}
+	if os.SameFile(targetInfo, rootInfo) {
+		return fmt.Errorf("卷内目标路径 %s 解析后与卷根是同一个目录，已拒绝", current)
+	}
+	realRootSlash := strings.TrimRight(filepath.ToSlash(realRoot), "/")
+	if !strings.HasPrefix(filepath.ToSlash(realTarget), realRootSlash+"/") {
+		return fmt.Errorf("卷内目标路径 %s 解析后不在打标卷内，已拒绝", current)
+	}
+	return nil
+}
+
 // RunAutoBackupJob 同步执行一条自动备份规则：扫描打标卷，逐个（串行）执行。
 // 一块盘失败不影响其它盘，最后把所有失败一起报出来。
 func (m *Manager) RunAutoBackupJob(ctx context.Context, rule GPIOAutoBackup, dryRun bool) (AutoBackupResult, error) {
@@ -1144,6 +1232,12 @@ func (m *Manager) RunAutoBackupJob(ctx context.Context, rule GPIOAutoBackup, dry
 		// 而且试跑也需要目录存在。NAS 侧目标仍要求已存在（在 RunBackupJob 里），
 		// 避免手滑写错路径时在 NAS 上静默建出一堆目录。
 		if rule.Direction == BackupDirectionToVolume {
+			// 词法校验之后、创建目录与启动 rsync 之前，再按真实文件系统复核一次：
+			// 卷内子目录不能是符号链接，也不能解析回卷根。
+			if gerr := m.autoBackupVolumeTargetGuard(volume, rule.VolumeSub); gerr != nil {
+				failures = append(failures, fmt.Sprintf("%s：%v", volume.displayName(), gerr))
+				continue
+			}
 			if target, rerr := m.resolveBackupLocation(job.Target); rerr == nil {
 				if merr := os.MkdirAll(m.rooted(target), 0o755); merr != nil {
 					failures = append(failures, fmt.Sprintf("%s：创建卷内目标目录失败：%v", volume.displayName(), merr))
