@@ -241,6 +241,9 @@ type Manager struct {
 	// 过期后恢复严格检查，不再像旧的「见过转速就永久豁免」那样放过真故障。
 	fanOffWasActive bool
 	fanOffExitedAt  time.Time
+	// nowFn 测试注入的时钟（默认 time.Now）：起转宽限期与关停 5 分钟上限的
+	// 边界断言直接拨时间，不依赖真实等待。仅测试使用，运行时保持 nil。
+	nowFn func() time.Time
 	// fanOffModeSince 关停档的进入时刻，用于 5 分钟上限后自动恢复原曲线并起转。
 	fanOffModeSince time.Time
 

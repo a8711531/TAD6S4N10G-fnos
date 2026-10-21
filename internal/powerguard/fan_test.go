@@ -1559,7 +1559,7 @@ func TestOffModeBackupClearedOnManualExit(t *testing.T) {
 	}
 }
 
-// 起转宽限窗口不是永久豁免：离开关停档 30 秒后仍然 0 转的通道必须重新按故障
+// 起转宽限窗口不是永久豁免：离开关停档 5 分钟后仍然 0 转的通道必须重新按故障
 // 处理（下发 fail-safe 满速、保存被拒）。旧的「见过一次转速就永久免检」会让
 // 拔掉/损坏的风扇永远不被发现。
 func TestZeroRPMRejectedAfterSpinUpGraceExpires(t *testing.T) {
@@ -1593,9 +1593,11 @@ func TestZeroRPMRejectedAfterSpinUpGraceExpires(t *testing.T) {
 		t.Fatalf("宽限期内切回正常档必须能保存: %v", err)
 	}
 
-	// 把宽限期拨到 30 秒之前：模拟用户离开关停档很久之后风扇仍然没有转起来。
+	// 把宽限期拨到 5 分钟之前：模拟用户离开关停档很久之后风扇仍然没有转起来。
+	fixed := time.Now()
 	manager.mu.Lock()
-	manager.fanOffExitedAt = time.Now().Add(-fanSpinUpGraceWindow - time.Second)
+	manager.nowFn = func() time.Time { return fixed }
+	manager.fanOffExitedAt = fixed.Add(-fanSpinUpGraceWindow - time.Second)
 	manager.mu.Unlock()
 
 	// 宽限期过后仍然 0 转：这是唯一选中的风扇，全部停转 = 真故障，运行时必须
@@ -1623,9 +1625,136 @@ func TestZeroRPMRejectedAfterSpinUpGraceExpires(t *testing.T) {
 	}
 }
 
+// 起转宽限的边界：31 秒、4 分 59 秒仍算「起转中」，0 转速不报警；正好 5 分钟
+// 与 5 分 1 秒都恢复严格检查。时钟通过 manager.nowFn 注入，断言不依赖真实等待。
+func TestSpinUpGraceBoundary(t *testing.T) {
+	cases := []struct {
+		name    string
+		elapsed time.Duration
+		wantErr bool
+	}{
+		{name: "31 秒仍在宽限", elapsed: 31 * time.Second},
+		{name: "4 分 59 秒仍在宽限", elapsed: fanSpinUpGraceWindow - time.Second},
+		{name: "正好 5 分钟恢复检查", elapsed: fanSpinUpGraceWindow, wantErr: true},
+		{name: "5 分 1 秒恢复检查", elapsed: fanSpinUpGraceWindow + time.Second, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			manager := newFanDebugTestManager(t)
+			hwmon := filepath.Join(manager.Root, "sys", "class", "hwmon", "hwmon3")
+			fan1 := filepath.Join(hwmon, "fan1_input")
+
+			off := DefaultFanConfig()
+			off.Enabled = true
+			off.OffMode = true
+			off.CPUFanIDs = []string{"it8613:hwmon3:fan1"}
+			for i := range off.Curve {
+				off.Curve[i].PWMPercent = 0
+			}
+			for i := range off.HDDCurve {
+				off.HDDCurve[i].PWMPercent = 0
+			}
+			for i := range off.NVMeCurve {
+				off.NVMeCurve[i].PWMPercent = 0
+			}
+			if err := manager.SaveFanConfig(off); err != nil {
+				t.Fatalf("save off: %v", err)
+			}
+			writeTestValue(t, fan1, "0") // 关停把风扇停住了
+
+			on := DefaultFanConfig()
+			on.Enabled = true
+			on.CPUFanIDs = []string{"it8613:hwmon3:fan1"}
+			if err := manager.SaveFanConfig(on); err != nil {
+				t.Fatalf("save on: %v", err)
+			}
+
+			// 注入固定时钟并直接拨到目标边界，模拟关停退出后已经过去的时间。
+			fixed := time.Now()
+			manager.mu.Lock()
+			manager.nowFn = func() time.Time { return fixed }
+			manager.fanOffExitedAt = fixed.Add(-tc.elapsed)
+			manager.fanOffWasActive = false
+			manager.mu.Unlock()
+
+			err := manager.ApplyFanCurrent()
+			manager.mu.Lock()
+			alarm := manager.fanLastError
+			manager.mu.Unlock()
+			if tc.wantErr {
+				if err == nil || alarm == "" {
+					t.Fatalf("超出宽限后全部风扇 0 转必须报错并保持报警: err=%v alarm=%q", err, alarm)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("宽限期内 0 转速不应报错: %v", err)
+			}
+			if alarm != "" {
+				t.Fatalf("宽限期内不应留下风扇错误: %q", alarm)
+			}
+		})
+	}
+}
+
+// 宽限期从「关停 → 普通」真正生效的那一刻起算：之后重复保存普通配置不能重置
+// 计时，否则反复点保存就能无限延长 0 转豁免。
+func TestRepeatedNormalSavesDoNotResetSpinUpGrace(t *testing.T) {
+	manager := newFanDebugTestManager(t)
+	hwmon := filepath.Join(manager.Root, "sys", "class", "hwmon", "hwmon3")
+	fan1 := filepath.Join(hwmon, "fan1_input")
+
+	off := DefaultFanConfig()
+	off.Enabled = true
+	off.OffMode = true
+	off.CPUFanIDs = []string{"it8613:hwmon3:fan1"}
+	for i := range off.Curve {
+		off.Curve[i].PWMPercent = 0
+	}
+	for i := range off.HDDCurve {
+		off.HDDCurve[i].PWMPercent = 0
+	}
+	for i := range off.NVMeCurve {
+		off.NVMeCurve[i].PWMPercent = 0
+	}
+	if err := manager.SaveFanConfig(off); err != nil {
+		t.Fatalf("save off: %v", err)
+	}
+	writeTestValue(t, fan1, "0")
+
+	on := DefaultFanConfig()
+	on.Enabled = true
+	on.CPUFanIDs = []string{"it8613:hwmon3:fan1"}
+	if err := manager.SaveFanConfig(on); err != nil {
+		t.Fatalf("save on: %v", err)
+	}
+
+	fixed := time.Now()
+	want := fixed.Add(-4 * time.Minute)
+	manager.mu.Lock()
+	manager.nowFn = func() time.Time { return fixed }
+	manager.fanOffExitedAt = want
+	manager.mu.Unlock()
+
+	for i := 0; i < 3; i++ {
+		next := DefaultFanConfig()
+		next.Enabled = true
+		next.CPUFanIDs = []string{"it8613:hwmon3:fan1"}
+		if err := manager.SaveFanConfig(next); err != nil {
+			t.Fatalf("第 %d 次重复保存应仍在宽限期内: %v", i+1, err)
+		}
+	}
+	manager.mu.Lock()
+	exitedAt := manager.fanOffExitedAt
+	manager.mu.Unlock()
+	if !exitedAt.Equal(want) {
+		t.Fatalf("重复保存不得重置起转宽限计时: got %v want %v", exitedAt, want)
+	}
+}
+
 // 被拒绝的关停配置不得留下假的关停状态：校验在任何运行状态修改之前完成，
 // 保存失败时 fanOffWasActive / fanOffExitedAt 都必须保持原样——否则下一轮普通
-// 模式会误以为「刚退出关停」而开启 30 秒起转宽限，把真正的 0 转通道当成起转中
+// 模式会误以为「刚退出关停」而开启 5 分钟起转宽限，把真正的 0 转通道当成起转中
 // 的风扇重新下发曲线目标，故障风扇就此被豁免。
 func TestRejectedOffModeConfigLeavesNoPhantomTransition(t *testing.T) {
 	manager := newFanDebugTestManager(t)

@@ -456,9 +456,10 @@ func selectedFanSources(cfg FanConfig) map[string][]string {
 }
 
 // fanSpinUpGraceWindow 关停档退出后允许风扇从 0 转自然起转的宽限期。
-// 风扇从停转到转速反馈恢复需要几秒到几十秒，期间读到的 0 转速不能当
-// 「通道接不到风扇」；宽限期过后仍然 0 转的通道按故障处理。
-const fanSpinUpGraceWindow = 30 * time.Second
+// 风扇从停转到转速反馈恢复通常只需几秒到几十秒，但个别风扇/供电恢复较慢，
+// 宽限给到 5 分钟（与关停档 5 分钟上限是两件独立的事）；期间读到的 0 转速
+// 不能当「通道接不到风扇」，宽限期过后仍然 0 转的通道按故障处理。
+const fanSpinUpGraceWindow = 5 * time.Minute
 
 // fanOffModeMaxDuration 关停档最长持续时间：到期自动恢复原曲线并起转，避免
 // 检修结束后忘记退出导致硬盘/NVMe 长时间无风散热。
@@ -471,13 +472,13 @@ func (m *Manager) noteOffModeStateLocked(offMode bool) {
 	if offMode {
 		if !m.fanOffWasActive {
 			m.fanOffWasActive = true
-			m.fanOffModeSince = time.Now()
+			m.fanOffModeSince = m.now()
 		}
 		return
 	}
 	if m.fanOffWasActive {
 		m.fanOffWasActive = false
-		m.fanOffExitedAt = time.Now()
+		m.fanOffExitedAt = m.now()
 	}
 	m.fanOffModeSince = time.Time{}
 }
@@ -487,7 +488,7 @@ func (m *Manager) fanOffModeExpiredLocked() bool {
 	if m.fanOffModeSince.IsZero() {
 		return false
 	}
-	return time.Since(m.fanOffModeSince) >= fanOffModeMaxDuration
+	return m.now().Sub(m.fanOffModeSince) >= fanOffModeMaxDuration
 }
 
 // captureOffModeBackup 进入关停档时保存上一条生效曲线的快照，供 5 分钟上限
@@ -556,12 +557,21 @@ func raiseCurveFloor(curve []FanPoint, minimum int) {
 	}
 }
 
+// now 统一时钟入口：默认 time.Now，测试通过 Manager.nowFn 注入固定时刻，
+// 让起转宽限/关停上限的边界用例可确定断言，不必真实等待几分钟。
+func (m *Manager) now() time.Time {
+	if m.nowFn != nil {
+		return m.nowFn()
+	}
+	return time.Now()
+}
+
 // fanSpinUpGraceLocked 报告当前是否仍在关停退出后的起转宽限期内。
 func (m *Manager) fanSpinUpGraceLocked() bool {
 	if m.fanOffExitedAt.IsZero() {
 		return false
 	}
-	return time.Since(m.fanOffExitedAt) < fanSpinUpGraceWindow
+	return m.now().Sub(m.fanOffExitedAt) < fanSpinUpGraceWindow
 }
 
 // errFanOffModeBusy 关停档（维修/检修）下拒绝调试调速、递增、标定这类主动
@@ -656,7 +666,7 @@ func (m *Manager) validateFanLocked(cfg *FanConfig) error {
 	}
 	// 起转宽限只依据「已接受并实际生效」的关停状态，待校验的配置不得修改运行
 	// 状态（被拒绝的配置不能留下假的关停转换）：fanSpinUpGraceLocked 覆盖退出
-	// 关停后的 30 秒窗口；(m.fanOffWasActive && !cfg.OffMode) 覆盖「当前生效的是
+	// 关停后的 5 分钟窗口；(m.fanOffWasActive && !cfg.OffMode) 覆盖「当前生效的是
 	// 关停档、本次保存要切回普通档」这一跳——此刻风扇必然还是 0 转，不能判死。
 	// 真正的关停转换记录只发生在 applyFanLocked。
 	grace := m.fanSpinUpGraceLocked() || (m.fanOffWasActive && !cfg.OffMode)
