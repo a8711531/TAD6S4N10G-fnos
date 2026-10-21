@@ -250,6 +250,9 @@ type Manager struct {
 	// fanOffAlarmChimeAt 关停档维修安全报警（errOffModeAlarm）的上次蜂鸣时刻，
 	// 按 fanOffAlarmChimeInterval 节流，避免报警期间蜂鸣器连响不停。
 	fanOffAlarmChimeAt time.Time
+	// fanAlarmMuted 关停档故障/超温蜂鸣报警的临时静音（不落盘）：只停蜂鸣器，
+	// 界面错误状态与日志照旧；退出关停档时自动解除，避免长期静音漏掉真故障。
+	fanAlarmMuted bool
 
 	// 0 转风扇屏蔽/跳过日志的去重键：控制周期每 2 秒跑一轮，同一组风扇问题
 	// 只在集合变化（或恢复后再次出现）时写一次日志，避免刷满运行日志。

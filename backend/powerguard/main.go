@@ -11,6 +11,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -134,7 +136,8 @@ func bindAllFans(args []string) error {
 	return manager.BindAllFansDefault()
 }
 
-func probe(args []string) error {	set := flag.NewFlagSet("probe", flag.ContinueOnError)
+func probe(args []string) error {
+	set := flag.NewFlagSet("probe", flag.ContinueOnError)
 	root := set.String("sys-root", "/", "alternate system root")
 	asJSON := set.Bool("json", false, "JSON output")
 	if err := set.Parse(args); err != nil {
@@ -245,7 +248,14 @@ func serve(args []string) error {
 		defer crpsEnergySave() // CRPS 耗电统计退出落盘 (ctx.Done 与 server 错误两条路径均覆盖)
 	}
 	go func() {
-		server := &powerguard.Server{Manager: manager, Socket: *socket, WebRoot: *webRoot, BasePath: "/app/tad-module", Logger: logger, History: history, LogPath: *logPath, Crps: crpsHandler}
+		server := &powerguard.Server{Manager: manager, Socket: *socket, WebRoot: *webRoot, BasePath: "/app/tad-module", Logger: logger, History: history, LogPath: *logPath, Crps: crpsHandler,
+			// 网页可访问时滴一声：只在系统刚启动的窗口内响，升级/手动重启服务
+			// （此时系统已运行很久）不再重复响。
+			OnReady: func() {
+				if recentlyBooted(*root) {
+					go manager.PowerChime()
+				}
+			}}
 		done <- server.ListenAndServe()
 	}()
 	// 日志大小清理：独立于历史数据库大小上限（log.max_size_mb，默认 16MB），
@@ -271,6 +281,9 @@ func serve(args []string) error {
 	select {
 	case <-ctx.Done():
 		logger.Printf("stopping: restoring captured power and fan settings")
+		// 软关机/服务停止前滴一声：此时蜂鸣器仍供电，同步播完再恢复。
+		// 蜂鸣器缺失或开关关闭时 PowerChime 直接返回，不影响退出流程。
+		manager.PowerChime()
 		err := manager.Restore()
 		if errors.Is(err, powerguard.ErrOriginalStateCPUMismatch) {
 			logger.Printf("restore skipped because saved state belongs to different hardware: %v", err)
@@ -543,4 +556,26 @@ func initCrps(logger *log.Logger, cfgPath string) (http.Handler, func()) {
 	logger.Printf("crps module enabled config=%s energy=%s", cfgPath, filepath.Join(filepath.Dir(cfgPath), "energy.json"))
 	srv := &crpsump.AppServer{Bus: bus, ConfigPath: cfgPath}
 	return srv.APIHandler(), energy.Save
+}
+
+// bootChimeWindow 开机提示音的判定窗口：只有系统刚启动（uptime 小于该值）才响。
+// 服务随升级/手动重启也会走到就绪回调，但那时 uptime 早已超出窗口，不会重复滴。
+const bootChimeWindow = 10 * time.Minute
+
+// recentlyBooted 读取 sys-root 下的 /proc/uptime 判断系统是否刚启动；读不到时
+// 一律按「不是刚开机」处理，宁可不响也不要在服务重启时误响。
+func recentlyBooted(root string) bool {
+	data, err := os.ReadFile(filepath.Join(root, "proc", "uptime"))
+	if err != nil {
+		return false
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) == 0 {
+		return false
+	}
+	seconds, err := strconv.ParseFloat(fields[0], 64)
+	if err != nil {
+		return false
+	}
+	return seconds < bootChimeWindow.Seconds()
 }

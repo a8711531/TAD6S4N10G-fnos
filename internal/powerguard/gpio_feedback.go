@@ -24,6 +24,20 @@ type gpioChimeOutput interface {
 	PlayChime(tones []GPIOToneSpec) error
 }
 
+// powerChimeTone 开机就绪/软关机提示音：单声 880 Hz、200 ms，与存储提示音的
+// 「滴」区分开，只响一声。
+var powerChimeTone = []GPIOToneSpec{{FrequencyHz: 880, DurationMS: 200}}
+
+// PowerChime 在开机就绪（网页可访问）和软关机触发时各响一声，开关见
+// GPIOConfig.PowerChime。蜂鸣器缺失或写入失败一律静默忽略，绝不影响
+// 启动与关机流程。
+func (m *Manager) PowerChime() {
+	if !m.gpioPowerChimeEnabled() {
+		return
+	}
+	_ = m.PlayStorageChime(powerChimeTone)
+}
+
 // runGPIOFeedback deliberately attempts both outputs. Confirmation feedback is
 // best effort, so callers must not use its error to suppress a button action.
 func runGPIOFeedback(pattern GPIOFeedbackPattern, tone gpioToneOutput, led gpioLEDOutput) error {

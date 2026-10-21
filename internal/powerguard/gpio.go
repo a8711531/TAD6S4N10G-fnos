@@ -84,6 +84,9 @@ type GPIOConfig struct {
 	// Feedback 是否在按键触发动作时播放蜂鸣 + LED 闪烁反馈（见 gpio_feedback_*.go）。
 	// 指针类型与 StorageNotify 同理：缺省视为开启。
 	Feedback *bool `json:"feedback,omitempty"`
+	// PowerChime 是否在开机就绪（网页可访问）与软关机触发时各响一声（见 PowerChime）。
+	// 指针类型同理：缺省视为开启。
+	PowerChime *bool `json:"power_chime,omitempty"`
 }
 
 // StorageNotifyEnabled 报告存储设备插入提示音是否开启：字段缺省视为开启。
@@ -94,6 +97,11 @@ func (config GPIOConfig) StorageNotifyEnabled() bool {
 // FeedbackEnabled 报告按键触发声光反馈是否开启：字段缺省视为开启。
 func (config GPIOConfig) FeedbackEnabled() bool {
 	return config.Feedback == nil || *config.Feedback
+}
+
+// PowerChimeEnabled 报告开机/关机提示音是否开启：字段缺省视为开启。
+func (config GPIOConfig) PowerChimeEnabled() bool {
+	return config.PowerChime == nil || *config.PowerChime
 }
 
 func gpioBoolPointer(value bool) *bool { return &value }
@@ -108,6 +116,18 @@ func (m *Manager) gpioFeedbackEnabled() bool {
 		return true
 	}
 	return cfg.GPIO.FeedbackEnabled()
+}
+
+// gpioPowerChimeEnabled 读取开机/关机提示音开关；配置读不出来按默认（开启）
+// 处理——这只是提示音，不该因为读不到配置就静默失效。
+func (m *Manager) gpioPowerChimeEnabled() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cfg, err := m.loadConfigLocked()
+	if err != nil {
+		return true
+	}
+	return cfg.GPIO.PowerChimeEnabled()
 }
 
 type GPIOButtonStatus struct {
@@ -218,6 +238,7 @@ func DefaultGPIOConfig() GPIOConfig {
 	config.Migrations = []string{gpioDefaultsMigrationRefreshSDCard}
 	config.StorageNotify = gpioBoolPointer(true)
 	config.Feedback = gpioBoolPointer(true)
+	config.PowerChime = gpioBoolPointer(true)
 	for _, spec := range gpioButtonSpecs {
 		short := defaultGPIOShortActions[spec.ID]
 		if short == "" {
@@ -320,7 +341,7 @@ func gpioContainsString(values []string, target string) bool {
 // 保存过的脚本被删掉、关掉的提示音被重开。
 func gpioConfigLooksUnconfigured(config GPIOConfig) bool {
 	if config.Enabled || len(config.Migrations) > 0 || len(config.Scripts) > 0 ||
-		config.StorageNotify != nil || config.Feedback != nil ||
+		config.StorageNotify != nil || config.Feedback != nil || config.PowerChime != nil ||
 		len(config.Backups) > 0 || len(config.Autos) > 0 || len(config.AutoVolumes) > 0 {
 		return false
 	}
@@ -349,6 +370,10 @@ func preserveGPIOUserData(next, previous GPIOConfig) GPIOConfig {
 	if previous.Feedback != nil {
 		feedback := *previous.Feedback
 		next.Feedback = &feedback
+	}
+	if previous.PowerChime != nil {
+		chime := *previous.PowerChime
+		next.PowerChime = &chime
 	}
 	return next
 }

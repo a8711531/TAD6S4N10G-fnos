@@ -79,6 +79,7 @@ func TestNormalizeConfigUpgradesUntouchedGPIOConfig(t *testing.T) {
 	config.GPIO.Migrations = nil
 	config.GPIO.StorageNotify = nil
 	config.GPIO.Feedback = nil
+	config.GPIO.PowerChime = nil
 	for index := range config.GPIO.Buttons {
 		config.GPIO.Buttons[index].Actions = GPIOActions{}
 	}
@@ -368,6 +369,7 @@ func TestSaveGPIOConfigKeepsUserDisabledMapping(t *testing.T) {
 	disabled.Migrations = []string{gpioDefaultsMigrationRefreshSDCard}
 	disabled.StorageNotify = gpioBoolPointer(false)
 	disabled.Feedback = gpioBoolPointer(false)
+	disabled.PowerChime = gpioBoolPointer(false)
 	disabled.Scripts = []GPIOScript{{ID: "s1", Name: "自检", Body: "echo ok"}}
 	if err := manager.SaveGPIOConfig(disabled); err != nil {
 		t.Fatalf("保存失败: %v", err)
@@ -391,6 +393,9 @@ func TestSaveGPIOConfigKeepsUserDisabledMapping(t *testing.T) {
 	if manager.gpioFeedbackEnabled() {
 		t.Fatal("落盘的反馈开关应被 PlayGPIOFeedback 的判定入口读到")
 	}
+	if config.GPIO.PowerChimeEnabled() || manager.gpioPowerChimeEnabled() {
+		t.Fatal("关掉的开机/关机提示音不该被重开")
+	}
 	if network, ok := gpioTestButton(config.GPIO, "network"); !ok || !gpioActionIsEmpty(network.Actions.Short) {
 		t.Fatalf("关掉映射后不该被补上默认动作: %+v", network.Actions)
 	}
@@ -402,6 +407,7 @@ func TestPreserveGPIOUserDataKeepsScriptsAndNotify(t *testing.T) {
 		Scripts:       []GPIOScript{{ID: "s1", Name: "自检", Body: "echo ok"}},
 		StorageNotify: gpioBoolPointer(false),
 		Feedback:      gpioBoolPointer(false),
+		PowerChime:    gpioBoolPointer(false),
 		Backups: []GPIOBackupJob{{
 			ID: "b1", Name: "照片", Mode: BackupModeCopy,
 			Source: BackupLocation{Kind: "path", Path: "/vol1/src"},
@@ -418,6 +424,9 @@ func TestPreserveGPIOUserDataKeepsScriptsAndNotify(t *testing.T) {
 	if merged.FeedbackEnabled() {
 		t.Fatal("关掉的按键声光反馈应当被保留成关闭")
 	}
+	if merged.PowerChimeEnabled() {
+		t.Fatal("关掉的开机/关机提示音应当被保留成关闭")
+	}
 	if len(merged.Backups) != 1 {
 		t.Fatalf("备份任务应当被保留: %+v", merged.Backups)
 	}
@@ -432,6 +441,10 @@ func TestPreserveGPIOUserDataKeepsScriptsAndNotify(t *testing.T) {
 	}
 	if *merged.Feedback {
 		t.Fatal("反馈开关应当是独立副本")
+	}
+	*merged.PowerChime = true
+	if *previous.PowerChime {
+		t.Fatal("开机/关机提示音开关应当是独立副本")
 	}
 }
 

@@ -703,6 +703,28 @@ function fanOffModeActive(fanStatus = {}) {
   return Boolean(currentStatus?.config?.fan?.off_mode);
 }
 
+const FAN_ALARM_MUTE_HELP = '仅屏蔽关停档下每 20 秒一次的蜂鸣；界面报警与日志保留，退出「关停」后自动恢复。';
+
+// 关停档报警临时静音：后端只接受关停档下的请求（其他档位没有 20 秒报警可静音），
+// 静音状态是运行时字段、退出关停自动解除，所以每次 render 都以 status 回填。
+function syncFanAlarmMute(fanStatus = {}) {
+  const input = $('fan-alarm-mute');
+  const row = $('fan-alarm-mute-row');
+  const target = $('fan-alarm-mute-status');
+  if (!input || !row || !target) return;
+  const offMode = fanOffModeActive(fanStatus);
+  input.checked = Boolean(fanStatus.alarm_muted);
+  input.disabled = !offMode;
+  row.classList.toggle('is-inactive', !offMode);
+  if (!offMode) {
+    target.textContent = '仅「关停」档下有效：该档位才有每 20 秒一次的故障/超温蜂鸣。';
+    return;
+  }
+  target.textContent = input.checked
+    ? '已临时静音：蜂鸣暂停，界面报警与日志仍保留；退出「关停」后自动恢复。'
+    : FAN_ALARM_MUTE_HELP;
+}
+
 function healthIssues(status, fanStatus, storageStatus, gpioStatus) {
   const issues = [];
   if (!status.supported) issues.push('当前处理器未通过 TAD6S4N模块兼容性检查');
@@ -2966,6 +2988,8 @@ function fillGPIOInputs(gpio = {}) {
   $('gpio-storage-notify').checked = gpio.storage_notify !== false;
   // 按键声光反馈开关缺省为开：老配置里没有这个字段，不能因此显示成关闭。
   $('gpio-feedback').checked = gpio.feedback !== false;
+  // 开机/关机提示音开关缺省为开：老配置里没有这个字段，同样按开启显示。
+  $('gpio-power-chime').checked = gpio.power_chime !== false;
   gpioMigrations = Array.isArray(gpio.migrations) ? gpio.migrations.map(String) : [];
   gpioScripts = Array.isArray(gpio.scripts)
     ? gpio.scripts.map((script) => ({ id: String(script.id), name: String(script.name), body: String(script.body) }))
@@ -3016,6 +3040,7 @@ function fillGPIOInputs(gpio = {}) {
   showGPIOScriptMessage(gpioScripts.length ? `已加载 ${gpioScripts.length} 个脚本。` : '尚未创建自定义脚本。');
   updateGPIOEnabledState();
   updateGPIOFeedbackStatus();
+  updatePowerChimeStatus();
 }
 
 function gpioConfigFromInputs() {
@@ -3024,6 +3049,7 @@ function gpioConfigFromInputs() {
     enabled: $('gpio-enabled').checked,
     storage_notify: $('gpio-storage-notify').checked,
     feedback: $('gpio-feedback').checked,
+    power_chime: $('gpio-power-chime').checked,
     migrations: [...gpioMigrations],
     scripts: gpioScripts.map((script) => ({ ...script })),
     backups: gpioBackups.map((job) => ({ ...job })),
@@ -5933,6 +5959,7 @@ function render(status, keepInputs = false) {
   renderStorageTable(storageStatus);
   renderFanSlotTemperatures(storageStatus);
   renderFanHardwareWarning(fanStatus);
+  syncFanAlarmMute(fanStatus);
   $('gpio-status').textContent = gpioStatus.enabled
     ? (gpioStatus.available ? `监听中${gpioStatus.last_event ? ` · 最近：${gpioStatus.last_event}` : ''}` : `已启用但不可用：${gpioStatus.last_error || '无法读取 /dev/port'}`)
     : (gpioStatus.available ? '硬件接口可用，按键映射尚未启用。' : '未检测到 GPIO 硬件接口。');
@@ -6650,6 +6677,49 @@ $('gpio-feedback').addEventListener('change', async () => {
     showMessage(enabled ? '按键声光反馈已开启。' : '按键声光反馈已关闭。', false, 'message-gpio');
   } catch (error) {
     showMessage(`保存失败：${error.message}`, true, 'message-gpio');
+  } finally {
+    setBusy(false);
+  }
+});
+
+// 开机/关机提示音开关：与按键反馈一样切换即落盘，不必再点「保存按钮控制」。
+const POWER_CHIME_HELP = '开启后开机进入系统、网页可访问时滴一声，触发软关机时再滴一声。';
+
+function updatePowerChimeStatus() {
+  const target = $('gpio-power-chime-status');
+  if (!target) return;
+  target.textContent = $('gpio-power-chime').checked
+    ? POWER_CHIME_HELP
+    : '已关闭：开机就绪与软关机时都不再蜂鸣。';
+}
+
+$('gpio-power-chime').addEventListener('change', async () => {
+  const enabled = $('gpio-power-chime').checked;
+  updatePowerChimeStatus();
+  const config = gpioConfigFromInputs();
+  setBusy(true);
+  try {
+    render(await request('api/config/gpio', { method: 'POST', body: JSON.stringify(config) }), true);
+    showMessage(enabled ? '开机与关机提示音已开启。' : '开机与关机提示音已关闭。', false, 'message-gpio');
+  } catch (error) {
+    showMessage(`保存失败：${error.message}`, true, 'message-gpio');
+  } finally {
+    setBusy(false);
+  }
+});
+
+// 关停档报警临时静音：切换即调用专用接口（不落盘，退出关停自动解除）。
+$('fan-alarm-mute').addEventListener('change', async () => {
+  const muted = $('fan-alarm-mute').checked;
+  setBusy(true);
+  try {
+    render(await request('api/fan/alarm-mute', { method: 'POST', body: JSON.stringify({ muted }) }), true);
+    showMessage(muted
+      ? '已临时静音关停档的故障/超温蜂鸣报警；界面报警与日志仍保留。'
+      : '已恢复关停档的故障/超温蜂鸣报警。', false, 'message-fan');
+  } catch (error) {
+    showMessage(`静音失败：${error.message}`, true, 'message-fan');
+    syncFanAlarmMute(currentStatus?.fan_control || {}); // 失败时把开关拨回真实状态
   } finally {
     setBusy(false);
   }

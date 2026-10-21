@@ -1131,6 +1131,18 @@ body.modal-open { overflow: hidden; }
 
 .curve-modes-label { color: var(--muted); font-size: 12px; font-weight: 700; }
 
+/* 关停档报警临时静音：开关与说明同一行，仅关停档可用（其余档位置灰并提示）。 */
+.fan-alarm-mute {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+}
+.fan-alarm-mute .inline-status { margin: 0; }
+.fan-alarm-mute.is-inactive { opacity: .62; }
+.fan-alarm-mute.is-inactive .toggle { cursor: not-allowed; }
+
 .curve-mode {
   height: 30px;
   min-width: 62px;

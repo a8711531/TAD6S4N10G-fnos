@@ -202,6 +202,11 @@
               <button id="curve-custom-3" type="button" class="curve-mode" data-curve-slot="3">自定义 3</button>
             </div>
 
+            <div id="fan-alarm-mute-row" class="fan-alarm-mute">
+              <label class="toggle"><input id="fan-alarm-mute" type="checkbox"><span></span>临时静音关停档故障/超温报警</label>
+              <span id="fan-alarm-mute-status" class="inline-status" role="status" aria-live="polite">仅屏蔽关停档下每 20 秒一次的蜂鸣；界面报警与日志保留，退出「关停」后自动恢复。</span>
+            </div>
+
             <div class="curve-editors">
               <section id="disk-curve-editor" class="curve-editor" role="tabpanel" aria-labelledby="disk-curve-heading" data-curve-kind="hdd">
                 <div class="curve-editor-heading">
@@ -350,6 +355,10 @@
             <div class="gpio-sdcard-row">
               <label class="toggle"><input id="gpio-feedback" type="checkbox" checked><span></span>按键触发功能声光提示</label>
               <span id="gpio-feedback-status" class="inline-status" role="status" aria-live="polite">开启后通过按键触发动作会滴滴滴响 3 声并让复制键 LED 闪 3 次，脚本运行结束时也会重复一次声光提示。</span>
+            </div>
+            <div class="gpio-sdcard-row">
+              <label class="toggle"><input id="gpio-power-chime" type="checkbox" checked><span></span>开机与关机提示音</label>
+              <span id="gpio-power-chime-status" class="inline-status" role="status" aria-live="polite">开启后开机进入系统、网页可访问时滴一声，触发软关机时再滴一声。</span>
             </div>
             <p id="gpio-status" class="inline-status">按键映射默认开启；默认只有网络键的短按绑定「刷新 SD 卡」（换卡后读卡器认不出来时按一下），其余按键与档位默认无动作，按需自行绑定。</p>
           </section>

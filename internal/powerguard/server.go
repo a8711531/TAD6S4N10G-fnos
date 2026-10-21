@@ -28,6 +28,9 @@ type Server struct {
 	History     *HistoryStore
 	LogPath     string       // 守护进程文本日志路径；空 = stderr 模式，日志端点降级
 	Crps        http.Handler // 可选: CRPS PMBus 监控板块 API (nil = 不挂载); 直接挂在 /api/crps/, handler 自行改写为 /api/<ep>
+	// OnReady 在 socket 监听成功、网页已可访问后调用一次；用于开机提示音等
+	// 「服务就绪」动作。回调在 Serve 之前同步执行，实现方需自行避免阻塞。
+	OnReady func()
 }
 
 const configRequestMaxBytes = 3 << 20
@@ -82,6 +85,9 @@ func (s *Server) ListenAndServe() error {
 	if err := os.Chmod(s.Socket, 0o660); err != nil {
 		return err
 	}
+	if s.OnReady != nil {
+		s.OnReady()
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/status", s.handleStatus)
@@ -94,6 +100,7 @@ func (s *Server) ListenAndServe() error {
 	mux.HandleFunc("/api/config", s.handleConfig)
 	mux.HandleFunc("/api/config/global", s.handleGlobalConfig)
 	mux.HandleFunc("/api/config/fan", s.handleFanConfig)
+	mux.HandleFunc("/api/fan/alarm-mute", s.handleFanAlarmMute)
 	mux.HandleFunc("/api/config/gpio", s.handleGPIOConfig)
 	mux.HandleFunc("/api/config/history", s.handleHistoryConfig)
 	mux.HandleFunc("/api/config/sensor-names", s.handleSensorNamesConfig)
@@ -294,6 +301,26 @@ func (s *Server) handleFanConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.Manager.SaveFanConfig(cfg); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.Status())
+}
+
+// handleFanAlarmMute 临时静音/恢复关停档的故障与超温蜂鸣报警。只影响蜂鸣器，
+// 界面错误状态与风扇控制不变；状态不落盘，退出关停档自动解除。
+func (s *Server) handleFanAlarmMute(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigRequest(w, r) {
+		return
+	}
+	var payload struct {
+		Muted bool `json:"muted"`
+	}
+	if err := decodeConfigRequest(r, &payload); err != nil {
+		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
+		return
+	}
+	if err := s.Manager.SetFanAlarmMute(payload.Muted); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}

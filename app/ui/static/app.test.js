@@ -2380,3 +2380,47 @@ test('移动设备渲染：没有设备与多设备两种情况都不报错', ()
     ],
   });
 });
+
+test('按键映射：开机/关机提示音开关排在声光反馈下方，缺省为开并随保存提交', () => {
+  const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
+  const feedbackAt = html.indexOf('id="gpio-feedback"');
+  const chimeAt = html.indexOf('id="gpio-power-chime"');
+  assert.ok(feedbackAt > 0 && chimeAt > feedbackAt, '开关应排在「按键触发功能声光提示」下方');
+
+  // fillGPIOInputs 会走一遍脚本编辑器收尾（renderBashHighlight 用 TextEncoder 算
+  // 字节数），浏览器里它一直存在，这里按需注入。
+  const app = loadAppContext({ TextEncoder });
+  app.resolve('fillGPIOInputs')({ enabled: true });
+  assert.equal(app.element('gpio-power-chime').checked, true, '老配置没有该字段时应按默认开启显示');
+  app.element('gpio-power-chime').checked = false;
+  assert.equal(app.resolve('gpioConfigFromInputs')().power_chime, false, '关掉后必须随保存请求下发，否则后端按缺省重新打开');
+});
+
+test('关停档报警临时静音：仅关停档可用，切换即提交 api/fan/alarm-mute', async () => {
+  const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
+  const offAt = html.indexOf('id="curve-mode-off"');
+  const muteAt = html.indexOf('id="fan-alarm-mute"');
+  assert.ok(offAt > 0 && muteAt > offAt, '静音开关应放在曲线模式（关停）附近');
+
+  const { requests, fetch } = recordingFetch(() => ({}));
+  const app = loadAppContext({ fetch });
+
+  app.resolve('syncFanAlarmMute')({ off_mode: true, alarm_muted: true });
+  assert.equal(app.element('fan-alarm-mute').checked, true, '静音状态要按后端 status 回填');
+  assert.equal(app.element('fan-alarm-mute').disabled, false, '关停档下要能操作');
+  assert.match(app.element('fan-alarm-mute-status').textContent, /已临时静音/);
+
+  // 非关停档没有 20 秒报警可静音：开关置灰，静音状态必然是解除
+  app.resolve('syncFanAlarmMute')({ off_mode: false });
+  assert.equal(app.element('fan-alarm-mute').disabled, true);
+  assert.equal(app.element('fan-alarm-mute').checked, false);
+  assert.match(app.element('fan-alarm-mute-status').textContent, /仅「关停」档下有效/);
+
+  app.resolve('syncFanAlarmMute')({ off_mode: true });
+  app.element('fan-alarm-mute').checked = true;
+  await app.click('fan-alarm-mute', 'change');
+  const post = requests.find((req) => req.url.includes('api/fan/alarm-mute'));
+  assert.ok(post, '切换开关应调用专用静音接口');
+  assert.equal(post.init.method, 'POST');
+  assert.equal(JSON.parse(post.init.body).muted, true);
+});

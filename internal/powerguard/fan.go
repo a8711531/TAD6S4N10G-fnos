@@ -81,6 +81,7 @@ type FanControlStatus struct {
 	DriverDetected       bool        `json:"driver_detected"`
 	Active               bool        `json:"active"`
 	OffMode              bool        `json:"off_mode,omitempty"`
+	AlarmMuted           bool        `json:"alarm_muted,omitempty"`
 	TemperatureC         float64     `json:"temperature_c,omitempty"`
 	CPUTemperatureC      float64     `json:"cpu_temperature_c,omitempty"`
 	DiskTemperatureC     float64     `json:"disk_temperature_c,omitempty"`
@@ -480,6 +481,9 @@ func (m *Manager) noteOffModeStateLocked(offMode bool) {
 		m.fanOffWasActive = false
 		m.fanOffExitedAt = m.now()
 	}
+	// 退出关停档即解除报警静音：下一轮真出故障时蜂鸣必须恢复，不能让一次
+	// 临时静音永久生效。
+	m.fanAlarmMuted = false
 	m.fanOffModeSince = time.Time{}
 }
 
@@ -608,11 +612,18 @@ const (
 	fanOffAlarmChimeBeeps = 5
 	// fanOffAlarmChimeInterval 蜂鸣报警节流：报警持续期间每隔这么久重响一次。
 	fanOffAlarmChimeInterval = 20 * time.Second
+	// offModeHDDCriticalC 关停档下前置机械硬盘的温度上限：风扇停转后磁盘升温
+	// 往往早于 CPU 到达危险区，超过（含达到）该值即报警。只报警，不改变停转策略。
+	offModeHDDCriticalC = 55.0
 )
 
 // chimeOffModeAlarmLocked 关停档超温/温度源失效的蜂鸣报警：急促高频短音，后台
 // 播放不阻塞控制循环；蜂鸣器不在时尽力而为（错误被忽略，界面报警状态仍在）。
+// 用户临时静音期间只跳过蜂鸣，节流时刻不更新，解除静音后立即响一声。
 func (m *Manager) chimeOffModeAlarmLocked() {
+	if m.fanAlarmMuted {
+		return
+	}
 	if time.Since(m.fanOffAlarmChimeAt) < fanOffAlarmChimeInterval {
 		return
 	}
@@ -622,6 +633,20 @@ func (m *Manager) chimeOffModeAlarmLocked() {
 		tones[i] = GPIOToneSpec{FrequencyHz: fanOffAlarmChimeHz, DurationMS: fanOffAlarmChimeMS}
 	}
 	go func() { _ = m.PlayStorageChime(tones) }()
+}
+
+// SetFanAlarmMute 临时静音/恢复关停档的故障与超温蜂鸣报警。只影响蜂鸣器：
+// 界面错误状态、日志与风扇停转策略都不变；退出关停档时自动解除（见
+// noteOffModeStateLocked）。关停档未生效时开关没有意义，直接拒绝以便界面
+// 明确提示。
+func (m *Manager) SetFanAlarmMute(muted bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.fanOffModeActiveLocked() {
+		return errors.New("仅在「关停」档下可以临时静音故障/超温报警")
+	}
+	m.fanAlarmMuted = muted
+	return nil
 }
 
 func (m *Manager) validateFanLocked(cfg *FanConfig) error {
@@ -1539,6 +1564,15 @@ func (m *Manager) applyFanLocked(cfg FanConfig) error {
 		}
 		offAlarms = append(offAlarms, fmt.Sprintf("关停档下检测到紧急温度 %.1f°C（阈值 %.1f°C），按维修安全策略风扇保持停转，请立即处理", hottest, cfg.EmergencyTempC))
 	}
+	// 机械硬盘单独一条 55°C 上限：关停档停转后最先升温的是盘，CPU 可能还正常，
+	// 不能只盯 CPU。前置 SATA 盘全部纳入（不局限于曲线勾选的槽位）。
+	if cfg.OffMode {
+		if slot, ok := hottestFrontSlotOver(storage, offModeHDDCriticalC); ok {
+			offAlarms = append(offAlarms, fmt.Sprintf(
+				"关停档下机械硬盘温度 %.1f°C 达到 %.0f°C 上限（SATA %d），按维修安全策略风扇保持停转，请立即处理",
+				slot.TemperatureC, offModeHDDCriticalC, slot.Slot))
+		}
+	}
 	for id, sources := range selected {
 		fan := byID[id]
 		if _, taken := m.fanDebugTakenOver[id]; taken && !cfg.OffMode {
@@ -1757,6 +1791,24 @@ func maximumStorageTemperature(status StorageStatus, kind string, slotIDs []stri
 	return maximum, available
 }
 
+// hottestFrontSlotOver 返回前置机械硬盘中温度达到上限的最热槽位。休眠/未识别
+// 的盘没有有效温度，直接跳过；不限于曲线勾选的槽位——关停档停转时所有在位的
+// 机械盘都有过热风险。
+func hottestFrontSlotOver(status StorageStatus, limitC float64) (StorageSlot, bool) {
+	var hottest StorageSlot
+	found := false
+	for _, slot := range status.Slots {
+		if slot.Kind != "front" || slot.TemperatureC < limitC {
+			continue
+		}
+		if !found || slot.TemperatureC > hottest.TemperatureC {
+			hottest = slot
+			found = true
+		}
+	}
+	return hottest, found
+}
+
 func fanControlSource(cpuTarget, hddTarget, nvmeTarget int) string {
 	target := max(cpuTarget, hddTarget, nvmeTarget)
 	if target <= 0 {
@@ -1917,6 +1969,7 @@ func (m *Manager) fanStatusLocked(cfg FanConfig) FanControlStatus {
 		Active:           cfg.Enabled,
 		DriverDetected:   m.IT87DriverDetected(),
 		OffMode:          cfg.OffMode,
+		AlarmMuted:       m.fanAlarmMuted,
 		LastApply:        m.fanLastApply,
 		LastError:        m.fanLastError,
 		TargetPWMPercent: m.fanLastTarget,

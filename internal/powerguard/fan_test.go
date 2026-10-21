@@ -2160,3 +2160,126 @@ func curve40to90() []FanPoint {
 		{TempC: 80, PWMPercent: 90},
 	}
 }
+
+// TestOffModeAlarmMuteSilencesChimeUntilOffModeExit 关停档的 20 秒故障/超温
+// 蜂鸣报警可以临时静音：静音期间不响也不推进节流，解除后立即补响；界面
+// 报警状态与风扇停转策略不变，退出关停档后必须自动解除，避免长期漏报。
+func TestOffModeAlarmMuteSilencesChimeUntilOffModeExit(t *testing.T) {
+	manager := newFanDebugTestManager(t)
+	const id = "it8613:hwmon3:fan1"
+	if err := manager.SaveFanConfig(offModeZeroCurveConfig(id)); err != nil {
+		t.Fatalf("save off mode: %v", err)
+	}
+	if err := manager.SetFanAlarmMute(true); err != nil {
+		t.Fatalf("关停档下应允许临时静音: %v", err)
+	}
+	if !manager.Status().FanControl.AlarmMuted {
+		t.Fatal("状态里必须反映静音开关已打开")
+	}
+
+	// 静音期间既不响，也不更新节流时刻：解除静音后要能立刻补响。
+	manager.mu.Lock()
+	manager.fanOffAlarmChimeAt = time.Time{}
+	manager.chimeOffModeAlarmLocked()
+	mutedAt := manager.fanOffAlarmChimeAt
+	manager.mu.Unlock()
+	if !mutedAt.IsZero() {
+		t.Fatal("静音期间不得播放蜂鸣，也不该更新节流时刻")
+	}
+
+	if err := manager.SetFanAlarmMute(false); err != nil {
+		t.Fatalf("解除静音失败: %v", err)
+	}
+	manager.mu.Lock()
+	manager.chimeOffModeAlarmLocked()
+	chimeAt := manager.fanOffAlarmChimeAt
+	manager.mu.Unlock()
+	if chimeAt.IsZero() {
+		t.Fatal("解除静音后应立即恢复蜂鸣")
+	}
+
+	// 再次静音后退出关停档：开关必须自动恢复，下一次真故障照常报警。
+	if err := manager.SetFanAlarmMute(true); err != nil {
+		t.Fatalf("再次静音失败: %v", err)
+	}
+	on := DefaultFanConfig()
+	on.Enabled = true
+	on.CPUFanIDs = []string{id}
+	if err := manager.SaveFanConfig(on); err != nil {
+		t.Fatalf("save normal: %v", err)
+	}
+	if manager.Status().FanControl.AlarmMuted {
+		t.Fatal("退出关停档后静音开关必须自动解除")
+	}
+}
+
+// TestFanAlarmMuteRejectedOutsideOffMode 非关停档下没有 20 秒报警可静音，
+// 接口必须直接拒绝，界面据此提示用户先切到关停档。
+func TestFanAlarmMuteRejectedOutsideOffMode(t *testing.T) {
+	manager := newFanDebugTestManager(t)
+	if err := manager.SetFanAlarmMute(true); err == nil {
+		t.Fatal("非关停档下静音必须被拒绝")
+	}
+	if manager.Status().FanControl.AlarmMuted {
+		t.Fatal("被拒绝的静音请求不得改变状态")
+	}
+}
+
+// 关停档报警不能只盯 CPU：前置机械硬盘达到 55°C 上限同样要报警。维修安全
+// 策略不变——只报警/蜂鸣，风扇保持停转；温度回落后报警清除。
+func TestOffModeAlarmsOnHDDOver55C(t *testing.T) {
+	manager := newFanDebugTestManager(t)
+	hwmon := filepath.Join(manager.Root, "sys", "class", "hwmon", "hwmon3")
+	pwm1 := filepath.Join(hwmon, "pwm1")
+
+	manager.storageMu.Lock()
+	manager.storageStatus = StorageStatus{Slots: []StorageSlot{
+		{ID: "front-1", Kind: "front", Slot: 1, State: StorageUsed, TemperatureC: 56},
+		{ID: "front-2", Kind: "front", Slot: 2, State: StorageUsed, TemperatureC: 40},
+		{ID: "m2-1", Kind: "m2", Slot: 1, State: StorageUsed, TemperatureC: 30},
+	}}
+	manager.storageMu.Unlock()
+
+	cfg := DefaultFanConfig()
+	cfg.Enabled = true
+	cfg.OffMode = true
+	cfg.CPUFanIDs = []string{"it8613:hwmon3:fan1"}
+	for i := range cfg.Curve {
+		cfg.Curve[i].PWMPercent = 0
+	}
+	for i := range cfg.HDDCurve {
+		cfg.HDDCurve[i].PWMPercent = 0
+	}
+	for i := range cfg.NVMeCurve {
+		cfg.NVMeCurve[i].PWMPercent = 0
+	}
+	if err := manager.SaveFanConfig(cfg); err != nil {
+		t.Fatalf("关停档下盘温超限是正当维修场景，保存必须成功: %v", err)
+	}
+	if got, _ := readInt(pwm1); got != 0 {
+		t.Fatalf("维修安全策略：盘温超限时风扇必须保持停转，实际 pwm1=%d", got)
+	}
+	manager.mu.Lock()
+	alarm := manager.fanLastError
+	manager.mu.Unlock()
+	if !strings.Contains(alarm, "机械硬盘温度 56.0°C") || !strings.Contains(alarm, "SATA 1") {
+		t.Fatalf("盘温超过 55°C 必须单独报警并指明槽位，实际 %q", alarm)
+	}
+
+	// 回落到 54°C：报警清除，风扇保持停转。
+	manager.storageMu.Lock()
+	manager.storageStatus.Slots[0].TemperatureC = 54
+	manager.storageMu.Unlock()
+	if err := manager.ApplyFanCurrent(); err != nil {
+		t.Fatalf("盘温回落后不应再报警: %v", err)
+	}
+	manager.mu.Lock()
+	alarm = manager.fanLastError
+	manager.mu.Unlock()
+	if alarm != "" {
+		t.Fatalf("盘温回落后报警应清除，实际 %q", alarm)
+	}
+	if got, _ := readInt(pwm1); got != 0 {
+		t.Fatalf("关停档风扇应保持停转，实际 pwm1=%d", got)
+	}
+}

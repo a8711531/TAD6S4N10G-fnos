@@ -910,6 +910,7 @@ func TestGPIOConfigLooksUnconfiguredRespectsAutos(t *testing.T) {
 	config.Migrations = nil
 	config.StorageNotify = nil
 	config.Feedback = nil
+	config.PowerChime = nil
 	for index := range config.Buttons {
 		config.Buttons[index].Actions = GPIOActions{}
 	}
