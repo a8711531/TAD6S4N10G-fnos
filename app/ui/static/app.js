@@ -3203,6 +3203,8 @@ let fanOffMode = false;
 // 进入全速／关停之前记下的三条曲线，点「临时」可以原样回来
 const TEMP_CURVE_STORAGE_KEY = 'tad-fan-curve-temp';
 let tempCurveBackup = null;
+// 后端在进入关停档时留的曲线快照：换浏览器/清过本地存储时也能恢复原选定曲线
+let offModeCurveBackup = null;
 
 function loadTempCurveBackup() {
   try {
@@ -3342,17 +3344,32 @@ async function applyFullSpeed() {
 
 // 关停：全部 0%，优先级高于最低转速。第二次确认只留一个红色动作——
 // 关停必须落盘才算数，去掉「只改界面不保存」的主按钮，免得用户以为已经停了。
+// 关停档最长 5 分钟，后端到期自动恢复原曲线并起转；再次点击同一按钮也会
+// 直接退出关停、恢复原选定曲线。
 async function applyShutdown() {
+  if (fanOffMode) {
+    const result = await showAppConfirm({
+      title: '恢复原选定曲线',
+      message: '解除关停档，按关停前记下的三条曲线恢复并保存，风扇会立刻重新起转。',
+      confirmText: '恢复并保存',
+    });
+    if (!result) return;
+    const fallback = clamp(Number($('fan-min').value) || DEFAULT_MIN_PWM_PERCENT, 30, 100);
+    const curves = tempCurveBackup || offModeCurveBackup || flatCurveSet(fallback);
+    await applyModeCurves('temp', curves, '已恢复关停前的曲线，正在下发起转…');
+    await saveFanConfig();
+    return;
+  }
   const first = await showAppConfirm({
     title: '关停全部风扇',
-    message: '绑定风扇会立刻停转（0%），最低转速保护被绕过。温度会快速上升，只适合短时间检修或换盘。',
+    message: '绑定风扇会立刻停转（0%），最低转速保护被绕过。温度会快速上升，只适合短时间检修或换盘；关停最长 5 分钟，到期自动恢复原选定曲线并起转。',
     confirmText: '继续',
     danger: true,
   });
   if (!first) return;
   const second = await showAppConfirm({
     title: '再确认一次：确定要关停风扇？',
-    message: '停转期间硬盘与 NVMe 温度会持续升高，长时间关停可能造成不可逆的硬件损伤。关停期间即使达到紧急温度也不会自动起转，只会鸣响蜂鸣器报警——维修时请先断电并做好散热防护。',
+    message: '停转期间硬盘与 NVMe 温度会持续升高。关停最多持续 5 分钟，到期自动恢复原选定曲线并起转；此前的紧急温度兜底也不再生效，只会鸣响蜂鸣器报警——维修时请先断电并做好散热防护。',
     hideConfirm: true,
     secondaryText: '关停并保存风扇控制',
     secondaryDanger: true,
@@ -5227,6 +5244,11 @@ function fillFanInputs(fan = {}) {
   fillCurve('hdd', fan.hdd_curve || fan.disk_curve, DEFAULT_STORAGE_CURVE);
   fillCurve('nvme', fan.nvme_curve, DEFAULT_STORAGE_CURVE);
   fillFanSlotSelections(fan);
+  // 后端留的关停前曲线快照：本地临时曲线缺失时，再次点击「关停」用它恢复
+  const offBackup = fan.off_mode_backup;
+  offModeCurveBackup = offBackup
+    ? validCurveSet({ hdd: offBackup.hdd_curve, nvme: offBackup.nvme_curve, cpu: offBackup.curve })
+    : null;
   // 打开页面时按配置反推当前选中的曲线模式（关停／预设／全速／临时）
   setCurveMode(detectCurveMode(fan));
 }

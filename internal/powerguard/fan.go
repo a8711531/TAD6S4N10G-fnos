@@ -21,6 +21,15 @@ type FanPoint struct {
 	PWMPercent int     `json:"pwm_percent"`
 }
 
+// FanCurveBackup 进入关停档前的三条曲线快照。关停到达 5 分钟上限自动退出时用
+// 它恢复用户原来的曲线——关停期间落盘的是全 0% 节点，直接退出会因校验失败而
+// 回不到普通档。手动退出关停时快照一并清掉，不重复使用。
+type FanCurveBackup struct {
+	Curve     []FanPoint `json:"curve"`
+	HDDCurve  []FanPoint `json:"hdd_curve"`
+	NVMeCurve []FanPoint `json:"nvme_curve"`
+}
+
 type FanConfig struct {
 	Enabled        bool     `json:"enabled"`
 	DeviceID       string   `json:"device_id,omitempty"`
@@ -30,15 +39,17 @@ type FanConfig struct {
 	MinPWMPercent  int      `json:"min_pwm_percent"`
 	EmergencyTempC float64  `json:"emergency_temp_c"`
 	PollSeconds    int      `json:"poll_seconds"`
-	// OffMode 是「关停」档：绑定风扇一律写 0%，优先级高于最低转速与曲线数值，
-	// 只让位于紧急温度的满速兜底（防烧硬件）。曲线本身保持原样，便于随时退出。
-	OffMode     bool       `json:"off_mode,omitempty"`
-	Curve       []FanPoint `json:"curve"`
-	DiskCurve   []FanPoint `json:"disk_curve,omitempty"`
-	HDDCurve    []FanPoint `json:"hdd_curve"`
-	NVMeCurve   []FanPoint `json:"nvme_curve"`
-	HDDSlotIDs  []string   `json:"hdd_slot_ids"`
-	NVMeSlotIDs []string   `json:"nvme_slot_ids"`
+	// OffMode 是「关停」档：绑定风扇一律写 0%，优先级高于最低转速与曲线数值；
+	// 维修安全策略下即使达到紧急温度也不起转，只蜂鸣报警，避免伤人。
+	// 关停最长持续 fanOffModeMaxDuration，到期自动恢复 OffModeBackup 里的曲线。
+	OffMode       bool            `json:"off_mode,omitempty"`
+	OffModeBackup *FanCurveBackup `json:"off_mode_backup,omitempty"`
+	Curve         []FanPoint      `json:"curve"`
+	DiskCurve     []FanPoint      `json:"disk_curve,omitempty"`
+	HDDCurve      []FanPoint      `json:"hdd_curve"`
+	NVMeCurve     []FanPoint      `json:"nvme_curve"`
+	HDDSlotIDs    []string        `json:"hdd_slot_ids"`
+	NVMeSlotIDs   []string        `json:"nvme_slot_ids"`
 }
 
 type FanDevice struct {
@@ -449,18 +460,99 @@ func selectedFanSources(cfg FanConfig) map[string][]string {
 // 「通道接不到风扇」；宽限期过后仍然 0 转的通道按故障处理。
 const fanSpinUpGraceWindow = 30 * time.Second
 
-// noteOffModeStateLocked 记录关停档 → 普通档的切换时刻，作为起转宽限期的起点。
-// 旧实现用「曾经读到过转速」的永久标记（fanLiveRPM）豁免 0 转检查：风扇拔掉
-// 之后标记还在，0 转故障会被永久放行，fail-safe 形同虚设。宽限窗口从切换时刻
-// 起算，过期后立刻恢复严格检查，既不误伤起转中的风扇，也不豁免真故障。
+// fanOffModeMaxDuration 关停档最长持续时间：到期自动恢复原曲线并起转，避免
+// 检修结束后忘记退出导致硬盘/NVMe 长时间无风散热。
+const fanOffModeMaxDuration = 5 * time.Minute
+
+// noteOffModeStateLocked 记录关停档的进出状态：进入时记下起点供 5 分钟上限
+// 判定，退出时记下起转宽限的起点。旧的「曾经读到过转速」永久标记（fanLiveRPM）
+// 已废弃——风扇拔掉后仍会豁免 0 转故障。
 func (m *Manager) noteOffModeStateLocked(offMode bool) {
 	if offMode {
-		m.fanOffWasActive = true
+		if !m.fanOffWasActive {
+			m.fanOffWasActive = true
+			m.fanOffModeSince = time.Now()
+		}
 		return
 	}
 	if m.fanOffWasActive {
 		m.fanOffWasActive = false
 		m.fanOffExitedAt = time.Now()
+	}
+	m.fanOffModeSince = time.Time{}
+}
+
+// fanOffModeExpiredLocked 报告关停档是否已到达 5 分钟上限。
+func (m *Manager) fanOffModeExpiredLocked() bool {
+	if m.fanOffModeSince.IsZero() {
+		return false
+	}
+	return time.Since(m.fanOffModeSince) >= fanOffModeMaxDuration
+}
+
+// captureOffModeBackup 进入关停档时保存上一条生效曲线的快照，供 5 分钟上限
+// 自动恢复；退出关停（手动或自动）时清掉快照。手动退出由界面回传恢复后的
+// 曲线，这里不覆盖显式提交的曲线。
+func captureOffModeBackup(next *FanConfig, previous FanConfig) {
+	if !next.OffMode {
+		next.OffModeBackup = nil
+		return
+	}
+	if next.OffModeBackup != nil {
+		return
+	}
+	if previous.OffMode {
+		// 关停期间再次保存：界面不会回传快照，沿用服务端留的关停前曲线。
+		next.OffModeBackup = previous.OffModeBackup
+		return
+	}
+	next.OffModeBackup = &FanCurveBackup{
+		Curve:     append([]FanPoint(nil), previous.Curve...),
+		HDDCurve:  append([]FanPoint(nil), previous.HDDCurve...),
+		NVMeCurve: append([]FanPoint(nil), previous.NVMeCurve...),
+	}
+}
+
+// applyOffModeBackup 用快照覆盖三条曲线；任一档快照无效就那一档保持原样。
+func applyOffModeBackup(fan *FanConfig, backup *FanCurveBackup) {
+	if len(backup.Curve) >= 2 {
+		fan.Curve = backup.Curve
+	}
+	if len(backup.HDDCurve) >= 2 {
+		fan.HDDCurve = backup.HDDCurve
+	}
+	if len(backup.NVMeCurve) >= 2 {
+		fan.NVMeCurve = backup.NVMeCurve
+	}
+}
+
+// leaveOffModeLocked 关停到达 5 分钟上限：恢复关停前曲线、退出关停档并落盘，
+// 由调用方紧接着按普通模式下发，风扇自动起转。快照缺失时把 0% 抬到最低转速，
+// 保证恢复后的曲线能通过普通模式校验。
+func (m *Manager) leaveOffModeLocked(cfg *Config) error {
+	fan := &cfg.Fan
+	fan.OffMode = false
+	if backup := fan.OffModeBackup; backup != nil {
+		applyOffModeBackup(fan, backup)
+		fan.OffModeBackup = nil
+	}
+	raiseCurveFloor(fan.Curve, fan.MinPWMPercent)
+	raiseCurveFloor(fan.DiskCurve, fan.MinPWMPercent)
+	raiseCurveFloor(fan.HDDCurve, fan.MinPWMPercent)
+	raiseCurveFloor(fan.NVMeCurve, fan.MinPWMPercent)
+	if err := m.saveConfigLocked(*cfg); err != nil {
+		return err
+	}
+	m.logf("fan: 关停档已到 5 分钟上限，已自动恢复原曲线并起转")
+	return nil
+}
+
+// raiseCurveFloor 把关停期间写成 0% 的曲线节点抬到最低转速，作为快照缺失时的兜底。
+func raiseCurveFloor(curve []FanPoint, minimum int) {
+	for i := range curve {
+		if curve[i].PWMPercent < minimum {
+			curve[i].PWMPercent = minimum
+		}
 	}
 }
 
@@ -1263,6 +1355,13 @@ func (m *Manager) ApplyFanCurrent() error {
 		// 配置读不出来时按「上次实际生效的关停状态」处理故障：关停档维修期间
 		// 任何故障路径都不许把风扇转起来。
 		return m.setFanFailureLocked(err, m.fanOffWasActive)
+	}
+	// 关停档最长 5 分钟：到期自动恢复关停前的曲线并退出关停，随后按普通模式
+	// 下发，风扇无需用户操作就会重新起转。
+	if cfg.Fan.Enabled && cfg.Fan.OffMode && m.fanOffModeExpiredLocked() {
+		if err := m.leaveOffModeLocked(&cfg); err != nil {
+			return m.setFanFailureLocked(err, true)
+		}
 	}
 	offMode := cfg.Fan.Enabled && cfg.Fan.OffMode
 	// 风扇调试接管：被接管的风扇脱离一切曲线控制(applyFanLocked 中锁定),

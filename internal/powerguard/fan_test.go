@@ -1416,6 +1416,149 @@ func TestLeavingOffModeSpinsFansBackUp(t *testing.T) {
 	}
 }
 
+// 关停档最长 5 分钟：到期后周期性下发必须自动退出关停、恢复关停前曲线并起转，
+// 以免检修结束忘记退出导致硬盘/NVMe 长时间无风散热。
+func TestOffModeAutoResumesAfterFiveMinutes(t *testing.T) {
+	manager := newFanDebugTestManager(t)
+	hwmon := filepath.Join(manager.Root, "sys", "class", "hwmon", "hwmon3")
+	pwm1 := filepath.Join(hwmon, "pwm1")
+	fan1 := filepath.Join(hwmon, "fan1_input")
+
+	base := DefaultFanConfig()
+	base.Enabled = true
+	base.CPUFanIDs = []string{"it8613:hwmon3:fan1"}
+	for i := range base.Curve {
+		base.Curve[i].PWMPercent = 100
+	}
+	if err := manager.SaveFanConfig(base); err != nil {
+		t.Fatalf("save base: %v", err)
+	}
+
+	off := DefaultFanConfig()
+	off.Enabled = true
+	off.OffMode = true
+	off.CPUFanIDs = []string{"it8613:hwmon3:fan1"}
+	for i := range off.Curve {
+		off.Curve[i].PWMPercent = 0
+	}
+	for i := range off.HDDCurve {
+		off.HDDCurve[i].PWMPercent = 0
+	}
+	for i := range off.NVMeCurve {
+		off.NVMeCurve[i].PWMPercent = 0
+	}
+	if err := manager.SaveFanConfig(off); err != nil {
+		t.Fatalf("save off: %v", err)
+	}
+	writeTestValue(t, fan1, "0") // 关停后风扇真的停住了
+
+	// 关停期间界面再次保存（不带快照）：服务端必须沿用关停前的曲线快照
+	again := off
+	again.OffModeBackup = nil
+	if err := manager.SaveFanConfig(again); err != nil {
+		t.Fatalf("关停期间再次保存: %v", err)
+	}
+
+	manager.mu.Lock()
+	saved, err := manager.loadConfigLocked()
+	manager.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.Fan.OffModeBackup == nil || len(saved.Fan.OffModeBackup.Curve) == 0 {
+		t.Fatal("进入关停档必须留下关停前的曲线快照")
+	}
+	if got := saved.Fan.OffModeBackup.Curve[0].PWMPercent; got != 100 {
+		t.Fatalf("快照应保存关停前的 100%% 曲线，实际 %d", got)
+	}
+
+	// 未到 5 分钟：保持关停
+	if err := manager.ApplyFanCurrent(); err != nil {
+		t.Fatalf("关停未到期时下发不应失败: %v", err)
+	}
+	if got, _ := readInt(pwm1); got != 0 {
+		t.Fatalf("关停未到期应保持 0，实际 pwm1=%d", got)
+	}
+
+	// 把进入时刻拨到 5 分钟上限之前：模拟检修结束、关停超时。
+	manager.mu.Lock()
+	manager.fanOffModeSince = time.Now().Add(-fanOffModeMaxDuration - time.Second)
+	manager.mu.Unlock()
+
+	if err := manager.ApplyFanCurrent(); err != nil {
+		t.Fatalf("关停到期后应自动恢复曲线并起转: %v", err)
+	}
+	manager.mu.Lock()
+	saved, err = manager.loadConfigLocked()
+	manager.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.Fan.OffMode {
+		t.Fatal("到期后 off_mode 必须落盘为 false")
+	}
+	if saved.Fan.OffModeBackup != nil {
+		t.Fatal("恢复原曲线后快照必须清掉")
+	}
+	if got := saved.Fan.Curve[0].PWMPercent; got != 100 {
+		t.Fatalf("到期后应恢复关停前的 100%% 曲线，实际 %d", got)
+	}
+	if got, _ := readInt(pwm1); got != 255 {
+		t.Fatalf("到期后风扇应重新起转，实际 pwm1=%d", got)
+	}
+}
+
+// 手动退出关停（界面回传恢复后的曲线）时快照必须清掉，且不得覆盖界面显式提交的曲线。
+func TestOffModeBackupClearedOnManualExit(t *testing.T) {
+	manager := newFanDebugTestManager(t)
+
+	base := DefaultFanConfig()
+	base.Enabled = true
+	base.CPUFanIDs = []string{"it8613:hwmon3:fan1"}
+	if err := manager.SaveFanConfig(base); err != nil {
+		t.Fatalf("save base: %v", err)
+	}
+	off := DefaultFanConfig()
+	off.Enabled = true
+	off.OffMode = true
+	off.CPUFanIDs = []string{"it8613:hwmon3:fan1"}
+	for i := range off.Curve {
+		off.Curve[i].PWMPercent = 0
+	}
+	for i := range off.HDDCurve {
+		off.HDDCurve[i].PWMPercent = 0
+	}
+	for i := range off.NVMeCurve {
+		off.NVMeCurve[i].PWMPercent = 0
+	}
+	if err := manager.SaveFanConfig(off); err != nil {
+		t.Fatalf("save off: %v", err)
+	}
+
+	back := DefaultFanConfig()
+	back.Enabled = true
+	back.CPUFanIDs = []string{"it8613:hwmon3:fan1"}
+	for i := range back.Curve {
+		back.Curve[i].PWMPercent = 80
+	}
+	if err := manager.SaveFanConfig(back); err != nil {
+		t.Fatalf("手动退出关停必须能保存: %v", err)
+	}
+
+	manager.mu.Lock()
+	saved, err := manager.loadConfigLocked()
+	manager.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.Fan.OffMode || saved.Fan.OffModeBackup != nil {
+		t.Fatalf("退出关停后 off_mode/快照都必须清掉: %+v", saved.Fan)
+	}
+	if got := saved.Fan.Curve[0].PWMPercent; got != 80 {
+		t.Fatalf("手动退出应保留界面回传的曲线，实际 %d", got)
+	}
+}
+
 // 起转宽限窗口不是永久豁免：离开关停档 30 秒后仍然 0 转的通道必须重新按故障
 // 处理（下发 fail-safe 满速、保存被拒）。旧的「见过一次转速就永久免检」会让
 // 拔掉/损坏的风扇永远不被发现。

@@ -241,6 +241,8 @@ type Manager struct {
 	// 过期后恢复严格检查，不再像旧的「见过转速就永久豁免」那样放过真故障。
 	fanOffWasActive bool
 	fanOffExitedAt  time.Time
+	// fanOffModeSince 关停档的进入时刻，用于 5 分钟上限后自动恢复原曲线并起转。
+	fanOffModeSince time.Time
 
 	// fanOffAlarmChimeAt 关停档维修安全报警（errOffModeAlarm）的上次蜂鸣时刻，
 	// 按 fanOffAlarmChimeInterval 节流，避免报警期间蜂鸣器连响不停。
@@ -724,6 +726,8 @@ func (m *Manager) SaveFanConfig(fan FanConfig) error {
 	previous := cfg.Fan
 	cfg.Fan = fan
 	normalizeConfig(&cfg)
+	// 进入关停档时留一份关停前曲线，供 5 分钟上限到期自动恢复；退出时清掉。
+	captureOffModeBackup(&cfg.Fan, previous)
 	if err := m.validateFanLocked(&cfg.Fan); err != nil {
 		m.lastError = err.Error()
 		return err
