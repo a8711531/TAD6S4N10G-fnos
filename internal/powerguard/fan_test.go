@@ -1765,3 +1765,126 @@ func TestOffModeStopsDebugLoopsFromWritingPWM(t *testing.T) {
 		t.Fatalf("闭环不得改写关停档的 0%%，实际 pwm1=%d", got)
 	}
 }
+
+// 释放调试接管时 restoreFan 会把原始非零 PWM 写回去，再由 ApplyFanCurrent
+// 覆盖成 0——中间那笔非零写入虽然最终被清掉，维修关停期间依然算起转，必须整个
+// 跳过 restoreFan，只让 ApplyFanCurrent 处理。回归：关停档下 release takeover
+// 全程不得出现任何非零 PWM 写入。
+func TestOffModeReleaseTakeoverNeverRestoresNonZeroPWM(t *testing.T) {
+	manager := newFanDebugTestManager(t)
+	hwmon := filepath.Join(manager.Root, "sys", "class", "hwmon", "hwmon3")
+	pwm1 := filepath.Join(hwmon, "pwm1")
+	const id = "it8613:hwmon3:fan1"
+
+	// 先让风扇有一个非零的正常运行值，用作接管时 capture 的原始状态。
+	writeTestValue(t, filepath.Join(hwmon, "pwm1"), "102")
+	writeTestValue(t, filepath.Join(hwmon, "pwm1_enable"), "2")
+
+	cfg := DefaultConfig(Profile{}).Fan
+	cfg.Enabled = true
+	cfg.CPUFanIDs = []string{id}
+	cfg.OffMode = false
+	cfg.Curve = clampCurvePWM(curve40to90(), cfg.MinPWMPercent)
+	if err := manager.SaveFanConfig(cfg); err != nil {
+		t.Fatalf("save baseline config: %v", err)
+	}
+
+	if err := manager.SetFanDebugTakeover(id, true); err != nil {
+		t.Fatalf("takeover should succeed before off-mode: %v", err)
+	}
+
+	// 进入关停档：ApplyFanCurrent 把 PWM 写成 0。
+	off := offModeZeroCurveConfig(id)
+	if err := manager.SaveFanConfig(off); err != nil {
+		t.Fatalf("save off-mode: %v", err)
+	}
+	if got, _ := readInt(pwm1); got != 0 {
+		t.Fatalf("关停档应立即写 0，实际 pwm1=%d", got)
+	}
+
+	writes := recordFanPWMWrites(t)
+	if err := manager.SetFanDebugTakeover(id, false); err != nil {
+		t.Fatalf("release takeover should succeed even in off-mode: %v", err)
+	}
+	assertNoSpinWrites(t, writes())
+	if got, _ := readInt(pwm1); got != 0 {
+		t.Fatalf("释放接管后仍必须保持停转，实际 pwm1=%d", got)
+	}
+}
+
+// 校准期间用户可能启用关停档（另一个 goroutine 跑 SaveFanConfig + ApplyFanCurrent
+// 打断采样），结束后 restoreAfterCalibrateLocked 不能再把原始非零 PWM 写回去。
+// 这里用 goroutine 在 CalibrateFanRPM 释放锁开始采样后介入 OffMode，
+// 模拟真实的并发路径；断言：最终 PWM 为 0、OffMode 生效后的写入全为 0、
+// 全速基准没被错误落盘。
+func TestOffModeMidCalibrationRestoresZeroPWM(t *testing.T) {
+	m := newFanDebugTestManager(t)
+	hwmon := filepath.Join(m.Root, "sys", "class", "hwmon", "hwmon3")
+	pwm1 := filepath.Join(hwmon, "pwm1")
+	const id = "it8613:hwmon3:fan1"
+
+	cfg := DefaultConfig(Profile{}).Fan
+	cfg.Enabled = true
+	cfg.CPUFanIDs = []string{id}
+	cfg.OffMode = false
+	cfg.Curve = clampCurvePWM(curve40to90(), cfg.MinPWMPercent)
+	if err := m.SaveFanConfig(cfg); err != nil {
+		t.Fatalf("save baseline: %v", err)
+	}
+
+	// 让接管在 calibrate 之前就生效，原始状态 capture 一个非零 PWM。
+	if err := m.SetFanDebugTakeover(id, true); err != nil {
+		t.Fatalf("pre-calibrate takeover: %v", err)
+	}
+
+	// 先开始校准（会写 255，这是关停前的全速标定准备，可接受）。
+	done := make(chan struct{})
+	var afterOffWrites []int
+	go func() {
+		defer close(done)
+		time.Sleep(100 * time.Millisecond)
+		// 关停档启用后，ApplyFanCurrent 把 PWM 强制写 0；
+		// 此时开始记录写入，只看关停后的副作用。
+		stop := recordFanPWMWrites(t)
+		off := offModeZeroCurveConfig(id)
+		_ = m.SaveFanConfig(off)
+		time.Sleep(50 * time.Millisecond)
+		afterOffWrites = stop()
+	}()
+
+	_, calibErr := m.CalibrateFanRPM(id)
+	<-done
+	if calibErr != nil {
+		t.Fatalf("校准不应报错：%v", calibErr)
+	}
+
+	// 关停档启用后的所有 PWM 写入必须全为 0：包括 ApplyFanCurrent 的 0、
+	// 以及 restoreAfterCalibrateLocked 必须写 0 而不是 originalPWM。
+	for _, w := range afterOffWrites {
+		if w != 0 {
+			t.Fatalf("关停档生效后仍出现非零 PWM %d（序列：%v）", w, afterOffWrites)
+		}
+	}
+
+	// 关键断言：最终 PWM 必须是 0，不能是 originalPWM（接管时的 102）或 255。
+	if got, _ := readInt(pwm1); got != 0 {
+		t.Fatalf("校准被关停档打断后必须停在 0%%，实际 pwm1=%d", got)
+	}
+
+	// 全速基准不应落盘：采样过程 ApplyFanCurrent 已把 PWM 从 255 写成 0，
+	// 读数不再可信。
+	m.mu.Lock()
+	table := m.fanRPMLearned[id]
+	m.mu.Unlock()
+	if table != nil && table[240] != 0 {
+		t.Fatalf("关停档打断的校准不应落盘全速基准，实际 slot240=%d", table[240])
+	}
+}
+
+// curve40to90 测试用 CPU 曲线：20°C→40%, 80°C→90%。
+func curve40to90() []FanPoint {
+	return []FanPoint{
+		{TempC: 20, PWMPercent: 40},
+		{TempC: 80, PWMPercent: 90},
+	}
+}

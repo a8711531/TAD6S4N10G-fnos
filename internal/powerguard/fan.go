@@ -1971,10 +1971,15 @@ func (m *Manager) SetFanDebugTakeover(id string, taken bool) error {
 		// (mode≥2)的风扇会卡死在固定转速。曲线开着时函数尾部的
 		// ApplyFanCurrent 随即按曲线接管(enable=1);风扇控制停用/不在
 		// 曲线列表的风扇则真正回到接管前的硬件模式。
-		if original, ok := m.originalFanLocked(id); ok {
-			if err := restoreFan(*target, original); err != nil {
-				// 恢复失败不阻塞交还:曲线开着时 ApplyFanCurrent 兜底接管
-				m.fanDebugLastError = fmt.Sprintf("fan %s hand-back restore: %v", id, err)
+		// 关停档例外:OffMode 期间绝不写非零 PWM——restoreFan 会把原始非零
+		// 转速写回去,再由 ApplyFanCurrent 覆盖成 0,中间那笔写入与「关停档
+		// 一律不起转」冲突,必须整个跳过,让 ApplyFanCurrent 直接写 0%。
+		if !m.fanOffModeActiveLocked() {
+			if original, ok := m.originalFanLocked(id); ok {
+				if err := restoreFan(*target, original); err != nil {
+					// 恢复失败不阻塞交还:曲线开着时 ApplyFanCurrent 兜底接管
+					m.fanDebugLastError = fmt.Sprintf("fan %s hand-back restore: %v", id, err)
+				}
 			}
 		}
 		handBack = true
@@ -2555,7 +2560,12 @@ func (m *Manager) CalibrateFanRPM(id string) (int, error) {
 	m.mu.Unlock()
 
 	median, samples, calibErr := m.sampleFanRPMSteady(id)
-	if calibErr == nil {
+	// 校准期间另一个 goroutine 可能启用了关停档。此时采样可能被 ApplyFanCurrent
+	// 中途打断(fanPWM 从 255 被写成 0),记录的全速基准不可信,不能落盘。
+	m.mu.Lock()
+	wasOff := m.fanOffModeActiveLocked()
+	m.mu.Unlock()
+	if calibErr == nil && !wasOff {
 		m.recordFanRPMData(id, 240, median, true) // 主动标定:绕过节流立即落盘 // 入特性表最高档并维护满转基准（自带加锁）
 	}
 	m.mu.Lock()
@@ -2616,13 +2626,21 @@ func (m *Manager) sampleFanRPMSteady(id string) (int, int, error) {
 // restoreAfterCalibrateLocked 恢复标定前的控制状态。两个分支都立即写回
 // 原始 PWM:接管分支重建调试值,未接管分支交还曲线控制——若控制已停用,
 // 不写回会让风扇停在标定的全速上。调用方须持 m.mu。
+// 关停档例外:标定期间另一个 goroutine 可能启用了 OffMode。此时原始 PWM
+// 可能非零,直接写回会让维修关停期间风扇转起来,必须改成写 0;全速采样的
+// 入档也不再可信,调用方已在外层判断 calibErr && !wasOff 才落盘。
 func (m *Manager) restoreAfterCalibrateLocked(id string, wasTaken bool, originalValue int, originalUnit string, originalPWM int64) {
 	delete(m.fanRPMSuspend, id)
+	offMode := m.fanOffModeActiveLocked()
 	fans, err := m.DiscoverFans()
 	if err == nil {
 		for i := range fans {
 			if fans[i].ID == id {
-				_ = setFanPWMRaw(fans[i], int(originalPWM))
+				targetPWM := int(originalPWM)
+				if offMode {
+					targetPWM = 0
+				}
+				_ = setFanPWMRaw(fans[i], targetPWM)
 				break
 			}
 		}
