@@ -3,6 +3,7 @@ package powerguard
 import (
 	"context"
 	"io"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -366,6 +367,7 @@ func TestSaveGPIOConfigKeepsUserDisabledMapping(t *testing.T) {
 	disabled := gpioTestConfig(false, nil)
 	disabled.Migrations = []string{gpioDefaultsMigrationRefreshSDCard}
 	disabled.StorageNotify = gpioBoolPointer(false)
+	disabled.Feedback = gpioBoolPointer(false)
 	disabled.Scripts = []GPIOScript{{ID: "s1", Name: "自检", Body: "echo ok"}}
 	if err := manager.SaveGPIOConfig(disabled); err != nil {
 		t.Fatalf("保存失败: %v", err)
@@ -383,6 +385,12 @@ func TestSaveGPIOConfigKeepsUserDisabledMapping(t *testing.T) {
 	if config.GPIO.StorageNotifyEnabled() {
 		t.Fatal("关掉的存储插入提示音不该被重开")
 	}
+	if config.GPIO.FeedbackEnabled() {
+		t.Fatal("关掉的按键声光反馈不该被重开")
+	}
+	if manager.gpioFeedbackEnabled() {
+		t.Fatal("落盘的反馈开关应被 PlayGPIOFeedback 的判定入口读到")
+	}
 	if network, ok := gpioTestButton(config.GPIO, "network"); !ok || !gpioActionIsEmpty(network.Actions.Short) {
 		t.Fatalf("关掉映射后不该被补上默认动作: %+v", network.Actions)
 	}
@@ -393,6 +401,7 @@ func TestPreserveGPIOUserDataKeepsScriptsAndNotify(t *testing.T) {
 	previous := GPIOConfig{
 		Scripts:       []GPIOScript{{ID: "s1", Name: "自检", Body: "echo ok"}},
 		StorageNotify: gpioBoolPointer(false),
+		Feedback:      gpioBoolPointer(false),
 		Backups: []GPIOBackupJob{{
 			ID: "b1", Name: "照片", Mode: BackupModeCopy,
 			Source: BackupLocation{Kind: "path", Path: "/vol1/src"},
@@ -406,6 +415,9 @@ func TestPreserveGPIOUserDataKeepsScriptsAndNotify(t *testing.T) {
 	if merged.StorageNotifyEnabled() {
 		t.Fatal("关掉的提示音应当被保留成关闭")
 	}
+	if merged.FeedbackEnabled() {
+		t.Fatal("关掉的按键声光反馈应当被保留成关闭")
+	}
 	if len(merged.Backups) != 1 {
 		t.Fatalf("备份任务应当被保留: %+v", merged.Backups)
 	}
@@ -417,5 +429,35 @@ func TestPreserveGPIOUserDataKeepsScriptsAndNotify(t *testing.T) {
 	*merged.StorageNotify = true
 	if *previous.StorageNotify {
 		t.Fatal("提示音开关应当是独立副本")
+	}
+	if *merged.Feedback {
+		t.Fatal("反馈开关应当是独立副本")
+	}
+}
+
+// 按键声光反馈开关：老配置里没有这个字段时必须按「开启」处理，否则升级上来的
+// 机器会静默失去按键反馈；显式关掉则必须读到关闭。
+func TestGPIOFeedbackEnabledDefaultsOn(t *testing.T) {
+	if !(GPIOConfig{}).FeedbackEnabled() {
+		t.Fatal("缺省（老配置没有该字段）应当视为开启")
+	}
+	if !DefaultGPIOConfig().FeedbackEnabled() {
+		t.Fatal("默认配置应当开启按键声光反馈")
+	}
+	enabled, disabled := true, false
+	if !(GPIOConfig{Feedback: &enabled}).FeedbackEnabled() {
+		t.Fatal("显式开启应当读到开启")
+	}
+	if (GPIOConfig{Feedback: &disabled}).FeedbackEnabled() {
+		t.Fatal("显式关闭应当读到关闭")
+	}
+}
+
+// 配置读不出来时反馈按开启处理（与存储提示音同口径），避免读盘失败把功能静默关掉。
+func TestGPIOFeedbackEnabledFallsBackOnWhenConfigMissing(t *testing.T) {
+	root := t.TempDir()
+	manager := &Manager{Root: root, ConfigPath: filepath.Join(root, "config.json")}
+	if !manager.gpioFeedbackEnabled() {
+		t.Fatal("配置读不出来时应当按开启处理")
 	}
 }

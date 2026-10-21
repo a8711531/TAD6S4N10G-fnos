@@ -3015,6 +3015,7 @@ function fillGPIOInputs(gpio = {}) {
   refreshAutoBackupDevices();
   showGPIOScriptMessage(gpioScripts.length ? `已加载 ${gpioScripts.length} 个脚本。` : '尚未创建自定义脚本。');
   updateGPIOEnabledState();
+  updateGPIOFeedbackStatus();
 }
 
 function gpioConfigFromInputs() {
@@ -6600,6 +6601,31 @@ $('save-gpio').addEventListener('click', async () => {
   try {
     render(await request('api/config/gpio', { method: 'POST', body: JSON.stringify(config) }), true);
     showMessage('按钮控制配置已保存；全局和风扇配置未修改。', false, 'message-gpio');
+  } catch (error) {
+    showMessage(`保存失败：${error.message}`, true, 'message-gpio');
+  } finally {
+    setBusy(false);
+  }
+});
+
+// 按键触发声光反馈开关：切换后立即落盘，不必再点「保存按钮控制」，
+// 否则用户以为拨了开关就生效，实际配置没存下去、按键照样滴滴滴。
+function updateGPIOFeedbackStatus() {
+  const target = $('gpio-feedback-status');
+  if (!target) return;
+  target.textContent = $('gpio-feedback').checked
+    ? '开启后通过按键触发动作会滴滴滴响 3 声并让复制键 LED 闪 3 次，脚本运行结束时也会重复一次声光提示。'
+    : '已关闭：按键触发动作不再蜂鸣，也不再闪灯。';
+}
+
+$('gpio-feedback').addEventListener('change', async () => {
+  const enabled = $('gpio-feedback').checked;
+  updateGPIOFeedbackStatus();
+  const config = gpioConfigFromInputs();
+  setBusy(true);
+  try {
+    render(await request('api/config/gpio', { method: 'POST', body: JSON.stringify(config) }), true);
+    showMessage(enabled ? '按键声光反馈已开启。' : '按键声光反馈已关闭。', false, 'message-gpio');
   } catch (error) {
     showMessage(`保存失败：${error.message}`, true, 'message-gpio');
   } finally {
