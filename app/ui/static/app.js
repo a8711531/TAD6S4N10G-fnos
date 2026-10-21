@@ -695,7 +695,7 @@ function renderDiagnostics(status, fanStatus) {
 }
 
 // 「关停」档下 0 转是设置出来的结果，不是接线/驱动故障：文案要说明白并催用户尽快退出
-const FAN_OFF_RPM_NOTICE = '因为设置曲线模式为关停，风扇转速反馈为 0 RPM。请尽快取消此模式以免损坏硬件。';
+const FAN_OFF_RPM_NOTICE = '因为设置曲线模式为关停，风扇转速反馈为 0 RPM。该模式优先级最高：达到紧急温度也不会自动起转，超过阈值时只会蜂鸣报警。请尽快取消此模式以免损坏硬件。';
 
 // 后端 status 里带 off_mode；老状态没这个字段时退回读配置，两种来源都认
 function fanOffModeActive(fanStatus = {}) {
@@ -1953,6 +1953,12 @@ function autoRuleDeletesNasSource(rule) {
   return rule.mode === 'move_overwrite' || rule.mode === 'move_archive';
 }
 
+// 卷内子目录清理后是否等于卷根本身：空、"."、"./"、"././" 都算。这类输入等于
+// 「没选子目录」，同步模式会带 --delete 清空整块盘，后端也会拒绝。
+function autoVolumeSubIsVolumeRoot(sub) {
+  return String(sub || '').trim().split('/').every((part) => part === '' || part === '.');
+}
+
 function validateAutoRuleDraft(rule) {
   if (!rule.name) {
     showAutoBackupEditorMessage('规则名称不能为空。', true);
@@ -1976,9 +1982,18 @@ function validateAutoRuleDraft(rule) {
     showAutoBackupEditorMessage('NAS 侧目标不能直接是整个「我的文件」根目录，请在它下面新建一个备份目录。', true);
     return false;
   }
-  if (rule.mode === 'sync' && rule.direction === 'to_volume' && !rule.volume_sub) {
-    showAutoBackupEditorMessage('同步模式请填写打标卷内的目标子目录（留空会清空整块盘）。', true);
-    return false;
+  // 卷内子目录按「清理后的路径」判断：空、"."、"./"、"././" 都落在卷根。
+  // 同步模式会 --delete 清空整块盘；其它模式下点目录也等于把规则作用到整卷，
+  // 与用户填了子目录的预期不符，一起拦住（后端规则校验与执行入口有同样的闸）。
+  if (rule.direction === 'to_volume' && autoVolumeSubIsVolumeRoot(rule.volume_sub)) {
+    if (rule.mode === 'sync') {
+      showAutoBackupEditorMessage('同步模式请填写打标卷内的目标子目录（留空、. 或 ./ 都会清空整块盘）。', true);
+      return false;
+    }
+    if (rule.volume_sub) {
+      showAutoBackupEditorMessage('卷内子目录不能是 . 或 ./（等同于整块盘的根目录）。', true);
+      return false;
+    }
   }
   if (autoRuleDeletesNasSource(rule) && !rule.allow_move_to_volume) {
     // 只说不做没用：抖一下那一行、把焦点送过去，让用户知道要勾的是哪里。
@@ -3333,7 +3348,7 @@ async function applyShutdown() {
   if (!first) return;
   const second = await showAppConfirm({
     title: '再确认一次：确定要关停风扇？',
-    message: '停转期间硬盘与 NVMe 温度会持续升高，长时间关停可能造成不可逆的硬件损伤。CPU 达到紧急满速温度时仍会自动兜底。',
+    message: '停转期间硬盘与 NVMe 温度会持续升高，长时间关停可能造成不可逆的硬件损伤。关停期间即使达到紧急温度也不会自动起转，只会鸣响蜂鸣器报警——维修时请先断电并做好散热防护。',
     hideConfirm: true,
     secondaryText: '关停并保存风扇控制',
     secondaryDanger: true,

@@ -81,6 +81,16 @@ func TestValidateGPIOAutoBackup(t *testing.T) {
 		}},
 		{"卷内子目录不能是绝对路径", func(r *GPIOAutoBackup) { r.VolumeSub = "/abs" }},
 		{"卷内子目录不能包含 ..", func(r *GPIOAutoBackup) { r.VolumeSub = "a/../b" }},
+		// 「.」「./」「././」清理后就是卷根本身：同步模式会 --delete 清空整盘，
+		// 其它模式也会把规则作用到整卷，必须按清理后的路径拒绝。
+		{"卷内子目录不能是 .", func(r *GPIOAutoBackup) { r.VolumeSub = "." }},
+		{"卷内子目录不能是 ./", func(r *GPIOAutoBackup) { r.VolumeSub = "./" }},
+		{"卷内子目录不能是 ././", func(r *GPIOAutoBackup) { r.VolumeSub = "././" }},
+		{"同步到打标卷必须指定子目录", func(r *GPIOAutoBackup) {
+			r.Direction = BackupDirectionToVolume
+			r.Mode = BackupModeSync
+			r.VolumeSub = ""
+		}},
 		{"保留份数越界", func(r *GPIOAutoBackup) { r.Keep = 1001 }},
 		{"NAS 侧位置缺失", func(r *GPIOAutoBackup) { r.Fixed = BackupLocation{} }},
 		{"名称为空", func(r *GPIOAutoBackup) { r.Name = "  " }},
@@ -215,6 +225,30 @@ func TestAutoBackupJobForVolume(t *testing.T) {
 	toVolume.VolumeSub = ""
 	if _, err := autoBackupJobForVolume(toVolume, volume); err == nil {
 		t.Fatal("同步到打标卷根目录应当被拒绝")
+	}
+
+	// 点目录清理后仍是卷根：只判空串会被绕过（`.`、`./`、`././` 与空白），
+	// 执行入口必须按清理后的路径拒绝，而且是在启动 rsync 之前。
+	for _, sub := range []string{".", "./", "././", " . "} {
+		for _, mode := range []string{BackupModeSync, BackupModeCopy, BackupModeArchive} {
+			rule := toVolume
+			rule.Mode = mode
+			rule.VolumeSub = sub
+			if _, err := autoBackupJobForVolume(rule, volume); err == nil {
+				t.Fatalf("卷内子目录 %q（模式 %s）指向卷根，应当被拒绝", sub, mode)
+			}
+		}
+	}
+
+	// 正常子目录照常可用，目标落在子目录里而不是卷根。
+	toVolume.Mode = BackupModeSync
+	toVolume.VolumeSub = "backup/照片"
+	job, err = autoBackupJobForVolume(toVolume, volume)
+	if err != nil {
+		t.Fatalf("正常子目录应当放行: %v", err)
+	}
+	if job.Target.Path != "/media/usb0/backup/照片" {
+		t.Fatalf("同步目标应落在卷内子目录: %+v", job.Target)
 	}
 
 	// 打了子目录标的卷：每个子目录一个源、保留目录名（NAS 上是 目标/DCIM/…），

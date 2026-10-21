@@ -1651,6 +1651,30 @@ test('反向移动规则：没勾确认就保存会被拦住，勾上才放行',
   assert.equal(validate({ ...rule, mode: 'archive' }), true);
 });
 
+test('自动备份：卷内子目录填 . / ./ / ././ 等同于整块盘，保存会被拦住', () => {
+  const app = loadAppContext({ fetch: recordingFetch(() => ({})).fetch });
+  const validate = app.resolve('validateAutoRuleDraft');
+  const base = {
+    id: 'to-disk', name: '同步到移动盘', direction: 'to_volume',
+    fixed: { kind: 'path', path: '/vol1/1000/照片' },
+    volume_sub: '.', mode: 'sync', overwrite: true, keep: 0,
+  };
+
+  for (const sub of ['.', './', '././', ' . ']) {
+    assert.equal(validate({ ...base, volume_sub: sub }), false, `同步模式子目录 ${JSON.stringify(sub)} 必须被拦住`);
+    assert.match(app.element('auto-backup-message').textContent, /整块盘/, '要说明会清空整块盘');
+  }
+  assert.equal(validate({ ...base, volume_sub: '' }), false, '同步模式留空同样会清空整块盘');
+  // 非同步模式：点目录等于把规则作用到整卷，与「填了子目录」的预期不符
+  for (const mode of ['archive', 'copy']) {
+    assert.equal(validate({ ...base, mode, volume_sub: './' }), false, `${mode} 模式也要拦住 ./`);
+    assert.match(app.element('auto-backup-message').textContent, /根目录/);
+  }
+  // 正常子目录、以及非同步模式的留空（整卷参与）放行
+  assert.equal(validate({ ...base, volume_sub: '照片/2026' }), true);
+  assert.equal(validate({ ...base, mode: 'archive', volume_sub: '' }), true);
+});
+
 test('反向移动规则：没勾确认就保存时，确认项抖动告警，勾上或换档后复位', () => {
   const radios = ['archive', 'sync', 'move_archive', 'move_overwrite'].map((value) => {
     const radio = listeningStub();
@@ -2032,6 +2056,33 @@ test('曲线模式：全速一次确认拉满 100%，关停必须两次确认才
   assert.equal(app.resolve('fanMinimumPWM')(), 0);
 });
 
+test('关停二次确认：明确「不会自动起转、只蜂鸣报警」，不再承诺超温满速兜底', async () => {
+  const app = loadAppContext();
+  app.element('fan-min').value = '40';
+  app.element('fan-emergency').value = '85';
+
+  const off = app.resolve('applyShutdown')();
+  await nextTick();
+  await app.click('confirm-ok');
+  await nextTick();
+  const text = app.element('confirm-message').textContent;
+  assert.match(text, /不会自动起转/, '维修安全策略要在弹窗里说清楚');
+  assert.match(text, /蜂鸣器/, '超温只蜂鸣报警，必须写明');
+  assert.doesNotMatch(text, /自动满速|满速兜底/, '不能再承诺超温自动拉满');
+  await app.click('confirm-cancel');
+  await off;
+  assert.equal(app.resolve('fanOffMode'), false, '取消后不得进入关停档');
+});
+
+test('关停档文案一致：页面说明、0 转提示都指向「停转 + 蜂鸣报警」', () => {
+  const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
+  assert.match(html, /「关停」档除外：维修期间一律停转，超过紧急温度只蜂鸣报警/, '页面说明要与后端维修安全策略一致');
+  const app = loadAppContext();
+  const notice = app.resolve('FAN_OFF_RPM_NOTICE');
+  assert.match(notice, /不会自动起转/, '0 转提示不能让用户以为超温会自动起转');
+  assert.match(notice, /蜂鸣/, '0 转提示要说明改用蜂鸣报警');
+});
+
 test('曲线模式：关停在第一次确认点取消，曲线与模式都不变', async () => {
   const app = loadAppContext();
   app.element('fan-min').value = '40';
@@ -2130,7 +2181,7 @@ test('应用并保存风扇控制：预设弹窗的副按钮同样直接下发�
 
 test('关停档：0 转提示改成「因为设置曲线模式为关停」，不再往接线上带', () => {
   const app = loadAppContext();
-  const notice = '因为设置曲线模式为关停，风扇转速反馈为 0 RPM。请尽快取消此模式以免损坏硬件。';
+  const notice = '因为设置曲线模式为关停，风扇转速反馈为 0 RPM。该模式优先级最高：达到紧急温度也不会自动起转，超过阈值时只会蜂鸣报警。请尽快取消此模式以免损坏硬件。';
   const stopped = { driver_detected: true, active: true, off_mode: true, fans: [{ id: 'it8613:fan1', rpm: 0, pwm_percent: 0 }] };
   const issues = app.resolve('healthIssues')({ supported: true }, stopped, {}, {}).join('\n');
   assert.match(issues, /因为设置曲线模式为关停，风扇转速反馈为 0 RPM/);

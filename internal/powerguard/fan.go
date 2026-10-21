@@ -472,6 +472,20 @@ func (m *Manager) fanSpinUpGraceLocked() bool {
 	return time.Since(m.fanOffExitedAt) < fanSpinUpGraceWindow
 }
 
+// errFanOffModeBusy 关停档（维修/检修）下拒绝调试调速、递增、标定这类主动
+// 写 PWM 的操作：关停档优先级最高，任何写入路径都不许让风扇转起来。
+var errFanOffModeBusy = errors.New("风扇处于「关停」档（维修/检修），已禁止主动调速；请先取消关停")
+
+// fanOffModeActiveLocked 报告当前配置是否处于「关停」档。配置读不出来时沿用
+// 上一次实际生效的关停状态（与 ApplyFanCurrent 的故障处理口径一致）。
+func (m *Manager) fanOffModeActiveLocked() bool {
+	cfg, err := m.loadConfigLocked()
+	if err != nil {
+		return m.fanOffWasActive
+	}
+	return cfg.Fan.Enabled && cfg.Fan.OffMode
+}
+
 // errNoUsableFan 所有选中的风扇都读不到转速：保存配置时拒绝（防止静默存下
 // 无风扇可用的配置）；运行时周期应用保持错误状态报警——机器有两个风扇接口，
 // 全部停转就是真故障（风扇卡死/线被扯掉/测速线坏），绝不能清掉错误装正常。
@@ -1101,6 +1115,9 @@ func (m *Manager) stepFanRPMCloseLoop() bool {
 			m.mu.Unlock()
 			return true
 		}
+		// 关停档维修期间闭环只保持存活、绝不写 PWM：关停档优先级最高，
+		// 否则闭环会把刚被写成 0% 的风扇按目标转速重新拉起来。
+		offMode := m.fanOffModeActiveLocked()
 		active := false
 		if m.fanRPMLoopMiss == nil {
 			m.fanRPMLoopMiss = map[string]int{}
@@ -1127,6 +1144,10 @@ func (m *Manager) stepFanRPMCloseLoop() bool {
 			}
 			if m.fanRPMSuspend[id] {
 				continue // 主动标定进行中，闭环让位（满速采样与微调不能同写）
+			}
+			if offMode {
+				active = true
+				continue // 关停档：保持存活但不写 PWM（见上方 offMode 注释）
 			}
 			if m.fanDebugEmergency {
 				// CPU 过温紧急满速兜底最高优先级：闭环暂停微调（保持
@@ -1239,11 +1260,19 @@ func (m *Manager) ApplyFanCurrent() error {
 	defer m.mu.Unlock()
 	cfg, err := m.loadConfigLocked()
 	if err != nil {
-		return m.setFanFailureLocked(err)
+		// 配置读不出来时按「上次实际生效的关停状态」处理故障：关停档维修期间
+		// 任何故障路径都不许把风扇转起来。
+		return m.setFanFailureLocked(err, m.fanOffWasActive)
 	}
+	offMode := cfg.Fan.Enabled && cfg.Fan.OffMode
 	// 风扇调试接管：被接管的风扇脱离一切曲线控制(applyFanLocked 中锁定),
 	// 未接管的风扇照常受曲线控制。紧急温度兜底覆盖所有风扇(含被接管)。
-	if err := m.applyFanDebugEmergencyLocked(cfg.Fan); err != nil {
+	// 关停档除外：维修安全策略要求一律停转，兜底会把被接管的风扇拉到 100%，
+	// 与「关停期间绝不起转」冲突。这里清掉兜底标记，随后由 applyFanLocked 的
+	// 关停分支把所有通道（含被调试接管的）写成 0%。
+	if offMode {
+		m.fanDebugEmergency = false
+	} else if err := m.applyFanDebugEmergencyLocked(cfg.Fan); err != nil {
 		return err
 	}
 	if !cfg.Fan.Enabled {
@@ -1261,7 +1290,9 @@ func (m *Manager) ApplyFanCurrent() error {
 			m.fanLastError = err.Error()
 			return err
 		}
-		return m.setFanFailureLocked(err)
+		// 关停档里任何校验失败（例如某通道测速读不到，DiscoverFans 直接漏掉它）
+		// 都不得走 fail-safe：那会把仍在工作的另一路风扇突然转起来。
+		return m.setFanFailureLocked(err, offMode)
 	}
 	if err := m.applyFanLocked(cfg.Fan); err != nil {
 		m.fanLastError = err.Error()
@@ -1271,7 +1302,15 @@ func (m *Manager) ApplyFanCurrent() error {
 	return nil
 }
 
-func (m *Manager) setFanFailureLocked(cause error) error {
+// setFanFailureLocked 统一处理风扇控制路径上的失败。
+// offMode 为真时只记录错误、绝不写 PWM：维修关停期间任何故障（含某通道测速
+// 读不到导致校验失败）都不许把仍在工作的另一路风扇拉起来，fail-safe 的 100%
+// 写入在这条分支上属于伤人风险，必须让位给关停档。
+func (m *Manager) setFanFailureLocked(cause error, offMode bool) error {
+	if offMode {
+		m.fanLastError = cause.Error()
+		return cause
+	}
 	failSafeErr := m.failSafeCapturedFansLocked()
 	err := errors.Join(cause, failSafeErr)
 	m.fanLastError = err.Error()
@@ -1393,8 +1432,11 @@ func (m *Manager) applyFanLocked(cfg FanConfig) error {
 	}
 	for id, sources := range selected {
 		fan := byID[id]
-		if _, taken := m.fanDebugTakenOver[id]; taken {
-			continue // 被调试接管:脱离曲线控制,由调试接口锁定转速
+		if _, taken := m.fanDebugTakenOver[id]; taken && !cfg.OffMode {
+			// 被调试接管:脱离曲线控制,由调试接口锁定转速。
+			// 关停档例外:维修安全策略要求一律停转,调试锁定也要让位,
+			// 由下面的关停分支统一写 0%（否则调试值会让风扇继续转）。
+			continue
 		}
 		// 关停档（维修/检修模式，开启有两重确认+顶部常驻警告）：直接写 0%，
 		// 不再看最低转速与曲线。维修安全策略：紧急温度、温度源失效都不再翻
@@ -1482,10 +1524,18 @@ func setFanPWM(fan FanDevice, percent int) error {
 	return setFanPWMRaw(fan, percentToPWM(percent))
 }
 
+// fanPWMWriteHook 测试钩子：非 nil 时记录每一笔 PWM 原始写入（0–255）。
+// 回归用例需要核对「整条路径上有没有出现过非零写入」，只看最后一次 PWM 值会
+// 漏掉中途被 fail-safe 拉到 100% 又再写回 0 的情况。
+var fanPWMWriteHook func(fan FanDevice, raw int)
+
 // setFanPWMRaw 直接按原始占空比(0–255)写入;百分比调用方先换算。
 func setFanPWMRaw(fan FanDevice, raw int) error {
 	if raw < 0 || raw > 255 {
 		return fmt.Errorf("invalid fan PWM raw %d", raw)
+	}
+	if fanPWMWriteHook != nil {
+		fanPWMWriteHook(fan, raw)
 	}
 	currentPWM, err := readInt(fan.PWMPath)
 	if err != nil {
@@ -2011,6 +2061,10 @@ func (m *Manager) SetFanDebugValue(id string, value int, unit string) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.fanOffModeActiveLocked() {
+		// 关停档维修期间不接受任何主动调速：调试锁定的转速会让风扇转起来。
+		return errFanOffModeBusy
+	}
 	if m.fanDebugEmergency {
 		return fmt.Errorf("CPU 温度达到紧急阈值，风扇已强制满速，调速暂不可用")
 	}
@@ -2194,6 +2248,9 @@ func (m *Manager) SetFanDebugAuto(id string, running bool, step, intervalSeconds
 	}
 	// 关闭总是允许(幂等);开启要求风扇已接管且参数在该单位范围内
 	if running {
+		if m.fanOffModeActiveLocked() {
+			return errFanOffModeBusy
+		}
 		if _, taken := m.fanDebugTakenOver[id]; !taken {
 			return fmt.Errorf("风扇 %s 未被接管,请先勾选接管", id)
 		}
@@ -2269,9 +2326,15 @@ func (m *Manager) runFanDebugAuto(stop chan struct{}) {
 			continue
 		}
 		anyRunning := false
+		// 关停档维修期间自动递增只保持存活、绝不写 PWM（关停档优先级最高）。
+		offMode := m.fanOffModeActiveLocked()
 		var errs []error
 		for id, entry := range m.fanDebugAuto.entries {
 			if !entry.Running || entry.Done {
+				continue
+			}
+			if offMode {
+				anyRunning = true
 				continue
 			}
 			if m.fanDebugEmergency {
@@ -2351,6 +2414,9 @@ func (m *Manager) stopFanDebugAutoLocked() {
 func (m *Manager) StartFanDebugAutoBatch(entries map[string]fanDebugAutoEntry) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.fanOffModeActiveLocked() {
+		return errFanOffModeBusy
+	}
 	if m.fanDebugAuto == nil {
 		m.fanDebugAuto = &fanDebugAutoTest{entries: map[string]fanDebugAutoEntry{}}
 	}
@@ -2433,6 +2499,11 @@ const (
 // 标定期间该风扇的 RPM 闭环挂起，避免微调与满速采样互相打架。返回新基准。
 func (m *Manager) CalibrateFanRPM(id string) (int, error) {
 	m.mu.Lock()
+	if m.fanOffModeActiveLocked() {
+		// 标定要写 255（全速），关停档维修期间会把风扇转起来，直接拒绝。
+		m.mu.Unlock()
+		return 0, errFanOffModeBusy
+	}
 	if m.fanDebugEmergency {
 		// 紧急满速兜底期间不启动标定：标定结束会恢复标定前转速，覆盖兜底
 		m.mu.Unlock()

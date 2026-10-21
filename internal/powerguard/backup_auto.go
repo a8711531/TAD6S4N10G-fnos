@@ -295,14 +295,24 @@ func validateGPIOAutoBackup(rule GPIOAutoBackup) error {
 		return err
 	}
 	sub := strings.TrimSpace(rule.VolumeSub)
+	slashSub := filepath.ToSlash(sub)
 	if len(sub) > backupLocationMaxLen {
 		return fmt.Errorf("自动备份规则 %q 的卷内子目录过长", rule.ID)
 	}
-	if strings.HasPrefix(sub, "/") {
+	if strings.HasPrefix(slashSub, "/") {
 		return fmt.Errorf("自动备份规则 %q 的卷内子目录必须是相对路径", rule.ID)
 	}
-	if strings.Contains(sub, "..") {
+	if strings.Contains(slashSub, "..") {
 		return fmt.Errorf("自动备份规则 %q 的卷内子目录不能包含 ..", rule.ID)
+	}
+	// 「.」「./」「././」清理后就是卷根本身，等于没选子目录：同步模式会带
+	// --delete 清空整块盘，其它模式也会把规则作用到没选中的内容，必须拒绝。
+	if sub != "" && autoBackupSubIsVolumeRoot(sub) {
+		return fmt.Errorf("自动备份规则 %q 的卷内子目录不能指向卷根本身（. 或 ./ 等同于整块卷）", rule.ID)
+	}
+	// 同步到卷根 = 清空整块盘：执行层有同一条红线，这里提前在规则校验阶段拦住。
+	if rule.Direction == BackupDirectionToVolume && rule.Mode == BackupModeSync && sub == "" {
+		return fmt.Errorf("自动备份规则 %q 使用同步模式时必须指定打标卷内的目标子目录（整卷根会被清空）", rule.ID)
 	}
 	if rule.Keep < 0 || rule.Keep > 1000 {
 		return fmt.Errorf("自动备份规则 %q 的归档保留份数必须在 0-1000 之间（0 表示不限）", rule.ID)
@@ -364,6 +374,14 @@ func autoBackupLegacyMarkerName(mountPoint string) string {
 	return filepath.Join(mountPoint, BackupAutoMarkerLegacyName)
 }
 
+// autoBackupSubIsVolumeRoot 报告卷内子目录清理后是否等于可移动卷的根本身。
+// 「.」「./」「././」以及空串都等价于「没选子目录」：上层会把它当整块卷处理，
+// 同步模式于是带 --delete 清空整盘，移动模式把没选中的内容一起搬走。
+func autoBackupSubIsVolumeRoot(sub string) bool {
+	cleaned := filepath.ToSlash(filepath.Clean(filepath.ToSlash(strings.TrimSpace(sub))))
+	return cleaned == "." || cleaned == "/"
+}
+
 // validateAutoBackupSub 校验「卷内子目录」：必须是相对卷根的路径。
 func validateAutoBackupSub(sub string) error {
 	if strings.TrimSpace(sub) == "" {
@@ -381,7 +399,7 @@ func validateAutoBackupSub(sub string) error {
 	}
 	// 清理后等于卷根的路径（"."、"./"）等于没选子目录：上层会把它当「整块卷」
 	// 处理，移动/删除类规则于是把没选中的内容一起搬走，必须拒绝。
-	if filepath.ToSlash(filepath.Clean(slash)) == "." {
+	if autoBackupSubIsVolumeRoot(sub) {
 		return errors.New("不能指向卷根本身")
 	}
 	return nil
@@ -1019,8 +1037,16 @@ func autoBackupJobForVolume(rule GPIOAutoBackup, volume AutoBackupVolume) (GPIOB
 	case BackupDirectionToVolume:
 		// 卷侧是目标：只能有一个（一个源没法同时写进多个子目录）。规则里填的
 		// 子目录优先，没填就写到卷根。同步到卷根 = 清空整块盘，与内置卷根同一条红线。
-		if rule.Mode == BackupModeSync && strings.TrimSpace(rule.VolumeSub) == "" {
-			return GPIOBackupJob{}, fmt.Errorf("同步模式不能以整块打标卷的根目录为目标（会清空整块盘），请在卷内指定一个子目录")
+		// 这里按「清理后的路径」判断，而不是原始字符串是否为空：`.`、`./`、`././`
+		// 清理后同样落在卷根，只判空串会被绕过（规则校验已有同一道闸，这里是执行
+		// 入口的最后一道，老配置里残留的点目录也拦得住）。
+		if autoBackupSubIsVolumeRoot(rule.VolumeSub) {
+			if rule.Mode == BackupModeSync {
+				return GPIOBackupJob{}, fmt.Errorf("同步模式不能以整块打标卷的根目录为目标（会清空整块盘），请在卷内指定一个子目录")
+			}
+			if strings.TrimSpace(rule.VolumeSub) != "" {
+				return GPIOBackupJob{}, fmt.Errorf("打标卷内的目标子目录不能指向卷根本身（. 或 ./ 等同于整块卷），请填写一个子目录")
+			}
 		}
 		job.Source, job.Target = rule.Fixed, volumeLocation(rule.VolumeSub)
 	case BackupDirectionFromVolume:

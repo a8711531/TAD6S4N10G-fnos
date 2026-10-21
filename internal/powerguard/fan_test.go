@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -1591,5 +1592,176 @@ func TestAllFansZeroRPMAlarmsAtRuntime(t *testing.T) {
 	manager.mu.Unlock()
 	if alarm != "" {
 		t.Fatalf("风扇恢复后报警应清除，实际 %q", alarm)
+	}
+}
+
+// offModeZeroCurveConfig 关停档用的全 0% 曲线配置：关停档不看曲线，但保存校验
+// 仍要求曲线本身合法。
+func offModeZeroCurveConfig(fanIDs ...string) FanConfig {
+	cfg := DefaultFanConfig()
+	cfg.Enabled = true
+	cfg.OffMode = true
+	cfg.CPUFanIDs = fanIDs
+	for i := range cfg.Curve {
+		cfg.Curve[i].PWMPercent = 0
+	}
+	for i := range cfg.HDDCurve {
+		cfg.HDDCurve[i].PWMPercent = 0
+	}
+	for i := range cfg.NVMeCurve {
+		cfg.NVMeCurve[i].PWMPercent = 0
+	}
+	return cfg
+}
+
+// recordFanPWMWrites 记录测试期间每一笔 PWM 原始写入，返回读取已记录写入的函数。
+func recordFanPWMWrites(t *testing.T) func() []int {
+	t.Helper()
+	var mu sync.Mutex
+	var writes []int
+	fanPWMWriteHook = func(fan FanDevice, raw int) {
+		mu.Lock()
+		writes = append(writes, raw)
+		mu.Unlock()
+	}
+	t.Cleanup(func() { fanPWMWriteHook = nil })
+	return func() []int {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]int(nil), writes...)
+	}
+}
+
+// assertNoSpinWrites 校验整条路径上没有出现过任何非零 PWM 写入。只看最后一次
+// PWM 值会漏掉「中途被 fail-safe 拉到 100% 再写回 0」这种同样会伤人的情况。
+func assertNoSpinWrites(t *testing.T, writes []int) {
+	t.Helper()
+	for _, raw := range writes {
+		if raw != 0 {
+			t.Fatalf("关停档维修期间出现非零 PWM 写入 %d（全部写入：%v）", raw, writes)
+		}
+	}
+}
+
+// 关停档维修期间，任何故障路径都不许让仍工作的另一路风扇意外起转：某通道测速
+// 节点读不到时 DiscoverFans 直接漏掉它，校验报「配置的风扇找不到」，旧实现会
+// 顺势走 fail-safe 把另一路拉到 100%。这里核对整条路径上的全部 PWM 写入。
+func TestOffModeFailurePathNeverSpinsAnotherFan(t *testing.T) {
+	manager := newFanDebugTestManager(t)
+	hwmon := filepath.Join(manager.Root, "sys", "class", "hwmon", "hwmon3")
+	pwm1 := filepath.Join(hwmon, "pwm1")
+	fan2 := filepath.Join(hwmon, "fan2_input")
+	writeTestValue(t, fan2, "1300")
+	writeTestValue(t, filepath.Join(hwmon, "pwm2"), "128")
+	writeTestValue(t, filepath.Join(hwmon, "pwm2_enable"), "2")
+
+	cfg := offModeZeroCurveConfig("it8613:hwmon3:fan1", "it8613:hwmon3:fan2")
+	if err := manager.SaveFanConfig(cfg); err != nil {
+		t.Fatalf("save off mode: %v", err)
+	}
+	if got, _ := readInt(pwm1); got != 0 {
+		t.Fatalf("关停档应立即写 0，实际 pwm1=%d", got)
+	}
+
+	// 注入一路测速读取失败：整个通道从 DiscoverFans 里消失。
+	if err := os.Remove(fan2); err != nil {
+		t.Fatal(err)
+	}
+	writes := recordFanPWMWrites(t)
+	err := manager.ApplyFanCurrent()
+	if err == nil {
+		t.Fatal("通道消失必须报错，不能静默当作正常")
+	}
+	if !strings.Contains(err.Error(), "was not found") {
+		t.Fatalf("错误应说明配置的风扇找不到，实际 %v", err)
+	}
+	manager.mu.Lock()
+	alarm := manager.fanLastError
+	manager.mu.Unlock()
+	if !strings.Contains(alarm, "was not found") {
+		t.Fatalf("fanLastError 应保持该故障，实际 %q", alarm)
+	}
+	assertNoSpinWrites(t, writes())
+	if got, _ := readInt(pwm1); got != 0 {
+		t.Fatalf("关停档另一路风扇必须保持停转，实际 pwm1=%d", got)
+	}
+}
+
+// 关停档下调试接管、调速、递增、标定一律不得把风扇转起来；CPU 超温时调试紧急
+// 兜底（100%）也必须让位，改为保持停转 + 报警。
+func TestOffModeBlocksDebugWritesAndEmergencySpinUp(t *testing.T) {
+	manager := newFanDebugTestManager(t)
+	hwmon := filepath.Join(manager.Root, "sys", "class", "hwmon", "hwmon3")
+	pwm1 := filepath.Join(hwmon, "pwm1")
+	const id = "it8613:hwmon3:fan1"
+
+	cfg := offModeZeroCurveConfig(id)
+	if err := manager.SaveFanConfig(cfg); err != nil {
+		t.Fatalf("save off mode: %v", err)
+	}
+	if err := manager.SetFanDebugTakeover(id, true); err != nil {
+		t.Fatalf("关停档仍应允许（不写 PWM 的）接管: %v", err)
+	}
+	writes := recordFanPWMWrites(t)
+	if err := manager.SetFanDebugValue(id, 80, "percent"); !errors.Is(err, errFanOffModeBusy) {
+		t.Fatalf("关停档必须拒绝调试调速，实际 %v", err)
+	}
+	if err := manager.SetFanDebugAuto(id, true, 5, 2, "percent"); !errors.Is(err, errFanOffModeBusy) {
+		t.Fatalf("关停档必须拒绝自动递增，实际 %v", err)
+	}
+	if err := manager.StartFanDebugAutoBatch(map[string]fanDebugAutoEntry{
+		id: {Step: 5, Interval: 2, Unit: "percent"},
+	}); !errors.Is(err, errFanOffModeBusy) {
+		t.Fatalf("关停档必须拒绝批量递增，实际 %v", err)
+	}
+	if _, err := manager.CalibrateFanRPM(id); !errors.Is(err, errFanOffModeBusy) {
+		t.Fatalf("关停档必须拒绝标定（会写 255），实际 %v", err)
+	}
+	assertNoSpinWrites(t, writes())
+
+	// CPU 超温：调试紧急兜底不得生效。
+	writeTestValue(t, filepath.Join(manager.Root, "sys", "class", "hwmon", "hwmon9", "temp1_input"), "90000")
+	writes = recordFanPWMWrites(t)
+	err := manager.ApplyFanCurrent()
+	if !errors.Is(err, errOffModeAlarm) {
+		t.Fatalf("超温应报关停档报警，实际 %v", err)
+	}
+	manager.mu.Lock()
+	emergency := manager.fanDebugEmergency
+	manager.mu.Unlock()
+	if emergency {
+		t.Fatal("关停档下调试紧急兜底必须为 false")
+	}
+	assertNoSpinWrites(t, writes())
+	if got, _ := readInt(pwm1); got != 0 {
+		t.Fatalf("关停档超温也必须保持停转，实际 pwm1=%d", got)
+	}
+}
+
+// RPM 闭环与自动递增都是后台 goroutine 写 PWM 的隐蔽路径：关停档下只能保持
+// 存活，不得把刚写成 0% 的风扇按目标转速重新拉起来。
+func TestOffModeStopsDebugLoopsFromWritingPWM(t *testing.T) {
+	manager := newFanDebugTestManager(t)
+	hwmon := filepath.Join(manager.Root, "sys", "class", "hwmon", "hwmon3")
+	const id = "it8613:hwmon3:fan1"
+
+	cfg := offModeZeroCurveConfig(id)
+	if err := manager.SaveFanConfig(cfg); err != nil {
+		t.Fatalf("save off mode: %v", err)
+	}
+	// 直接构造「rpm 单位 + 已接管 + 目标高于实测」的闭环状态：不走调试接口
+	// （关停档下已被拒绝），模拟关停前就存在的接管。
+	manager.mu.Lock()
+	manager.fanDebugTakenOver = map[string]int{id: 1500}
+	manager.fanDebugUnits = map[string]string{id: "rpm"}
+	manager.mu.Unlock()
+
+	writes := recordFanPWMWrites(t)
+	if !manager.stepFanRPMCloseLoop() {
+		t.Fatal("关停档下闭环应保持存活，退出后自动恢复")
+	}
+	assertNoSpinWrites(t, writes())
+	if got, _ := readInt(filepath.Join(hwmon, "pwm1")); got != 0 {
+		t.Fatalf("闭环不得改写关停档的 0%%，实际 pwm1=%d", got)
 	}
 }
