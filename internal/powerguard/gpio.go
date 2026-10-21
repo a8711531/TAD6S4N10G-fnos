@@ -81,6 +81,9 @@ type GPIOConfig struct {
 	// 指针类型是为了区分「用户关掉了」与「老配置里还没有这个字段」——后者必须
 	// 按默认（开启）处理，否则升级上来的机器会静默失去这个功能。
 	StorageNotify *bool `json:"storage_notify,omitempty"`
+	// Feedback 是否在按键触发动作时播放蜂鸣 + LED 闪烁反馈（见 gpio_feedback_*.go）。
+	// 指针类型与 StorageNotify 同理：缺省视为开启。
+	Feedback *bool `json:"feedback,omitempty"`
 }
 
 // StorageNotifyEnabled 报告存储设备插入提示音是否开启：字段缺省视为开启。
@@ -88,7 +91,24 @@ func (config GPIOConfig) StorageNotifyEnabled() bool {
 	return config.StorageNotify == nil || *config.StorageNotify
 }
 
+// FeedbackEnabled 报告按键触发声光反馈是否开启：字段缺省视为开启。
+func (config GPIOConfig) FeedbackEnabled() bool {
+	return config.Feedback == nil || *config.Feedback
+}
+
 func gpioBoolPointer(value bool) *bool { return &value }
+
+// gpioFeedbackEnabled 读取配置里的按键声光反馈开关。配置读不出来时按默认（开启）
+// 处理——这只是反馈音，不该因为读不到配置就静默失效。
+func (m *Manager) gpioFeedbackEnabled() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cfg, err := m.loadConfigLocked()
+	if err != nil {
+		return true
+	}
+	return cfg.GPIO.FeedbackEnabled()
+}
 
 type GPIOButtonStatus struct {
 	ID         string `json:"id"`
@@ -197,6 +217,7 @@ func DefaultGPIOConfig() GPIOConfig {
 	config := GPIOConfig{Version: gpioConfigVersion, Enabled: true}
 	config.Migrations = []string{gpioDefaultsMigrationRefreshSDCard}
 	config.StorageNotify = gpioBoolPointer(true)
+	config.Feedback = gpioBoolPointer(true)
 	for _, spec := range gpioButtonSpecs {
 		short := defaultGPIOShortActions[spec.ID]
 		if short == "" {
@@ -299,7 +320,7 @@ func gpioContainsString(values []string, target string) bool {
 // 保存过的脚本被删掉、关掉的提示音被重开。
 func gpioConfigLooksUnconfigured(config GPIOConfig) bool {
 	if config.Enabled || len(config.Migrations) > 0 || len(config.Scripts) > 0 ||
-		config.StorageNotify != nil ||
+		config.StorageNotify != nil || config.Feedback != nil ||
 		len(config.Backups) > 0 || len(config.Autos) > 0 || len(config.AutoVolumes) > 0 {
 		return false
 	}
@@ -324,6 +345,10 @@ func preserveGPIOUserData(next, previous GPIOConfig) GPIOConfig {
 	if previous.StorageNotify != nil {
 		notify := *previous.StorageNotify
 		next.StorageNotify = &notify
+	}
+	if previous.Feedback != nil {
+		feedback := *previous.Feedback
+		next.Feedback = &feedback
 	}
 	return next
 }

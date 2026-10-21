@@ -77,6 +77,7 @@ func TestNormalizeConfigUpgradesUntouchedGPIOConfig(t *testing.T) {
 	config.GPIO.Enabled = false
 	config.GPIO.Migrations = nil
 	config.GPIO.StorageNotify = nil
+	config.GPIO.Feedback = nil
 	for index := range config.GPIO.Buttons {
 		config.GPIO.Buttons[index].Actions = GPIOActions{}
 	}

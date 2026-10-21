@@ -10,6 +10,9 @@ func (m *Manager) PlayGPIOFeedback(event GPIOEvent) error {
 	if !event.IsFeedback() {
 		return nil
 	}
+	if !m.gpioFeedbackEnabled() {
+		return nil
+	}
 	return fmt.Errorf("%w: PC speaker and /dev/port feedback require linux/amd64", ErrGPIOFeedbackUnavailable)
 }
 

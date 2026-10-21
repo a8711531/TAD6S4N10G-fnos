@@ -2964,6 +2964,8 @@ function fillGPIOInputs(gpio = {}) {
   $('gpio-enabled').checked = Boolean(gpio.enabled);
   // 提示音开关缺省为开：老配置里没有这个字段，不能因此显示成关闭。
   $('gpio-storage-notify').checked = gpio.storage_notify !== false;
+  // 按键声光反馈开关缺省为开：老配置里没有这个字段，不能因此显示成关闭。
+  $('gpio-feedback').checked = gpio.feedback !== false;
   gpioMigrations = Array.isArray(gpio.migrations) ? gpio.migrations.map(String) : [];
   gpioScripts = Array.isArray(gpio.scripts)
     ? gpio.scripts.map((script) => ({ id: String(script.id), name: String(script.name), body: String(script.body) }))
@@ -3020,6 +3022,7 @@ function gpioConfigFromInputs() {
     version: 1,
     enabled: $('gpio-enabled').checked,
     storage_notify: $('gpio-storage-notify').checked,
+    feedback: $('gpio-feedback').checked,
     migrations: [...gpioMigrations],
     scripts: gpioScripts.map((script) => ({ ...script })),
     backups: gpioBackups.map((job) => ({ ...job })),

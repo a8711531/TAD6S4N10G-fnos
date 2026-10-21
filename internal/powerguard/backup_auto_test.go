@@ -909,6 +909,7 @@ func TestGPIOConfigLooksUnconfiguredRespectsAutos(t *testing.T) {
 	// 旧版本的默认值里没有迁移标记与提示音字段，去掉才等于「从未配置过」。
 	config.Migrations = nil
 	config.StorageNotify = nil
+	config.Feedback = nil
 	for index := range config.Buttons {
 		config.Buttons[index].Actions = GPIOActions{}
 	}

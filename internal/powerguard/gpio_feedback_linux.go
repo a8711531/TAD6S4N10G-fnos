@@ -79,6 +79,9 @@ func (m *Manager) PlayGPIOFeedback(event GPIOEvent) error {
 	if !event.IsFeedback() {
 		return nil
 	}
+	if !m.gpioFeedbackEnabled() {
+		return nil
+	}
 	gpioFeedbackMu.Lock()
 	defer gpioFeedbackMu.Unlock()
 	// portIOMu 不在这里整段持有: 蜂鸣走 /dev/input、闪烁间隔是 200ms sleep,
