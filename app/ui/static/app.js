@@ -695,7 +695,7 @@ function renderDiagnostics(status, fanStatus) {
 }
 
 // 「关停」档下 0 转是设置出来的结果，不是接线/驱动故障：文案要说明白并催用户尽快退出
-const FAN_OFF_RPM_NOTICE = '因为设置曲线模式为关停，风扇转速反馈为 0 RPM。该模式优先级最高：达到紧急温度也不会自动起转，超过阈值时只会蜂鸣报警。请尽快取消此模式以免损坏硬件。';
+const FAN_OFF_RPM_NOTICE = '因为设置曲线模式为关停，风扇转速反馈为 0 RPM。该模式优先级最高：达到紧急温度也不会自动起转，超过阈值时只会蜂鸣报警；最长 5 分钟后会自动恢复原曲线并起转。请尽快取消此模式以免损坏硬件。';
 
 // 后端 status 里带 off_mode；老状态没这个字段时退回读配置，两种来源都认
 function fanOffModeActive(fanStatus = {}) {

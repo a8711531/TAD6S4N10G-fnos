@@ -2056,7 +2056,7 @@ test('曲线模式：全速一次确认拉满 100%，关停必须两次确认才
   assert.equal(app.resolve('fanMinimumPWM')(), 0);
 });
 
-test('关停二次确认：明确「不会自动起转、只蜂鸣报警」，不再承诺超温满速兜底', async () => {
+test('关停二次确认：写明 5 分钟上限后自动恢复原曲线，超温仍只蜂鸣报警', async () => {
   const app = loadAppContext();
   app.element('fan-min').value = '40';
   app.element('fan-emergency').value = '85';
@@ -2066,7 +2066,8 @@ test('关停二次确认：明确「不会自动起转、只蜂鸣报警」，�
   await app.click('confirm-ok');
   await nextTick();
   const text = app.element('confirm-message').textContent;
-  assert.match(text, /不会自动起转/, '维修安全策略要在弹窗里说清楚');
+  assert.match(text, /5 分钟/, '关停有时长上限，必须在弹窗里写明');
+  assert.match(text, /自动恢复原选定曲线/, '到期要自动恢复用户原曲线，不能让人以为会永久停转');
   assert.match(text, /蜂鸣器/, '超温只蜂鸣报警，必须写明');
   assert.doesNotMatch(text, /自动满速|满速兜底/, '不能再承诺超温自动拉满');
   await app.click('confirm-cancel');
@@ -2181,7 +2182,7 @@ test('应用并保存风扇控制：预设弹窗的副按钮同样直接下发�
 
 test('关停档：0 转提示改成「因为设置曲线模式为关停」，不再往接线上带', () => {
   const app = loadAppContext();
-  const notice = '因为设置曲线模式为关停，风扇转速反馈为 0 RPM。该模式优先级最高：达到紧急温度也不会自动起转，超过阈值时只会蜂鸣报警。请尽快取消此模式以免损坏硬件。';
+  const notice = app.resolve('FAN_OFF_RPM_NOTICE');
   const stopped = { driver_detected: true, active: true, off_mode: true, fans: [{ id: 'it8613:fan1', rpm: 0, pwm_percent: 0 }] };
   const issues = app.resolve('healthIssues')({ supported: true }, stopped, {}, {}).join('\n');
   assert.match(issues, /因为设置曲线模式为关停，风扇转速反馈为 0 RPM/);
