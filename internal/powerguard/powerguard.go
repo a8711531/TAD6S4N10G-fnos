@@ -83,6 +83,9 @@ type Config struct {
 	// RemoteAliases 远程挂载的显示名（键为挂载点，如 /vol02/1000-1-xxx）。云盘友好名
 	// 尽力从挂载进程推断，拿不到就靠用户手动改名；见 backup.go 的 SetRemoteAlias。
 	RemoteAliases map[string]string `json:"remote_aliases,omitempty"`
+	// PowerSchedule 开关机计划（power_schedule.go）：定时关机由守护进程触发，
+	// 定时开机写进主板 RTC wakealarm。
+	PowerSchedule PowerScheduleConfig `json:"power_schedule"`
 }
 
 // UIPrefsConfig 纯界面偏好，与功能配置分开存放：历史/风扇等保存接口整段
@@ -333,6 +336,28 @@ type Manager struct {
 	// 读取器的运行状态，全部随 m.mu 保护。
 	serialKick    chan struct{}                 // 配置保存后通知监督者重新对账（容量 1，非阻塞）
 	serialReaders map[string]*serialReaderState // 在跑的读取器（键为设备路径，读取器退出时自行摘除）
+
+	// 固件升级（firmware.go）：任务状态与网卡探测缓存都在内存里，不落盘；
+	// 刷写任务同一时刻只允许一个，状态接口只读缓存、不执行外部命令。
+	firmwareMu       sync.Mutex
+	firmwareJob      firmwareJobState
+	firmwareNIC      firmwareNICInfo
+	firmwareExec     firmwareCommandRunner // 测试注入，nil 时执行真实命令
+	firmwareFlint    string                // 测试注入的 flint 路径，空则按 PATH/常见路径查找
+	firmwareMST      string                // 测试注入的 mst 路径，空则按 PATH/常见路径查找
+	firmwareFlashrom string                // 测试注入的 flashrom 路径，空则按 PATH/常见路径查找
+	biosOnline       biosOnlineCache       // BIOS 在线检查的缓存（bios_online.go），随 firmwareMu 保护
+
+	// 压力测试（stress.go）：CPU/内存工作协程与采样状态，全部在内存中。
+	stressMu sync.Mutex
+	stress   stressState
+
+	// 开关机计划（power_schedule.go）：关机触发去重键（日期+时间，同一分钟
+	// 只触发一次），随 m.mu 保护。
+	powerScheduleFiredKey string
+	// powerScheduleTestUntil 测试唤醒的保护窗口：TestPowerSchedule 写入的
+	// 临时闹钟在窗口内不被 tick 的计划同步覆盖，给用户留出手动关机的时间。
+	powerScheduleTestUntil time.Time
 }
 
 // SetLogger 注入运行日志器（main 启动时调用）。

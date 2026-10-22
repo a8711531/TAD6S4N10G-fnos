@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>电源监控 - CRPS PMBus</title>
-<link rel="stylesheet" href="styles.css?v=202610210930">
+<link rel="stylesheet" href="styles.css?v=202610231200">
 </head>
 <body>
 <div class="app">
@@ -92,10 +92,6 @@
         <button id="gpio-save" class="export-btn">保存并应用</button>
         <span class="wiring-wrap">
           <button id="dl-log" class="export-btn">查看连线方法</button>
-          <span class="wiring-pop" id="wiring-pop">
-            <img src="wiring.jpg" alt="硬盘背板与主板 FPANEL 接线示意图">
-            <span class="wiring-note">此功能需要连接硬盘背板 PSDA 和 PSCL 信号到主板的 FPANEL 19PIN 和 20PIN（不分方向），连接好后点击“自动识别保存”即可启用电源监管功能。</span>
-          </span>
         </span>
       </div>
     </div>
@@ -126,6 +122,24 @@
   </div>
 </div>
 
-<script src="app.js?v=202610211130"></script>
+<div class="wiring-mask hidden" id="wiring-mask">
+  <div class="wiring-modal" role="dialog" aria-modal="true" aria-labelledby="wiring-title">
+    <div class="wiring-head">
+      <span id="wiring-title">连线方法</span>
+      <span class="wiring-tools">
+        <button id="wiring-zoom-out" class="export-btn" title="缩小">−</button>
+        <span class="wiring-zoom-label" id="wiring-zoom-label">100%</span>
+        <button id="wiring-zoom-in" class="export-btn" title="放大">＋</button>
+        <button id="wiring-close" class="export-btn wiring-close" title="关闭">✕</button>
+      </span>
+    </div>
+    <div class="wiring-body" id="wiring-body">
+      <img id="wiring-img" src="wiring.jpg" alt="硬盘背板与主板 FPANEL 接线示意图">
+    </div>
+    <div class="wiring-note">此功能需要连接硬盘背板 PSDA 和 PSCL 信号到主板的 FPANEL 19PIN 和 20PIN（不分方向），连接好后点击“自动识别保存”即可启用电源监管功能。</div>
+  </div>
+</div>
+
+<script src="app.js?v=202610231200"></script>
 </body>
 </html>

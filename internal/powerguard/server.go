@@ -1,6 +1,7 @@
 package powerguard
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -128,6 +129,21 @@ func (s *Server) ListenAndServe() error {
 	mux.HandleFunc("/api/fans/debug/calibrate", s.handleFansDebugCalibrate)
 	mux.HandleFunc("/api/apply", s.handleApply)
 	mux.HandleFunc("/api/restore", s.handleRestore)
+	mux.HandleFunc("/api/firmware", s.handleFirmwareStatus)
+	mux.HandleFunc("/api/firmware/fpt", s.handleFirmwareFPTUpload)
+	mux.HandleFunc("/api/firmware/bios/flash", s.handleFirmwareBIOSFlash)
+	mux.HandleFunc("/api/firmware/bios-online", s.handleBIOSOnlineStatus)
+	mux.HandleFunc("/api/firmware/bios-online/check", s.handleBIOSOnlineCheck)
+	mux.HandleFunc("/api/firmware/bios-online/flash", s.handleBIOSOnlineFlash)
+	mux.HandleFunc("/api/firmware/nic/check", s.handleFirmwareNICCheck)
+	mux.HandleFunc("/api/firmware/nic/flash", s.handleFirmwareNICFlash)
+	mux.HandleFunc("/api/stress", s.handleStressStatus)
+	mux.HandleFunc("/api/stress/start", s.handleStressStart)
+	mux.HandleFunc("/api/stress/stop", s.handleStressStop)
+	mux.HandleFunc("/api/power-schedule", s.handlePowerScheduleStatus)
+	mux.HandleFunc("/api/power-schedule/config", s.handlePowerScheduleConfig)
+	mux.HandleFunc("/api/power-schedule/apply", s.handlePowerScheduleApply)
+	mux.HandleFunc("/api/power-schedule/test", s.handlePowerScheduleTest)
 	if s.Crps != nil {
 		// CRPS 板块: handler 内部把 /api/crps/<ep> 改写为板块原路由 /api/<ep>
 		mux.Handle("/api/crps/", s.Crps)
@@ -1117,4 +1133,337 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+// handleFirmwareStatus 返回缓存的固件状态（含任务日志）；轮询不会触发外部命令。
+func (s *Server) handleFirmwareStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.FirmwareStatus())
+}
+
+// handleFirmwareFPTUpload 保存 Linux 版 FPT 可执行文件（multipart 字段 fpt）。
+func (s *Server) handleFirmwareFPTUpload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "仅管理员可以上传固件工具")
+		return
+	}
+	data, err := readMultipartFile(w, r, "fpt", firmwareToolMaxBytes)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.Manager.SaveFPTBinary(data); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.FirmwareStatus())
+}
+
+// handleFirmwareBIOSFlash 执行 BIOS 刷写；必须提交 confirm=FLASH 与 image 文件。
+func (s *Server) handleFirmwareBIOSFlash(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "仅管理员可以刷写 BIOS")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, firmwareImageMaxBytes+(2<<20))
+	if err := r.ParseMultipartForm(firmwareImageMaxBytes); err != nil {
+		writeError(w, http.StatusBadRequest, "解析上传内容失败: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(r.FormValue("confirm")) != "FLASH" {
+		writeError(w, http.StatusBadRequest, "缺少刷写确认")
+		return
+	}
+	file, _, err := r.FormFile("image")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "请选择 BIOS 镜像文件")
+		return
+	}
+	defer func() { _ = file.Close() }()
+	image, err := io.ReadAll(io.LimitReader(file, firmwareImageMaxBytes+1))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "读取 BIOS 镜像失败: "+err.Error())
+		return
+	}
+	if int64(len(image)) > firmwareImageMaxBytes {
+		writeError(w, http.StatusBadRequest, "BIOS 镜像超过 64 MB 上限")
+		return
+	}
+	if err := s.Manager.StartBIOSFlash(image); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, errFirmwareBusy) {
+			status = http.StatusConflict
+		}
+		writeError(w, status, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.FirmwareStatus())
+}
+
+// handleFirmwareNICCheck 主动探测网卡与 MFT 状态（可能执行 lspci/flint）。
+func (s *Server) handleFirmwareNICCheck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "仅管理员可以检测网卡")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	defer cancel()
+	writeJSON(w, http.StatusOK, s.Manager.RefreshFirmwareStatus(ctx))
+}
+
+// handleFirmwareNICFlash 刷写网卡固件；confirm=UPGRADE，可选 firmware 文件覆盖内置版本。
+func (s *Server) handleFirmwareNICFlash(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "仅管理员可以刷写网卡固件")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, firmwareImageMaxBytes+(2<<20))
+	if err := r.ParseMultipartForm(firmwareImageMaxBytes); err != nil {
+		writeError(w, http.StatusBadRequest, "解析上传内容失败: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(r.FormValue("confirm")) != "UPGRADE" {
+		writeError(w, http.StatusBadRequest, "缺少升级确认")
+		return
+	}
+	var firmware []byte
+	file, _, err := r.FormFile("firmware")
+	switch {
+	case err == nil:
+		defer func() { _ = file.Close() }()
+		firmware, err = io.ReadAll(io.LimitReader(file, firmwareImageMaxBytes+1))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "读取网卡固件失败: "+err.Error())
+			return
+		}
+		if int64(len(firmware)) > firmwareImageMaxBytes {
+			writeError(w, http.StatusBadRequest, "网卡固件超过 64 MB 上限")
+			return
+		}
+	case errors.Is(err, http.ErrMissingFile):
+		firmware = nil // 未上传则使用内置下载地址
+	default:
+		writeError(w, http.StatusBadRequest, "读取上传文件失败: "+err.Error())
+		return
+	}
+	if err := s.Manager.StartNICFlash(firmware); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, errFirmwareBusy) {
+			status = http.StatusConflict
+		}
+		writeError(w, status, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.FirmwareStatus())
+}
+
+// handleBIOSOnlineStatus 返回缓存的 BIOS 在线检查结果（不触发网络请求）。
+func (s *Server) handleBIOSOnlineStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.BIOSOnline())
+}
+
+// handleBIOSOnlineCheck 拉取 zip.txt 索引并读取当前 flash $FID，判定是否有新版 BIOS。
+func (s *Server) handleBIOSOnlineCheck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "仅管理员可以检查 BIOS 更新")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Minute)
+	defer cancel()
+	writeJSON(w, http.StatusOK, s.Manager.CheckBIOSOnline(ctx))
+}
+
+// handleBIOSOnlineFlash 按检查结果在线下载并刷写 BIOS；confirm=FLASH。
+func (s *Server) handleBIOSOnlineFlash(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "仅管理员可以刷写 BIOS")
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		writeError(w, http.StatusBadRequest, "解析请求失败: "+err.Error())
+		return
+	}
+	if strings.TrimSpace(r.FormValue("confirm")) != "FLASH" {
+		writeError(w, http.StatusBadRequest, "缺少刷写确认")
+		return
+	}
+	if err := s.Manager.StartBIOSOnlineFlash(); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, errFirmwareBusy) {
+			status = http.StatusConflict
+		}
+		writeError(w, status, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.FirmwareStatus())
+}
+
+// handleStressStatus 返回压力测试实时指标。
+func (s *Server) handleStressStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.StressStatus())
+}
+
+// handleStressStart 启动压力测试；CPU、内存与 GPU 均由后端施压。
+func (s *Server) handleStressStart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "仅管理员可以启动压力测试")
+		return
+	}
+	var options StressOptions
+	decoder := json.NewDecoder(io.LimitReader(r.Body, 64<<10))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&options); err != nil {
+		writeError(w, http.StatusBadRequest, "解析参数失败: "+err.Error())
+		return
+	}
+	if err := s.Manager.StartStress(options); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.StressStatus())
+}
+
+// handleStressStop 停止压力测试。
+func (s *Server) handleStressStop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "仅管理员可以停止压力测试")
+		return
+	}
+	if err := s.Manager.StopStress(); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.StressStatus())
+}
+
+// handlePowerScheduleStatus 返回开关机计划状态（计划列表、统计、RTC 信息）。
+func (s *Server) handlePowerScheduleStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		methodNotAllowed(w)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.PowerScheduleStatus())
+}
+
+// handlePowerScheduleConfig 保存开关机计划列表，并立即同步 RTC 唤醒。
+func (s *Server) handlePowerScheduleConfig(w http.ResponseWriter, r *http.Request) {
+	if !s.authorizeConfigRequest(w, r) {
+		return
+	}
+	var cfg PowerScheduleConfig
+	if err := decodeConfigRequest(r, &cfg); err != nil {
+		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
+		return
+	}
+	if err := s.Manager.SavePowerScheduleConfig(cfg); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.PowerScheduleStatus())
+}
+
+// handlePowerScheduleApply 立即把下次开机计划写进 RTC（界面「应用计划」按钮）。
+func (s *Server) handlePowerScheduleApply(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "仅管理员可以应用开关机计划")
+		return
+	}
+	status, err := s.Manager.ApplyPowerSchedule()
+	if err != nil {
+		writeJSON(w, http.StatusConflict, status)
+		return
+	}
+	writeJSON(w, http.StatusOK, status)
+}
+
+// handlePowerScheduleTest 写入一个 N 分钟后的测试唤醒，用于验证主板定时开机。
+func (s *Server) handlePowerScheduleTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "仅管理员可以测试开机计划")
+		return
+	}
+	var body struct {
+		Minutes int `json:"minutes"`
+	}
+	if err := decodeConfigRequest(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, "配置格式错误: "+err.Error())
+		return
+	}
+	at, err := s.Manager.TestPowerSchedule(body.Minutes)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"wake_at": at.Format("2006-01-02 15:04:05")})
+}
+
+func readMultipartFile(w http.ResponseWriter, r *http.Request, field string, limit int64) ([]byte, error) {
+	r.Body = http.MaxBytesReader(w, r.Body, limit+(1<<20))
+	if err := r.ParseMultipartForm(limit); err != nil {
+		return nil, fmt.Errorf("解析上传内容失败: %w", err)
+	}
+	file, _, err := r.FormFile(field)
+	if err != nil {
+		return nil, errors.New("缺少上传文件")
+	}
+	defer func() { _ = file.Close() }()
+	data, err := io.ReadAll(io.LimitReader(file, limit+1))
+	if err != nil {
+		return nil, fmt.Errorf("读取上传文件失败: %w", err)
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("文件超过 %d MB 上限", limit>>20)
+	}
+	return data, nil
 }

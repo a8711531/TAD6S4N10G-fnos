@@ -2778,6 +2778,660 @@ async function refreshBackupStatus() {
   }
 }
 
+// ---- 固件升级：BIOS（Intel FPT）与网卡（Mellanox MFT） ----
+// 刷写是后台任务，页面只轮询 api/firmware 拿任务步骤与日志；GET 返回缓存，
+// 不会反复触发 lspci/flint 等外部命令。
+const FIRMWARE_POLL_MS = 2000;
+const STRESS_POLL_MS = 1000;
+const NIC_TARGET_FW = '14.32.1900';
+let firmwarePollTimer = null;
+let stressPollTimer = null;
+
+async function postForm(path, formData) {
+  // multipart 不能手动设 Content-Type：浏览器需要自己带 boundary
+  const response = await fetch(baseUrl(path), { method: 'POST', cache: 'no-store', body: formData });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
+  return body;
+}
+
+function firmwareFile(inputID) {
+  const input = $(inputID);
+  const files = input && input.files;
+  return files && files.length ? files[0] : null;
+}
+
+function firmwareLogText(job) {
+  const logs = job && Array.isArray(job.logs) ? job.logs : [];
+  return logs.length ? logs.join('\n') : '等待操作…';
+}
+
+function showFirmwareLog(kind, message, error = false) {
+  const target = $(kind === 'nic' ? 'firmware-nic-log' : 'firmware-bios-log');
+  if (!target) return;
+  target.textContent = message;
+  target.className = `firmware-log${error ? ' error' : ''}`;
+}
+
+function showFirmwareHint(message, error = false) {
+  const hint = $('firmware-nic-hint');
+  if (!hint) return;
+  hint.textContent = message;
+  hint.className = `inline-status${error ? ' error' : ''}`;
+}
+
+function renderFirmwareJob(job) {
+  if (!job) return;
+  const target = $(job.kind === 'nic' ? 'firmware-nic-log' : 'firmware-bios-log');
+  if (!target) return;
+  const state = job.state || 'idle';
+  target.textContent = firmwareLogText(job);
+  target.className = `firmware-log${state === 'success' ? ' success' : state === 'failed' ? ' error' : ''}`;
+  const running = state === 'running';
+  ['firmware-fpt-upload', 'firmware-bios-flash', 'firmware-nic-check', 'firmware-nic-flash', 'bios-online-check'].forEach((id) => {
+    const button = $(id);
+    if (button) button.disabled = running;
+  });
+  if (running) {
+    const onlineFlash = $('bios-online-flash');
+    if (onlineFlash) onlineFlash.disabled = true;
+  } else {
+    updateBIOSOnlineFlashButton();
+  }
+}
+
+function renderFirmwareStatus(status) {
+  if (!status) return;
+  const fpt = status.fpt || {};
+  const flashrom = status.flashrom || {};
+  const badge = $('firmware-tool-badge');
+  if (badge) {
+    if (flashrom.present) {
+      badge.textContent = 'flashrom 可用';
+      badge.className = 'inline-status';
+      badge.title = flashrom.path || 'flashrom';
+    } else if (fpt.present && fpt.builtin) {
+      badge.textContent = 'FPT 内置';
+      badge.className = 'inline-status';
+      badge.title = [fpt.path, fpt.size ? formatByteSize(fpt.size) : ''].filter(Boolean).join(' · ');
+    } else if (fpt.present) {
+      badge.textContent = '自定义 FPT';
+      badge.className = 'inline-status';
+      badge.title = [fpt.path, fpt.size ? formatByteSize(fpt.size) : '', fpt.uploaded_at ? formatClock(fpt.uploaded_at) : '']
+        .filter(Boolean).join(' · ');
+    } else {
+      badge.textContent = '刷写工具缺失';
+      badge.className = 'inline-status error';
+      badge.title = '未找到 flashrom，也未上传 Linux 版 FPT';
+    }
+  }
+  const nic = status.nic || {};
+  const setText = (id, value) => {
+    const node = $(id);
+    if (node) node.textContent = value || '—';
+  };
+  setText('firmware-nic-model', nic.model);
+  setText('firmware-nic-pci', nic.pci_address);
+  setText('firmware-nic-fw', nic.fw_version);
+  setText('firmware-nic-psid', nic.psid);
+  setText('firmware-nic-mft', nic.mft_installed ? '已安装' : '未安装（升级时自动安装）');
+  setText('firmware-nic-target', nic.target_fw || NIC_TARGET_FW);
+  if (nic.error) showFirmwareHint(`检测失败：${nic.error}`, true);
+  else if (nic.present) {
+    const hint = $('firmware-nic-hint');
+    if (hint) {
+      hint.textContent = `已检测到 ${nic.model || 'Mellanox 网卡'}，当前固件 ${nic.fw_version || '未知'}，可开始升级。`;
+      hint.className = 'inline-status';
+    }
+  } else showFirmwareHint('尚未检测到 Mellanox 网卡，请点击「检测网卡」。');
+  renderFirmwareJob(status.job);
+}
+
+async function refreshFirmwareStatus(showError = false) {
+  try {
+    renderFirmwareStatus(await request('api/firmware'));
+  } catch (error) {
+    if (showError) showFirmwareHint(`读取固件状态失败：${error.message}`, true);
+  }
+}
+
+function startFirmwarePoll() {
+  if (firmwarePollTimer) return;
+  firmwarePollTimer = setInterval(() => refreshFirmwareStatus(), FIRMWARE_POLL_MS);
+}
+
+function stopFirmwarePoll() {
+  if (!firmwarePollTimer) return;
+  clearInterval(firmwarePollTimer);
+  firmwarePollTimer = null;
+}
+
+async function uploadFPT() {
+  const file = firmwareFile('firmware-fpt-file');
+  if (!file) {
+    showFirmwareLog('bios', '请先选择 FPT 文件（Linux 版 fpt 可执行文件）。', true);
+    return;
+  }
+  const button = $('firmware-fpt-upload');
+  if (button) {
+    button.disabled = true;
+    button.textContent = '上传中…';
+  }
+  try {
+    const form = new FormData();
+    form.append('fpt', file);
+    renderFirmwareStatus(await postForm('api/firmware/fpt', form));
+    showFirmwareLog('bios', 'FPT 已上传，可以开始刷写 BIOS。');
+  } catch (error) {
+    showFirmwareLog('bios', `FPT 上传失败：${error.message}`, true);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = '上传 FPT';
+    }
+  }
+}
+
+async function flashBIOS() {
+  if (!$('firmware-bios-confirm').checked) {
+    showFirmwareLog('bios', '请先勾选「我已备份 BIOS」确认项。', true);
+    return;
+  }
+  const file = firmwareFile('firmware-bios-file');
+  if (!file) {
+    showFirmwareLog('bios', '请先选择 BIOS 镜像文件。', true);
+    return;
+  }
+  const button = $('firmware-bios-flash');
+  if (button) button.disabled = true;
+  try {
+    const form = new FormData();
+    form.append('confirm', 'FLASH');
+    form.append('image', file);
+    renderFirmwareStatus(await postForm('api/firmware/bios/flash', form));
+    startFirmwarePoll();
+  } catch (error) {
+    showFirmwareLog('bios', `刷写启动失败：${error.message}`, true);
+    if (button) button.disabled = false;
+  }
+}
+
+async function checkNIC() {
+  const button = $('firmware-nic-check');
+  if (button) {
+    button.disabled = true;
+    button.textContent = '检测中…';
+  }
+  showFirmwareHint('正在检测网卡与 MFT 工具…');
+  try {
+    renderFirmwareStatus(await request('api/firmware/nic/check', { method: 'POST' }));
+  } catch (error) {
+    showFirmwareHint(`检测失败：${error.message}`, true);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = '检测网卡';
+    }
+  }
+}
+
+async function flashNIC() {
+  if (!$('firmware-nic-confirm').checked) {
+    showFirmwareLog('nic', '请先勾选网卡型号与断电要求确认项。', true);
+    return;
+  }
+  const button = $('firmware-nic-flash');
+  if (button) button.disabled = true;
+  try {
+    const form = new FormData();
+    form.append('confirm', 'UPGRADE');
+    renderFirmwareStatus(await postForm('api/firmware/nic/flash', form));
+    startFirmwarePoll();
+  } catch (error) {
+    showFirmwareLog('nic', `升级启动失败：${error.message}`, true);
+    if (button) button.disabled = false;
+  }
+}
+
+// ---- BIOS 在线升级：拉取云端 zip.txt 索引，严格同机型判定 ----
+let biosOnlineUpdateAvailable = false;
+
+function showBIOSOnlineHint(message, error = false) {
+  const hint = $('bios-online-hint');
+  if (!hint) return;
+  hint.textContent = message;
+  hint.className = `inline-status${error ? ' error' : ''}`;
+}
+
+function renderBIOSOnline(status) {
+  if (!status) return;
+  const setText = (id, value) => {
+    const node = $(id);
+    if (node) node.textContent = value || '—';
+  };
+  setText('bios-online-model', status.model);
+  const current = status.current_version
+    ? `${status.current_version}（${status.current_build_date || '日期未知'}）`
+    : status.current_error || '';
+  setText('bios-online-current', current);
+  const latest = status.candidate_version
+    ? `${status.candidate_version}（${status.candidate_build_date || '日期未知'}）`
+    : '';
+  setText('bios-online-latest', latest);
+  setText('bios-online-zip', status.candidate_zip);
+  const changelog = $('bios-online-changelog');
+  if (changelog) {
+    if (status.changelog) {
+      changelog.textContent = `更新日志（${status.candidate_zip || ''}）：\n${status.changelog}`;
+      changelog.hidden = false;
+    } else {
+      changelog.textContent = '';
+      changelog.hidden = true;
+    }
+  }
+  const badge = $('bios-online-badge');
+  const flashButton = $('bios-online-flash');
+  biosOnlineUpdateAvailable = Boolean(status.update_available);
+  if (status.error) {
+    if (badge) { badge.textContent = '检查失败'; badge.className = 'inline-status error'; }
+    showBIOSOnlineHint(status.error, true);
+  } else if (!status.candidate_zip) {
+    if (badge) { badge.textContent = '未检查'; badge.className = 'inline-status'; }
+  } else if (status.update_available) {
+    if (badge) { badge.textContent = '有新版本'; badge.className = 'inline-status success'; }
+    showBIOSOnlineHint(`发现新版本 ${status.candidate_version}（${status.candidate_build_date}），勾选确认后可下载刷写。`);
+  } else {
+    if (badge) { badge.textContent = '已是最新'; badge.className = 'inline-status'; }
+    showBIOSOnlineHint('当前 BIOS 已是最新，无需升级。');
+  }
+  updateBIOSOnlineFlashButton();
+}
+
+function updateBIOSOnlineFlashButton() {
+  const flashButton = $('bios-online-flash');
+  const confirmNode = $('bios-online-confirm');
+  if (!flashButton) return;
+  flashButton.disabled = !biosOnlineUpdateAvailable || !(confirmNode && confirmNode.checked);
+}
+
+async function checkBIOSOnline() {
+  const button = $('bios-online-check');
+  if (button) {
+    button.disabled = true;
+    button.textContent = '检查中…';
+  }
+  showBIOSOnlineHint('正在读取云端索引并用 flashrom 读取当前 BIOS 版本（约 10–30 秒）…');
+  try {
+    renderBIOSOnline(await request('api/firmware/bios-online/check', { method: 'POST' }));
+  } catch (error) {
+    showBIOSOnlineHint(`检查失败：${error.message}`, true);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = '检查更新';
+    }
+  }
+}
+
+async function flashBIOSOnline() {
+  if (!$('bios-online-confirm').checked) {
+    showBIOSOnlineHint('请先勾选「我已备份 BIOS」确认项。', true);
+    return;
+  }
+  const button = $('bios-online-flash');
+  if (button) button.disabled = true;
+  try {
+    const form = new FormData();
+    form.append('confirm', 'FLASH');
+    renderFirmwareStatus(await postForm('api/firmware/bios-online/flash', form));
+    startFirmwarePoll();
+    showBIOSOnlineHint('已开始下载并刷写，进度见下方「BIOS 升级（flashrom）」日志。');
+  } catch (error) {
+    showBIOSOnlineHint(`刷写启动失败：${error.message}`, true);
+    updateBIOSOnlineFlashButton();
+  }
+}
+
+// ---- 开关机计划：定时关机由后端触发，定时开机写主板 RTC wakealarm ----
+let powerScheduleEntries = [];
+let powerScheduleSelected = -1; // 表格选中行；-1 = 无选中
+let powerScheduleEditing = -1;  // 编辑器正在编辑的行；-1 = 新增
+
+const SCHEDULE_DAYS_LABEL = { weekday: '平日', weekend: '假日', daily: '每天' };
+
+function showScheduleHint(message, error = false) {
+  const hint = $('schedule-hint');
+  if (!hint) return;
+  hint.textContent = message;
+  hint.className = `inline-status${error ? ' error' : ''}`;
+}
+
+function updateScheduleToolbar() {
+  const has = powerScheduleSelected >= 0 && powerScheduleSelected < powerScheduleEntries.length;
+  const entry = has ? powerScheduleEntries[powerScheduleSelected] : null;
+  $('schedule-edit').disabled = !has;
+  $('schedule-delete').disabled = !has;
+  $('schedule-enable').disabled = !has || entry.enabled;
+  $('schedule-disable').disabled = !has || !entry.enabled;
+}
+
+function renderPowerSchedule(status) {
+  if (!status) return;
+  powerScheduleEntries = status.entries || [];
+  if (powerScheduleSelected >= powerScheduleEntries.length) powerScheduleSelected = -1;
+  $('schedule-total').textContent = String(status.total ?? powerScheduleEntries.length);
+  $('schedule-enabled').textContent = String(status.enabled_count ?? 0);
+  $('schedule-next').textContent = status.next_trigger || '—';
+  const trs = powerScheduleEntries.map((entry, index) => {
+    const tr = document.createElement('tr');
+    if (index === powerScheduleSelected) tr.classList.add('selected');
+    const enableTd = document.createElement('td');
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = entry.enabled;
+    checkbox.setAttribute('aria-label', `${SCHEDULE_DAYS_LABEL[entry.days] || entry.days} ${entry.time} 启用开关`);
+    checkbox.addEventListener('click', (event) => event.stopPropagation());
+    checkbox.addEventListener('change', () => {
+      powerScheduleEntries[index].enabled = checkbox.checked;
+      savePowerSchedule();
+    });
+    enableTd.appendChild(checkbox);
+    tr.appendChild(enableTd);
+    const timeTd = document.createElement('td');
+    timeTd.textContent = `${SCHEDULE_DAYS_LABEL[entry.days] || entry.days} ${entry.time}`;
+    tr.appendChild(timeTd);
+    const actionTd = document.createElement('td');
+    actionTd.textContent = entry.action === 'poweron' ? '开机' : '关机';
+    tr.appendChild(actionTd);
+    const statusTd = document.createElement('td');
+    const badge = document.createElement('span');
+    badge.className = `schedule-status ${entry.enabled ? 'on' : 'off'}`;
+    badge.textContent = entry.enabled ? '已启用' : '已停用';
+    statusTd.appendChild(badge);
+    tr.appendChild(statusTd);
+    tr.addEventListener('click', () => {
+      powerScheduleSelected = index;
+      const rows = $('schedule-rows');
+      rows.querySelectorAll('tr').forEach((row, rowIndex) => row.classList.toggle('selected', rowIndex === index));
+      updateScheduleToolbar();
+    });
+    return tr;
+  });
+  $('schedule-rows').replaceChildren(...trs);
+  $('schedule-empty').hidden = powerScheduleEntries.length > 0;
+  // 页脚对齐参考界面：RTC · alarm_IRQ · 服务 · 计划写入
+  $('schedule-footer').textContent = [
+    `RTC: ${status.rtc_time || '读取失败'}`,
+    `alarm_IRQ: ${status.rtc_alarm_irq || '未知'}`,
+    '服务: enabled',
+    `计划写入: ${status.applied ? '是' : '否'}`,
+  ].join(' · ');
+  updateScheduleToolbar();
+  if (status.error) showScheduleHint(status.error, true);
+}
+
+async function loadPowerSchedule() {
+  try {
+    renderPowerSchedule(await request('api/power-schedule'));
+  } catch (error) {
+    showScheduleHint(`读取计划失败：${error.message}`, true);
+  }
+}
+
+async function savePowerSchedule() {
+  try {
+    const status = await request('api/power-schedule/config', {
+      method: 'POST',
+      body: JSON.stringify({ entries: powerScheduleEntries }),
+    });
+    renderPowerSchedule(status);
+    // RTC 缺失时保存仍成功（仅不能写唤醒）：不能把错误提示覆盖成「已同步到 RTC」
+    if (status.error) showScheduleHint(`计划已保存，但${status.error}`, true);
+    else showScheduleHint('计划已保存，开机时刻已同步到 RTC。');
+  } catch (error) {
+    showScheduleHint(`保存失败：${error.message}`, true);
+    loadPowerSchedule(); // 回滚到服务端状态，避免界面与服务端不一致
+  }
+}
+
+function openScheduleEditor(index) {
+  powerScheduleEditing = index;
+  const entry = index >= 0 ? powerScheduleEntries[index] : { days: 'weekday', time: '10:00', action: 'poweron' };
+  $('schedule-editor-title').textContent = index >= 0 ? '编辑计划' : '新增计划';
+  $('schedule-editor-days').value = entry.days;
+  $('schedule-editor-time').value = entry.time;
+  $('schedule-editor-action').value = entry.action;
+  $('schedule-editor').hidden = false;
+}
+
+function closeScheduleEditor() {
+  $('schedule-editor').hidden = true;
+}
+
+function submitScheduleEditor() {
+  const time = $('schedule-editor-time').value;
+  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(time)) {
+    showScheduleHint('时间格式无效，请选择正确的触发时间。', true);
+    return;
+  }
+  const entry = {
+    enabled: powerScheduleEditing >= 0 ? powerScheduleEntries[powerScheduleEditing].enabled : true,
+    days: $('schedule-editor-days').value,
+    time,
+    action: $('schedule-editor-action').value,
+  };
+  if (powerScheduleEditing >= 0) powerScheduleEntries[powerScheduleEditing] = entry;
+  else powerScheduleEntries.push(entry);
+  closeScheduleEditor();
+  savePowerSchedule();
+}
+
+// 工具栏「启用/停用」：切换选中行的 enabled 并保存
+async function setPowerScheduleEnabled(enabled) {
+  if (powerScheduleSelected < 0 || powerScheduleSelected >= powerScheduleEntries.length) return;
+  powerScheduleEntries[powerScheduleSelected].enabled = enabled;
+  savePowerSchedule();
+}
+
+async function deletePowerSchedule() {
+  if (powerScheduleSelected < 0 || powerScheduleSelected >= powerScheduleEntries.length) return;
+  const entry = powerScheduleEntries[powerScheduleSelected];
+  const ok = await showAppConfirm({
+    title: '删除计划',
+    message: `确定删除「${SCHEDULE_DAYS_LABEL[entry.days] || entry.days} ${entry.time} ${entry.action === 'poweron' ? '开机' : '关机'}」这条计划吗？`,
+    confirmText: '删除',
+    danger: true,
+  });
+  if (ok !== true) return;
+  powerScheduleEntries.splice(powerScheduleSelected, 1);
+  powerScheduleSelected = -1;
+  savePowerSchedule();
+}
+
+async function applyPowerSchedule() {
+  try {
+    renderPowerSchedule(await request('api/power-schedule/apply', { method: 'POST' }));
+    showScheduleHint('已把下次开机时刻写入 RTC。');
+  } catch (error) {
+    showScheduleHint(`应用失败：${error.message}`, true);
+  }
+}
+
+async function testPowerSchedule() {
+  const ok = await showAppConfirm({
+    title: '测试开机计划',
+    message: '将写入 3 分钟后的 RTC 唤醒闹钟。请随后手动关机，观察机器是否自动上电。测试闹钟在保护窗口内不会被计划同步覆盖，过期后自动恢复。',
+    confirmText: '写入测试闹钟',
+  });
+  if (ok !== true) return;
+  try {
+    const result = await request('api/power-schedule/test', { method: 'POST', body: JSON.stringify({ minutes: 3 }) });
+    showScheduleHint(`测试闹钟已写入：${result.wake_at}（RTC UTC）。请手动关机验证自动开机。`);
+  } catch (error) {
+    showScheduleHint(`测试闹钟写入失败：${error.message}`, true);
+  }
+}
+
+// ---- 压力测试：CPU / 内存 / GPU 全部由后端施压 ----
+function stressOptionsFromForm() {
+  const cpu = Boolean($('stress-cpu').checked);
+  const gpu = Boolean($('stress-gpu').checked);
+  const memory = Boolean($('stress-memory').checked);
+  if (!cpu && !gpu && !memory) return null;
+  const permanentNode = $('stress-permanent');
+  const permanent = Boolean(permanentNode && permanentNode.checked);
+  const durationValue = Number($('stress-duration').value);
+  const memoryValue = Number($('stress-memory-mb').value);
+  // 0 表示永久测试，由后端一直运行到用户点击停止。
+  const duration = permanent
+    ? 0
+    : Math.min(3600, Math.max(10, Number.isFinite(durationValue) && durationValue > 0 ? Math.round(durationValue) : 300));
+  const memoryMB = Math.max(64, Number.isFinite(memoryValue) && memoryValue > 0 ? Math.round(memoryValue) : 512);
+  return { cpu, gpu, memory, duration_seconds: duration, memory_mb: memoryMB };
+}
+
+function stressParts(options) {
+  const parts = [];
+  if (!options) return parts;
+  if (options.cpu) parts.push('CPU');
+  if (options.memory) parts.push('内存');
+  if (options.gpu) parts.push('GPU');
+  return parts;
+}
+
+function renderStressStatus(status) {
+  if (!status) return;
+  const options = status.options || {};
+  const running = Boolean(status.running);
+  const parts = stressParts(options);
+  const permanent = (options.duration_seconds || 0) === 0;
+  const text = $('stress-status-text');
+  if (text) {
+    if (status.error) {
+      text.textContent = `压测异常：${status.error}`;
+      text.className = 'message error';
+    } else if (running) {
+      if (permanent) {
+        text.textContent = `压测进行中（${parts.join(' + ')}），永久运行，点击「停止」结束`;
+      } else {
+        const remaining = Math.max(0, (options.duration_seconds || 0) - (status.elapsed_seconds || 0));
+        text.textContent = `压测进行中（${parts.join(' + ')}），剩余 ${remaining} 秒`;
+      }
+      text.className = 'message';
+    } else if (parts.length) {
+      text.textContent = `已结束（用时 ${status.elapsed_seconds || 0} 秒）`;
+      text.className = 'message';
+    } else {
+      text.textContent = '未开始';
+      text.className = 'message';
+    }
+  }
+  const setText = (id, value) => {
+    const node = $(id);
+    if (node) node.textContent = value;
+  };
+  setText('stress-elapsed', status.elapsed_seconds ? formatDuration(status.elapsed_seconds * 1000) : '—');
+  setText('stress-cpu-percent', running ? `${Number(status.cpu_percent || 0).toFixed(1)}%` : '—');
+  setText('stress-memory-used', status.memory_total_bytes
+    ? `${formatByteSize(status.memory_used_bytes)} / ${formatByteSize(status.memory_total_bytes)}`
+    : '—');
+  const memoryNode = $('stress-memory-used');
+  if (memoryNode) memoryNode.title = status.memory_allocated_bytes ? `压测分配 ${formatByteSize(status.memory_allocated_bytes)}` : '';
+  setText('stress-load', running ? Number(status.load1 || 0).toFixed(2) : '—');
+  setText('stress-cpu-temp', running && status.cpu_temp_c ? `${Number(status.cpu_temp_c).toFixed(1)} °C` : '—');
+  setText('stress-gpu-freq', status.gpu_freq_mhz ? `${status.gpu_freq_mhz} MHz` : '—');
+  setText('stress-gpu-backend', status.gpu_backend === 'vaapi' ? 'VAAPI / ffmpeg' : '—');
+  const gpuHint = $('stress-gpu-hint');
+  if (gpuHint) {
+    if (status.gpu_error) {
+      gpuHint.textContent = `GPU 压测异常：${status.gpu_error}`;
+      gpuHint.className = 'inline-status error';
+    } else if (running && options.gpu) {
+      gpuHint.textContent = 'GPU 压测运行中：后端通过 VAAPI 占用核显。';
+      gpuHint.className = 'inline-status';
+    } else {
+      gpuHint.textContent = 'GPU 压测由后端通过 VAAPI 调用核显（需 root 权限）。';
+      gpuHint.className = 'inline-status';
+    }
+  }
+  const start = $('stress-start');
+  const stop = $('stress-stop');
+  if (start) start.disabled = running;
+  if (stop) stop.disabled = !running;
+  ['stress-cpu', 'stress-gpu', 'stress-memory', 'stress-permanent', 'stress-memory-mb'].forEach((id) => {
+    const node = $(id);
+    if (node) node.disabled = running;
+  });
+  const permanentNode = $('stress-permanent');
+  const durationNode = $('stress-duration');
+  if (durationNode) durationNode.disabled = running || Boolean(permanentNode && permanentNode.checked);
+}
+
+async function refreshStressStatus(showError = false) {
+  try {
+    renderStressStatus(await request('api/stress'));
+  } catch (error) {
+    if (showError) {
+      const text = $('stress-status-text');
+      if (text) {
+        text.textContent = `读取压测状态失败：${error.message}`;
+        text.className = 'message error';
+      }
+    }
+  }
+}
+
+function startStressPoll() {
+  if (stressPollTimer) return;
+  stressPollTimer = setInterval(() => refreshStressStatus(), STRESS_POLL_MS);
+}
+
+function stopStressPoll() {
+  if (!stressPollTimer) return;
+  clearInterval(stressPollTimer);
+  stressPollTimer = null;
+}
+
+async function startStressRun() {
+  const options = stressOptionsFromForm();
+  const text = $('stress-status-text');
+  if (!options) {
+    if (text) {
+      text.textContent = '请至少勾选 CPU、GPU、内存中的一项。';
+      text.className = 'message error';
+    }
+    return;
+  }
+  const button = $('stress-start');
+  if (button) button.disabled = true;
+  try {
+    renderStressStatus(await request('api/stress/start', { method: 'POST', body: JSON.stringify(options) }));
+    startStressPoll();
+  } catch (error) {
+    if (text) {
+      text.textContent = `启动失败：${error.message}`;
+      text.className = 'message error';
+    }
+    if (button) button.disabled = false;
+  }
+}
+
+async function stopStressRun() {
+  const button = $('stress-stop');
+  if (button) button.disabled = true;
+  try {
+    renderStressStatus(await request('api/stress/stop', { method: 'POST' }));
+  } catch (error) {
+    if (button) button.disabled = false;
+    const text = $('stress-status-text');
+    if (text) {
+      text.textContent = `停止失败：${error.message}`;
+      text.className = 'message error';
+    }
+  }
+}
+
+
 function activateTab(tabID, focus = false) {
   // CRPS 页 iframe 懒加载：首次切到该页才加载，避免常驻轮询耗电 API。
   // 加载后按内容高度自适应 iframe，页面内部不滚动，滚动交给主应用整页（滚动条直达底部）。
@@ -2822,10 +3476,17 @@ function activateTab(tabID, focus = false) {
   });
   if (tabID === 'tab-fan') requestAnimationFrame(() => { CURVE_KINDS.forEach(renderFanChart); fetchHistory(); renderHistoryChart(); if (fanDebugVisiblePref()) startFanDebugPoll(); });
   else stopFanDebugPoll(); // 离开风扇控制页即停轮询(调试卡片不在当前页)
+  // 固件/压测状态只在对应页轮询；压测任务本身在后端继续跑，GPU 着色器按剩余时长自动停止
+  if (tabID === 'tab-firmware') requestAnimationFrame(() => { refreshFirmwareStatus(); startFirmwarePoll(); });
+  else stopFirmwarePoll();
+  if (tabID === 'tab-stress') requestAnimationFrame(() => { refreshStressStatus(); startStressPoll(); });
+  else stopStressPoll();
   // 进按键映射页时刷新一次备份运行状态（备份是异步的，回来能看到结果）
   if (tabID === 'tab-gpio') requestAnimationFrame(refreshBackupStatus);
   // 调试页的传感器显示名列表靠历史数据发现传感器键，进页时刷新一次再渲染
   if (tabID === 'tab-debug') requestAnimationFrame(() => { fetchHistory().then(renderSensorNamesList); });
+  // 开关机计划页：进页拉一次状态（RTC/计划写入状态随时间变化）
+  if (tabID === 'tab-schedule') requestAnimationFrame(loadPowerSchedule);
 }
 
 function setupTabs() {
@@ -6920,6 +7581,34 @@ $('config-form').addEventListener('invalid', (event) => {
   if (tabID) activateTab(tabID);
 }, true);
 setupTabs();
+// 固件升级 / 压力测试
+$('firmware-fpt-upload').addEventListener('click', uploadFPT);
+$('firmware-bios-flash').addEventListener('click', flashBIOS);
+$('firmware-nic-check').addEventListener('click', checkNIC);
+$('firmware-nic-flash').addEventListener('click', flashNIC);
+$('bios-online-check').addEventListener('click', checkBIOSOnline);
+$('bios-online-flash').addEventListener('click', flashBIOSOnline);
+$('bios-online-confirm').addEventListener('change', updateBIOSOnlineFlashButton);
+// 开关机计划：工具栏 + 编辑器
+$('schedule-add').addEventListener('click', () => openScheduleEditor(-1));
+$('schedule-edit').addEventListener('click', () => openScheduleEditor(powerScheduleSelected));
+$('schedule-delete').addEventListener('click', deletePowerSchedule);
+$('schedule-enable').addEventListener('click', () => setPowerScheduleEnabled(true));
+$('schedule-disable').addEventListener('click', () => setPowerScheduleEnabled(false));
+$('schedule-apply').addEventListener('click', applyPowerSchedule);
+$('schedule-test').addEventListener('click', testPowerSchedule);
+$('schedule-editor-ok').addEventListener('click', submitScheduleEditor);
+$('schedule-editor-cancel').addEventListener('click', closeScheduleEditor);
+document.querySelectorAll('[data-schedule-close]').forEach((node) => {
+  node.addEventListener('click', closeScheduleEditor);
+});
+$('stress-start').addEventListener('click', startStressRun);
+$('stress-stop').addEventListener('click', stopStressRun);
+$('stress-permanent').addEventListener('change', () => {
+  const duration = $('stress-duration');
+  if (!duration) return;
+  duration.disabled = $('stress-permanent').checked || $('stress-start').disabled;
+});
 setupHistoryPanel();
 setupHealthTooltip();
 setupAppModal();

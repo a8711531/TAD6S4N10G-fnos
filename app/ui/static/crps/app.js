@@ -425,16 +425,47 @@
       });
   });
 
-  // ---- 查看连线方法(点击切换接线图弹层, 点弹层外关闭) ----
+  // ---- 查看连线方法(页面内模态弹窗: 可放大缩小, 右上角 X / 点遮罩关闭) ----
   var dlLog = $("dl-log");
-  var wiringPop = $("wiring-pop");
-  if (dlLog && wiringPop) {
+  var wiringMask = $("wiring-mask");
+  var wiringImg = $("wiring-img");
+  var wiringZoomLabel = $("wiring-zoom-label");
+  var wiringZoom = 1;
+  var WIRING_ZOOM_MIN = 0.25, WIRING_ZOOM_MAX = 4, WIRING_ZOOM_STEP = 0.25;
+  function wiringApplyZoom() {
+    if (wiringImg) wiringImg.style.width = Math.round(wiringZoom * 100) + "%";
+    if (wiringZoomLabel) wiringZoomLabel.textContent = Math.round(wiringZoom * 100) + "%";
+  }
+  function wiringOpen() {
+    wiringZoom = 1;
+    wiringApplyZoom();
+    if (wiringMask) wiringMask.classList.remove("hidden");
+  }
+  function wiringClose() {
+    if (wiringMask) wiringMask.classList.add("hidden");
+  }
+  if (dlLog && wiringMask) {
     dlLog.addEventListener("click", function (e) {
       e.stopPropagation();
-      wiringPop.classList.toggle("show");
+      wiringOpen();
     });
-    document.addEventListener("click", function (e) {
-      if (!wiringPop.contains(e.target)) wiringPop.classList.remove("show");
+    wiringMask.addEventListener("click", function (e) {
+      if (e.target === wiringMask) wiringClose();
+    });
+    var wiringCloseBtn = $("wiring-close");
+    if (wiringCloseBtn) wiringCloseBtn.addEventListener("click", wiringClose);
+    var wiringZoomIn = $("wiring-zoom-in");
+    if (wiringZoomIn) wiringZoomIn.addEventListener("click", function () {
+      wiringZoom = Math.min(WIRING_ZOOM_MAX, wiringZoom + WIRING_ZOOM_STEP);
+      wiringApplyZoom();
+    });
+    var wiringZoomOut = $("wiring-zoom-out");
+    if (wiringZoomOut) wiringZoomOut.addEventListener("click", function () {
+      wiringZoom = Math.max(WIRING_ZOOM_MIN, wiringZoom - WIRING_ZOOM_STEP);
+      wiringApplyZoom();
+    });
+    document.addEventListener("keydown", function (e) {
+      if (e.key === "Escape" && !wiringMask.classList.contains("hidden")) wiringClose();
     });
   }
 

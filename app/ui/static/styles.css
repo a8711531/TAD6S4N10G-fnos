@@ -1002,6 +1002,110 @@ body.modal-open { overflow: hidden; }
 
 .inline-status.error { color: var(--danger); }
 
+.inline-status.success { color: var(--success); }
+
+/* 开关机计划 */
+.schedule-panel .schedule-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.schedule-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0 0 12px;
+}
+
+.schedule-stat {
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.schedule-stat-label { display: block; margin-bottom: 4px; color: var(--muted); font-size: 11px; }
+.schedule-stat b {
+  display: block;
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: 14px;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+
+.schedule-table-wrap {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow-x: auto;
+}
+
+.schedule-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.schedule-table th,
+.schedule-table td {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.schedule-table th {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  background: var(--surface-soft);
+}
+
+.schedule-table tbody tr { cursor: pointer; }
+.schedule-table tbody tr:last-child td { border-bottom: 0; }
+.schedule-table tbody tr:hover { background: var(--sidebar-hover); }
+.schedule-table tbody tr.selected { color: var(--primary); background: var(--primary-soft); }
+
+.schedule-status {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.schedule-status.on { color: var(--success); border-color: #bfe8d6; background: #f3fbf7; }
+.schedule-status.off { color: var(--muted); background: var(--surface); }
+
+.schedule-empty {
+  margin: 0;
+  padding: 18px 12px;
+  color: var(--muted);
+  font-size: 13px;
+  text-align: center;
+}
+
+.schedule-editor-dialog label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 10px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+[data-theme="dark"] .schedule-status.on { color: #7fd6a8; border-color: #2b5c45; background: #12271d; }
+
+@media (max-width: 599px) {
+  .schedule-stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .schedule-panel .schedule-toolbar button { flex: 1 1 auto; }
+}
+
 .diagnostic-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1992,6 +2096,154 @@ body.modal-open { overflow: hidden; }
 }
 .debug-report:focus { border-color: #8cb4ff; box-shadow: 0 0 0 3px rgba(52, 120, 246, .12); }
 
+/* ---- 固件升级 ---- */
+input[type="file"] {
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  outline: 0;
+  color: var(--text);
+  background: var(--surface);
+  font-size: 12px;
+}
+
+input[type="file"]:focus { border-color: #8cb4ff; box-shadow: 0 0 0 3px rgba(52, 120, 246, .12); }
+
+.firmware-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: end;
+  margin-bottom: 10px;
+}
+
+.firmware-row > button { margin-bottom: 1px; }
+.firmware-confirm { margin: 2px 0 10px; white-space: normal; }
+
+.firmware-nic-status {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin: 10px 0;
+}
+
+.firmware-nic-status > div {
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.firmware-nic-status span {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.firmware-nic-status b {
+  display: block;
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 620;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.firmware-log {
+  margin: 10px 0 0;
+  max-height: 240px;
+  overflow: auto;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text-body);
+  background: var(--surface-soft);
+  font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.firmware-log.success { color: var(--success); }
+.firmware-log.error { color: var(--danger); }
+
+/* ---- 压力测试 ---- */
+.stress-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  margin: 0 0 12px;
+}
+
+.stress-settings {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-bottom: 12px;
+}
+
+.stress-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin: 10px 0 12px;
+}
+
+.stress-metrics > div {
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.stress-metrics span {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.stress-metrics b {
+  display: block;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 620;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.firmware-advanced {
+  margin: 4px 0 10px;
+  padding: 10px 12px;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.firmware-advanced summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.firmware-advanced[open] summary { margin-bottom: 10px; }
+
+.firmware-advanced .firmware-row { margin-bottom: 0; }
+
+@media (max-width: 1023px) {
+  .firmware-nic-status,
+  .stress-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 599px) {
+  .firmware-row,
+  .firmware-nic-status,
+  .stress-settings,
+  .stress-metrics { grid-template-columns: minmax(0, 1fr); }
+}
+
 .actions {
   display: flex;
   flex-wrap: wrap;
@@ -2097,26 +2349,27 @@ button.danger {
     flex-wrap: nowrap;
     min-width: 0;
     width: 100%;
-    overflow: hidden;
+    /* 选项卡放不下了就横向滑动，不再压缩字号与宽度 */
+    overflow-x: auto;
+    overflow-y: hidden;
     gap: 2px;
+    scrollbar-width: thin;
+    -webkit-overflow-scrolling: touch;
   }
   .app-tabs button {
-    flex: 1 1 0;
-    min-width: 0;
+    flex: 0 0 auto;
+    min-width: 68px;
     width: auto;
-    max-width: 100%;
     height: auto;
     flex-direction: column;
     justify-content: center;
     min-height: 52px;
     gap: 2px;
-    padding: 6px 2px;
-    overflow: hidden;
-    font-size: clamp(9px, 1.5vw, 11px);
+    padding: 6px 8px;
+    font-size: 11px;
     line-height: 1.15;
     text-align: center;
     white-space: nowrap;
-    text-overflow: ellipsis;
   }
   .app-tabs button > img { flex-shrink: 0; }
   .sidebar-meta { display: none; }

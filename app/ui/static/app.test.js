@@ -123,6 +123,7 @@ function loadAppContext(overrides = {}) {
     // 既有用例是在「初始化流程没跑到那一步」的前提下写的，加上它会让一些后台 promise
     // 继续执行、反过来改掉用例的前置状态。要用的用例自己传 overrides.TextEncoder。
     ...(overrides.TextEncoder ? { TextEncoder: overrides.TextEncoder, TextDecoder: overrides.TextDecoder || TextDecoder } : {}),
+    ...(overrides.FormData ? { FormData: overrides.FormData } : {}),
     setInterval: () => 0,
     clearInterval: () => {},
     setTimeout: () => 0,
@@ -2544,3 +2545,438 @@ test('即时保存开关：请求与回读都失败时标记状态未知', async
   await app.element('gpio-feedback').listeners.get('change')();
   assert.match(app.element('gpio-feedback-status').textContent, /状态未知/);
 });
+
+// ---- 固件升级（BIOS / 网卡）与压力测试 ----
+
+test('压力测试参数：一项都没勾返回 null，时长与内存按边界处理，永久测试发 0', () => {
+  const app = loadAppContext();
+  const options = app.resolve('stressOptionsFromForm');
+
+  assert.equal(options(), null);
+
+  app.element('stress-cpu').checked = true;
+  let result = { ...options() };
+  assert.deepEqual(result, { cpu: true, gpu: false, memory: false, duration_seconds: 300, memory_mb: 512 });
+
+  app.element('stress-duration').value = '5';
+  app.element('stress-memory-mb').value = '16';
+  result = { ...options() };
+  assert.equal(result.duration_seconds, 10);
+  assert.equal(result.memory_mb, 64);
+
+  app.element('stress-duration').value = '9999';
+  app.element('stress-memory-mb').value = '9000';
+  result = { ...options() };
+  assert.equal(result.duration_seconds, 3600);
+  assert.equal(result.memory_mb, 9000, '内存不再有固定 4096 MB 上限');
+
+  app.element('stress-permanent').checked = true;
+  result = { ...options() };
+  assert.equal(result.duration_seconds, 0, '永久测试应以 0 表示时长');
+  assert.equal(result.memory_mb, 9000);
+
+  app.element('stress-permanent').checked = false;
+  app.element('stress-cpu').checked = false;
+  app.element('stress-gpu').checked = true;
+  assert.equal(options().gpu, true);
+});
+
+test('固件任务日志：空日志显示等待提示，多行按行拼接', () => {
+  const firmwareLogText = resolve('firmwareLogText');
+  assert.equal(firmwareLogText(null), '等待操作…');
+  assert.equal(firmwareLogText({ logs: [] }), '等待操作…');
+  assert.equal(firmwareLogText({ logs: ['第一步', '第二步'] }), '第一步\n第二步');
+});
+
+test('固件状态渲染：刷写工具徽标、网卡字段、目标版本与运行中按钮禁用', () => {
+  const app = loadAppContext();
+  const renderFirmwareStatus = app.resolve('renderFirmwareStatus');
+
+  renderFirmwareStatus({ flashrom: { present: false }, fpt: { present: false }, nic: {}, job: { kind: 'idle', state: 'idle' } });
+  assert.equal(app.element('firmware-tool-badge').textContent, '刷写工具缺失');
+  assert.match(app.element('firmware-tool-badge').className, /error/);
+  assert.equal(app.element('firmware-nic-model').textContent, '—');
+  assert.equal(app.element('firmware-nic-target').textContent, '14.32.1900');
+  assert.match(app.element('firmware-nic-hint').textContent, /尚未检测到/);
+  assert.equal(app.element('firmware-bios-flash').disabled, false);
+
+  renderFirmwareStatus({ flashrom: { present: true, path: '/usr/sbin/flashrom' }, fpt: { present: false }, nic: {}, job: {} });
+  assert.equal(app.element('firmware-tool-badge').textContent, 'flashrom 可用');
+
+  renderFirmwareStatus({
+    flashrom: { present: false },
+    fpt: { present: true, builtin: true, path: '/opt/tad-module/tools/fpt-linux', size: 4096 },
+    nic: {}, job: {},
+  });
+  assert.equal(app.element('firmware-tool-badge').textContent, 'FPT 内置');
+
+  renderFirmwareStatus({
+    flashrom: { present: false },
+    fpt: { present: true, path: '/data/firmware/fpt-linux', size: 2048, uploaded_at: '2026-10-22T10:00:00Z' },
+    nic: {
+      present: true, model: 'ConnectX-4 Lx', pci_address: '01:00.0', fw_version: '14.28.1002',
+      psid: 'MT_0000000001', mft_installed: true, target_fw: '14.32.1900',
+    },
+    job: { kind: 'nic', state: 'running', logs: ['检测网卡', '安装 MFT'] },
+  });
+  assert.equal(app.element('firmware-tool-badge').textContent, '自定义 FPT');
+  assert.equal(app.element('firmware-nic-model').textContent, 'ConnectX-4 Lx');
+  assert.equal(app.element('firmware-nic-mft').textContent, '已安装');
+  assert.equal(app.element('firmware-nic-log').textContent, '检测网卡\n安装 MFT');
+  assert.match(app.element('firmware-nic-hint').textContent, /已检测到/);
+  assert.equal(app.element('firmware-fpt-upload').disabled, true);
+  assert.equal(app.element('firmware-bios-flash').disabled, true);
+  assert.equal(app.element('firmware-nic-flash').disabled, true);
+});
+
+test('BIOS 刷写：未勾确认不发请求；勾选后提交 confirm=FLASH 与镜像', async () => {
+  const { requests, fetch } = recordingFetch(() => ({ job: { kind: 'bios', state: 'running', logs: ['刷写中'] } }));
+  const app = loadAppContext({ fetch, FormData });
+  const baseline = requests.length; // 页面初始化会先拉状态，只看本用例新增的请求
+
+  app.element('firmware-bios-file').files = [{ name: 'bios.bin' }];
+  await app.resolve('flashBIOS')();
+  assert.equal(requests.length, baseline, '未勾确认不得发请求');
+  assert.match(app.element('firmware-bios-log').textContent, /勾选/);
+
+  app.element('firmware-bios-confirm').checked = true;
+  await app.resolve('flashBIOS')();
+  assert.equal(requests.length, baseline + 1);
+  const sent = requests[requests.length - 1];
+  assert.match(sent.url, /api\/firmware\/bios\/flash$/);
+  assert.equal(sent.init.method, 'POST');
+  assert.equal(sent.init.body.get('confirm'), 'FLASH');
+  assert.ok(sent.init.body.get('image'), '要带上 BIOS 镜像文件');
+  assert.equal(app.element('firmware-bios-log').textContent, '刷写中');
+});
+
+test('BIOS 在线升级状态渲染：有新版本显示徽标/更新日志，勾选后刷写按钮才可用', () => {
+  const app = loadAppContext();
+  const renderBIOSOnline = app.resolve('renderBIOSOnline');
+
+  renderBIOSOnline({
+    model: 'N100',
+    current_version: '05.27.04.10',
+    current_build_date: '2026-05-13 10:20',
+    candidate_zip: 'TAD6S4N10G-BIOS-N100-2026_06_25.zip',
+    candidate_version: '05.27.05.10',
+    candidate_build_date: '2026-06-24 21:55',
+    update_available: true,
+    changelog: '1. 修复风扇曲线\n2. 更新微码',
+  });
+  assert.equal(app.element('bios-online-model').textContent, 'N100');
+  assert.equal(app.element('bios-online-current').textContent, '05.27.04.10（2026-05-13 10:20）');
+  assert.equal(app.element('bios-online-latest').textContent, '05.27.05.10（2026-06-24 21:55）');
+  assert.equal(app.element('bios-online-zip').textContent, 'TAD6S4N10G-BIOS-N100-2026_06_25.zip');
+  assert.equal(app.element('bios-online-badge').textContent, '有新版本');
+  assert.match(app.element('bios-online-badge').className, /success/);
+  assert.match(app.element('bios-online-changelog').textContent, /更新日志（TAD6S4N10G-BIOS-N100-2026_06_25\.zip）：\n1\. 修复风扇曲线/);
+  assert.equal(app.element('bios-online-changelog').hidden, false);
+  // 未勾确认时按钮必须保持禁用
+  assert.equal(app.element('bios-online-flash').disabled, true);
+  app.element('bios-online-confirm').checked = true;
+  app.resolve('updateBIOSOnlineFlashButton')();
+  assert.equal(app.element('bios-online-flash').disabled, false);
+});
+
+test('BIOS 在线升级状态渲染：已是最新隐藏日志并禁用刷写，错误状态走 error 徽标', () => {
+  const app = loadAppContext();
+  const renderBIOSOnline = app.resolve('renderBIOSOnline');
+
+  renderBIOSOnline({
+    model: 'N100',
+    current_version: '05.27.05.10',
+    current_build_date: '2026-06-24 21:55',
+    candidate_zip: 'TAD6S4N10G-BIOS-N100-2026_06_25.zip',
+    candidate_version: '05.27.05.10',
+    candidate_build_date: '2026-06-24 21:55',
+    update_available: false,
+  });
+  assert.equal(app.element('bios-online-badge').textContent, '已是最新');
+  assert.match(app.element('bios-online-hint').textContent, /已是最新/);
+  assert.equal(app.element('bios-online-changelog').hidden, true);
+  app.element('bios-online-confirm').checked = true;
+  app.resolve('updateBIOSOnlineFlashButton')();
+  assert.equal(app.element('bios-online-flash').disabled, true, '无更新时勾选也不得放开刷写');
+
+  renderBIOSOnline({ model: '', error: '读取云端 BIOS 索引失败: 404' });
+  assert.equal(app.element('bios-online-badge').textContent, '检查失败');
+  assert.match(app.element('bios-online-badge').className, /error/);
+  assert.match(app.element('bios-online-hint').textContent, /404/);
+});
+
+test('BIOS 在线升级检查：点击后发 POST 请求并渲染结果，未勾确认不发起刷写', async () => {
+  const { requests, fetch } = recordingFetch((url) => {
+    if (/bios-online\/check$/.test(url)) {
+      return {
+        model: 'N100',
+        current_version: '05.27.04.10',
+        current_build_date: '2026-05-13 10:20',
+        candidate_zip: 'TAD6S4N10G-BIOS-N100-2026_06_25.zip',
+        candidate_version: '05.27.05.10',
+        candidate_build_date: '2026-06-24 21:55',
+        update_available: true,
+      };
+    }
+    return { job: { kind: 'bios', state: 'running', logs: ['下载固件'] } };
+  });
+  const app = loadAppContext({ fetch, FormData });
+  const baseline = requests.length;
+
+  await app.resolve('checkBIOSOnline')();
+  const checkReq = requests.slice(baseline).find((item) => /bios-online\/check$/.test(item.url));
+  assert.ok(checkReq, '检查要 POST bios-online/check');
+  assert.equal(checkReq.init.method, 'POST');
+  assert.equal(app.element('bios-online-badge').textContent, '有新版本');
+
+  // 未勾确认：刷写直接拦截，不发请求
+  const beforeFlash = requests.length;
+  await app.resolve('flashBIOSOnline')();
+  assert.equal(requests.length, beforeFlash);
+  assert.match(app.element('bios-online-hint').textContent, /勾选/);
+
+  app.element('bios-online-confirm').checked = true;
+  await app.resolve('flashBIOSOnline')();
+  const flashReq = requests.slice(beforeFlash).find((item) => /bios-online\/flash$/.test(item.url));
+  assert.ok(flashReq, '刷写要 POST bios-online/flash');
+  assert.equal(flashReq.init.body.get('confirm'), 'FLASH');
+});
+
+// ---- 开关机计划 ----
+
+// 迷你元素桩：开关机计划渲染要真实记录子节点树（行/单元格/徽标），
+// 通用 Proxy 桩拿不到结构。只实现渲染路径用到的 DOM 子集。
+function miniEl(tag) {
+  const el = {
+    tagName: tag,
+    children: [],
+    textContent: '',
+    className: '',
+    hidden: false,
+    disabled: false,
+    checked: false,
+    value: '',
+    attrs: {},
+    listeners: {},
+    dataset: {},
+    style: {},
+  };
+  const classSet = new Set();
+  el.classList = {
+    add: (...names) => names.forEach((name) => classSet.add(name)),
+    remove: (...names) => names.forEach((name) => classSet.delete(name)),
+    toggle: (name, force) => {
+      const on = force === undefined ? !classSet.has(name) : Boolean(force);
+      if (on) classSet.add(name);
+      else classSet.delete(name);
+      return on;
+    },
+    contains: (name) => classSet.has(name),
+  };
+  el.appendChild = (child) => { el.children.push(child); return child; };
+  el.append = (...kids) => { el.children.push(...kids); };
+  el.replaceChildren = (...nodes) => { el.children = nodes; };
+  el.setAttribute = (name, val) => { el.attrs[String(name)] = String(val); };
+  el.getAttribute = (name) => (String(name) in el.attrs ? el.attrs[String(name)] : null);
+  el.addEventListener = (type, handler) => { (el.listeners[type] = el.listeners[type] || []).push(handler); };
+  el.querySelectorAll = (selector) => (selector === 'tr' ? el.children.filter((node) => node.tagName === 'tr') : []);
+  el.click = () => (el.listeners.click || []).forEach((handler) => handler({ preventDefault() {}, stopPropagation() {} }));
+  return el;
+}
+
+const SCHEDULE_IDS = [
+  'schedule-total', 'schedule-enabled', 'schedule-next', 'schedule-rows', 'schedule-empty',
+  'schedule-footer', 'schedule-hint', 'schedule-add', 'schedule-edit', 'schedule-delete',
+  'schedule-enable', 'schedule-disable', 'schedule-apply', 'schedule-test',
+  'schedule-editor', 'schedule-editor-title', 'schedule-editor-days',
+  'schedule-editor-time', 'schedule-editor-action',
+];
+
+function loadScheduleApp(overrides = {}) {
+  const els = {};
+  SCHEDULE_IDS.forEach((id) => { els[id] = miniEl('div'); });
+  const app = loadAppContext({
+    ...overrides,
+    // 风扇曲线初始化要 canvas.getContext，回退到通用 Proxy 桩；其余元素走迷你桩记录结构
+    createElement: (tag) => (tag === 'canvas' ? stubElement() : miniEl(tag)),
+    getElementById: (id, fallback) => els[id] || fallback(id),
+  });
+  return { app, els };
+}
+
+const flushMicrotasks = async () => {
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+};
+
+test('开关机计划渲染：统计卡片、计划行文案与 RTC 页脚', () => {
+  const { app, els } = loadScheduleApp();
+  app.resolve('renderPowerSchedule')({
+    total: 2,
+    enabled_count: 1,
+    entries: [
+      { enabled: true, days: 'weekday', time: '10:00', action: 'poweron' },
+      { enabled: false, days: 'weekend', time: '02:00', action: 'poweroff' },
+    ],
+    next_trigger: '2026-10-24 10:00 开机',
+    rtc_time: '2026-10-23 02:00:00',
+    rtc_alarm_irq: 'yes',
+    applied: true,
+  });
+  assert.equal(els['schedule-total'].textContent, '2');
+  assert.equal(els['schedule-enabled'].textContent, '1');
+  assert.equal(els['schedule-next'].textContent, '2026-10-24 10:00 开机');
+  const rows = els['schedule-rows'].children;
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0].children[0].children[0].checked, true, '首行复选框勾选');
+  assert.equal(rows[0].children[1].textContent, '平日 10:00');
+  assert.equal(rows[0].children[2].textContent, '开机');
+  assert.match(rows[0].children[3].children[0].className, /schedule-status on/);
+  assert.equal(rows[1].children[1].textContent, '假日 02:00');
+  assert.equal(rows[1].children[2].textContent, '关机');
+  assert.match(rows[1].children[3].children[0].className, /schedule-status off/);
+  assert.equal(els['schedule-empty'].hidden, true, '有计划时不显示空提示');
+  assert.equal(
+    els['schedule-footer'].textContent,
+    'RTC: 2026-10-23 02:00:00 · alarm_IRQ: yes · 服务: enabled · 计划写入: 是',
+  );
+  // 未选中行：编辑/删除/启停全部禁用
+  assert.equal(els['schedule-edit'].disabled, true);
+  assert.equal(els['schedule-delete'].disabled, true);
+  assert.equal(els['schedule-enable'].disabled, true);
+  assert.equal(els['schedule-disable'].disabled, true);
+});
+
+test('开关机计划交互：行选中驱动工具栏，启用按钮按选中行保存', async () => {
+  const entries = [
+    { enabled: true, days: 'weekday', time: '10:00', action: 'poweron' },
+    { enabled: false, days: 'weekend', time: '02:00', action: 'poweroff' },
+  ];
+  const { requests, fetch } = recordingFetch((url) => {
+    if (/power-schedule\/config$/.test(url)) return { total: 2, enabled_count: 2, entries: entries.map((e) => ({ ...e, enabled: true })), applied: true };
+    return { total: 2, enabled_count: 1, entries };
+  });
+  const { app, els } = loadScheduleApp({ fetch });
+  app.resolve('renderPowerSchedule')({ total: 2, enabled_count: 1, entries, applied: false });
+
+  const rows = els['schedule-rows'].children;
+  rows[1].click(); // 选中已停用的假日关机行
+  assert.equal(rows[1].classList.contains('selected'), true);
+  assert.equal(rows[0].classList.contains('selected'), false);
+  assert.equal(els['schedule-edit'].disabled, false);
+  assert.equal(els['schedule-enable'].disabled, false, '已停用行可启用');
+  assert.equal(els['schedule-disable'].disabled, true, '已停用行不能再停用');
+
+  await app.resolve('setPowerScheduleEnabled')(true);
+  const saveReq = requests.find((item) => /power-schedule\/config$/.test(item.url));
+  assert.ok(saveReq, '启用要 POST power-schedule/config');
+  const body = JSON.parse(saveReq.init.body);
+  assert.equal(body.entries.length, 2);
+  assert.equal(body.entries[1].enabled, true);
+  assert.equal(body.entries[1].days, 'weekend');
+});
+
+test('开关机计划编辑器：非法时间拦截不发请求，合法新增保存并带默认启用', async () => {
+  const { requests, fetch } = recordingFetch((url) => {
+    if (/power-schedule\/config$/.test(url)) {
+      const sent = JSON.parse(requests[requests.length - 1].init.body);
+      return { total: sent.entries.length, enabled_count: sent.entries.length, entries: sent.entries, applied: true };
+    }
+    return { total: 0, enabled_count: 0, entries: [] };
+  });
+  const { app, els } = loadScheduleApp({ fetch });
+  app.resolve('renderPowerSchedule')({ total: 0, enabled_count: 0, entries: [] });
+  assert.equal(els['schedule-empty'].hidden, false, '无计划显示空提示');
+
+  app.resolve('openScheduleEditor')(-1);
+  assert.equal(els['schedule-editor'].hidden, false);
+  assert.equal(els['schedule-editor-title'].textContent, '新增计划');
+
+  els['schedule-editor-time'].value = '25:00';
+  app.resolve('submitScheduleEditor')();
+  await flushMicrotasks();
+  assert.match(els['schedule-hint'].textContent, /时间格式无效/);
+  assert.equal(requests.filter((item) => /power-schedule\/config$/.test(item.url)).length, 0, '非法时间不得发保存请求');
+
+  els['schedule-editor-days'].value = 'daily';
+  els['schedule-editor-time'].value = '08:30';
+  els['schedule-editor-action'].value = 'poweroff';
+  app.resolve('submitScheduleEditor')();
+  await flushMicrotasks();
+  const saveReq = requests.find((item) => /power-schedule\/config$/.test(item.url));
+  assert.ok(saveReq, '合法新增要发保存请求');
+  const body = JSON.parse(saveReq.init.body);
+  assert.deepEqual(body.entries, [{ enabled: true, days: 'daily', time: '08:30', action: 'poweroff' }]);
+  assert.equal(els['schedule-editor'].hidden, true, '提交后编辑器要关闭');
+});
+
+test('压力测试状态渲染：指标格式、剩余时长与按钮状态', () => {
+  const app = loadAppContext();
+  const renderStressStatus = app.resolve('renderStressStatus');
+
+  renderStressStatus({
+    running: true,
+    options: { cpu: true, gpu: true, memory: true, duration_seconds: 300, memory_mb: 512 },
+    elapsed_seconds: 65,
+    cpu_percent: 97.53,
+    memory_used_bytes: 2 * 1024 * 1024 * 1024,
+    memory_total_bytes: 16 * 1024 * 1024 * 1024,
+    memory_allocated_bytes: 512 * 1024 * 1024,
+    load1: 7.321,
+    cpu_temp_c: 71.26,
+    gpu_freq_mhz: 1100,
+    gpu_backend: 'vaapi',
+  });
+  assert.match(app.element('stress-status-text').textContent, /剩余 235 秒/);
+  assert.equal(app.element('stress-elapsed').textContent, '1 分 5 秒');
+  assert.equal(app.element('stress-cpu-percent').textContent, '97.5%');
+  assert.equal(app.element('stress-memory-used').textContent, '2.0 GB / 16.0 GB');
+  assert.equal(app.element('stress-load').textContent, '7.32');
+  assert.equal(app.element('stress-cpu-temp').textContent, '71.3 °C');
+  assert.equal(app.element('stress-gpu-freq').textContent, '1100 MHz');
+  assert.equal(app.element('stress-gpu-backend').textContent, 'VAAPI / ffmpeg');
+  assert.match(app.element('stress-gpu-hint').textContent, /GPU 压测运行中/);
+  assert.equal(app.element('stress-start').disabled, true);
+  assert.equal(app.element('stress-stop').disabled, false);
+
+  renderStressStatus({ running: true, options: { cpu: true, duration_seconds: 0 }, elapsed_seconds: 30 });
+  assert.match(app.element('stress-status-text').textContent, /永久运行/);
+
+  renderStressStatus({ running: false, options: { cpu: true, duration_seconds: 300 }, elapsed_seconds: 300 });
+  assert.match(app.element('stress-status-text').textContent, /已结束/);
+  assert.equal(app.element('stress-start').disabled, false);
+  assert.equal(app.element('stress-stop').disabled, true);
+});
+
+test('GPU 压测异常：展示后端返回的错误信息', () => {
+  const app = loadAppContext();
+  app.resolve('renderStressStatus')({
+    running: true,
+    options: { gpu: true, duration_seconds: 0 },
+    gpu_backend: 'vaapi',
+    gpu_error: 'GPU 压测进程退出：VAAPI 初始化失败',
+  });
+  assert.match(app.element('stress-gpu-hint').textContent, /VAAPI 初始化失败/);
+  assert.match(app.element('stress-gpu-hint').className, /error/);
+});
+
+test('压力测试启动：一项都没勾时不发请求并给出提示', async () => {
+  const { requests, fetch } = recordingFetch(() => ({}));
+  const app = loadAppContext({ fetch });
+  const baseline = requests.length;
+  await app.resolve('startStressRun')();
+  assert.equal(requests.length, baseline);
+  assert.match(app.element('stress-status-text').textContent, /至少勾选/);
+});
+
+test('切到固件页：立即拉取一次固件状态', async () => {
+  const { requests, fetch } = recordingFetch(() => ({ fpt: {}, nic: {}, job: {} }));
+  const app = loadAppContext({
+    fetch,
+    requestAnimationFrame: (callback) => { callback(); return 0; },
+  });
+  app.resolve('activateTab')('tab-firmware');
+  await new Promise((resolveTick) => setImmediate(resolveTick));
+  assert.ok(requests.some((item) => /api\/firmware$/.test(item.url)), '进入固件页要拉取 api/firmware');
+});
+

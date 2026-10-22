@@ -271,6 +271,8 @@ func serve(args []string) error {
 	go storageNotifyLoop(ctx, manager, logger)
 	go autoBackupClearLoop(ctx, manager, logger)
 	go gpioLoop(ctx, manager, logger)
+	// 开关机计划：到点触发关机 + 同步 RTC 唤醒（power_schedule.go）
+	go powerScheduleLoop(ctx, manager, logger)
 	// USB 串口温度传感器读取器：未配置时内部低频空转，常驻无副作用
 	go manager.SerialSensorLoop(ctx, logger)
 	// USB HID 温度计（TEMPer 家族）：锁外后台读取 + 缓存（阻塞 IO 不进
@@ -409,6 +411,22 @@ func storageLoop(ctx context.Context, manager *powerguard.Manager, logger *log.L
 			return
 		case <-ticker.C:
 			refresh()
+		}
+	}
+}
+
+// 开关机计划：启动先对账一次（同步 RTC 唤醒），之后每 30 秒检查——
+// 到点触发计划关机、wakealarm 与开机计划不一致时重写。
+func powerScheduleLoop(ctx context.Context, manager *powerguard.Manager, logger *log.Logger) {
+	manager.PowerScheduleTick(ctx)
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			manager.PowerScheduleTick(ctx)
 		}
 	}
 }
