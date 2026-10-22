@@ -253,6 +253,12 @@ type Manager struct {
 	// fanAlarmMuted 关停档故障/超温蜂鸣报警的临时静音（不落盘）：只停蜂鸣器，
 	// 界面错误状态与日志照旧；退出关停档时自动解除，避免长期静音漏掉真故障。
 	fanAlarmMuted bool
+	// fanOffAlarmActive 最近一次控制周期是否处于关停档报警状态：解除静音时用它
+	// 判断要不要立刻补响，避免没有报警时凭空响一声。
+	fanOffAlarmActive bool
+	// fanOffAlarmLogKey 关停档报警日志去重键（报警内容+蜂鸣状态）：既避免每个
+	// 控制周期重复刷同一行，也避免静音时仍写成「已蜂鸣报警」。
+	fanOffAlarmLogKey string
 
 	// 0 转风扇屏蔽/跳过日志的去重键：控制周期每 2 秒跑一轮，同一组风扇问题
 	// 只在集合变化（或恢复后再次出现）时写一次日志，避免刷满运行日志。

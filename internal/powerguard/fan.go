@@ -617,22 +617,33 @@ const (
 	offModeHDDCriticalC = 55.0
 )
 
+// fanAlarmChimeHook 测试钩子：非 nil 时替代真实 GPIO 蜂鸣，用于断言报警音
+// 到底有没有播放（关停档报警只允许在该响的时候响）。运行时保持 nil。
+var fanAlarmChimeHook func(tones []GPIOToneSpec)
+
 // chimeOffModeAlarmLocked 关停档超温/温度源失效的蜂鸣报警：急促高频短音，后台
 // 播放不阻塞控制循环；蜂鸣器不在时尽力而为（错误被忽略，界面报警状态仍在）。
 // 用户临时静音期间只跳过蜂鸣，节流时刻不更新，解除静音后立即响一声。
-func (m *Manager) chimeOffModeAlarmLocked() {
+// 返回值表示本次是否真的播放了报警音，调用方据此决定日志措辞。
+func (m *Manager) chimeOffModeAlarmLocked() bool {
 	if m.fanAlarmMuted {
-		return
+		return false
 	}
-	if time.Since(m.fanOffAlarmChimeAt) < fanOffAlarmChimeInterval {
-		return
+	now := m.now()
+	if !m.fanOffAlarmChimeAt.IsZero() && now.Sub(m.fanOffAlarmChimeAt) < fanOffAlarmChimeInterval {
+		return false
 	}
-	m.fanOffAlarmChimeAt = time.Now()
+	m.fanOffAlarmChimeAt = now
 	tones := make([]GPIOToneSpec, fanOffAlarmChimeBeeps)
 	for i := range tones {
 		tones[i] = GPIOToneSpec{FrequencyHz: fanOffAlarmChimeHz, DurationMS: fanOffAlarmChimeMS}
 	}
+	if fanAlarmChimeHook != nil {
+		fanAlarmChimeHook(tones)
+		return true
+	}
 	go func() { _ = m.PlayStorageChime(tones) }()
+	return true
 }
 
 // SetFanAlarmMute 临时静音/恢复关停档的故障与超温蜂鸣报警。只影响蜂鸣器：
@@ -646,6 +657,15 @@ func (m *Manager) SetFanAlarmMute(muted bool) error {
 		return errors.New("仅在「关停」档下可以临时静音故障/超温报警")
 	}
 	m.fanAlarmMuted = muted
+	if muted {
+		return nil
+	}
+	// 解除静音要立刻补响：清零 20 秒节流，否则「刚响过 → 静音 → 20 秒内解除」
+	// 仍会被节流窗口挡掉；当前仍在报警时当场响一次，不等下一轮控制周期。
+	m.fanOffAlarmChimeAt = time.Time{}
+	if m.fanOffAlarmActive {
+		m.chimeOffModeAlarmLocked()
+	}
 	return nil
 }
 
@@ -1655,11 +1675,28 @@ func (m *Manager) applyFanLocked(cfg FanConfig) error {
 		// 去重、蜂鸣节流、错误经 errOffModeAlarm 上抛（调用方置 fanLastError，
 		// 不走 fail-safe 拉满，也不阻塞配置保存）。
 		msg := strings.Join(offAlarms, "；")
-		m.logf("fan: %s（已蜂鸣报警）", msg)
-		m.chimeOffModeAlarmLocked()
+		m.fanOffAlarmActive = true
+		played := m.chimeOffModeAlarmLocked()
+		chimeState := ""
+		switch {
+		case m.fanAlarmMuted:
+			chimeState = "蜂鸣已临时静音，界面报警保留"
+		case played:
+			chimeState = "已蜂鸣报警"
+		}
+		// 节流窗口内的周期不写日志：既不刷屏，也不会把没发声写成「已蜂鸣报警」。
+		if chimeState != "" {
+			key := msg + "|" + chimeState
+			if key != m.fanOffAlarmLogKey {
+				m.fanOffAlarmLogKey = key
+				m.logf("fan: %s（%s）", msg, chimeState)
+			}
+		}
 		return fmt.Errorf("%w: %s", errOffModeAlarm, msg)
 	}
 	m.fanOffAlarmChimeAt = time.Time{} // 无报警时清零节流，下次报警立即响
+	m.fanOffAlarmActive = false
+	m.fanOffAlarmLogKey = ""
 	return nil
 }
 

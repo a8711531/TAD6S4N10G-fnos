@@ -2424,3 +2424,123 @@ test('关停档报警临时静音：仅关停档可用，切换即提交 api/fan
   assert.equal(post.init.method, 'POST');
   assert.equal(JSON.parse(post.init.body).muted, true);
 });
+
+// 构造最小可用 status：只需 config.gpio 等字段齐全，其余渲染路径在 DOM 桩下为空操作。
+function gpioStatus(gpio = {}) {
+  return {
+    version: '0.10.56',
+    cpu_model: 'Intel N100',
+    supported: true,
+    profile: {},
+    config: {
+      enabled: true,
+      pl1_w: 6,
+      pl2_w: 15,
+      reapply_seconds: 300,
+      fan: {},
+      gpio: {
+        version: 1,
+        enabled: true,
+        storage_notify: true,
+        feedback: true,
+        power_chime: true,
+        migrations: [],
+        scripts: [],
+        backups: [],
+        autos: [],
+        buttons: [],
+        ...gpio,
+      },
+      history: {},
+      log: {},
+      ui_prefs: {},
+    },
+    effective_max_pl1_w: 15,
+    effective_max_pl2_w: 15,
+    packages: [],
+    temperatures: [],
+    cpu_temperature: {},
+    gpu_runtime: [],
+    fan_control: {},
+    storage: {},
+    gpio: {},
+    serial: {},
+    storage_notify: {},
+  };
+}
+
+test('即时保存开关：只提交本次字段，不夹带其他未保存草稿', async () => {
+  const { requests, fetch } = recordingFetch((href, init) => {
+    if (href.includes('api/config/gpio')) {
+      return gpioStatus(JSON.parse(init.body));
+    }
+    return gpioStatus({});
+  });
+  const app = loadAppContext({ fetch });
+  app.resolve('render')(gpioStatus({}), true);
+
+  // 用户改了两个开关但还没点保存：切提示音时不能把它们一起写进去。
+  app.element('gpio-enabled').checked = false;
+  app.element('gpio-storage-notify').checked = false;
+
+  app.element('gpio-power-chime').checked = false;
+  await app.element('gpio-power-chime').listeners.get('change')();
+  let posts = requests.filter((item) => item.url.includes('api/config/gpio'));
+  assert.equal(posts.length, 1);
+  let body = JSON.parse(posts[0].init.body);
+  assert.equal(body.power_chime, false);
+  assert.equal(body.enabled, true, '不能把未保存的 enabled 草稿一起提交');
+  assert.equal(body.storage_notify, true, '不能把未保存的提示音草稿一起提交');
+
+  // 第二个开关同样只带自己这一项，并基于服务端刚确认的状态。
+  app.element('gpio-feedback').checked = false;
+  await app.element('gpio-feedback').listeners.get('change')();
+  posts = requests.filter((item) => item.url.includes('api/config/gpio'));
+  body = JSON.parse(posts[posts.length - 1].init.body);
+  assert.equal(body.feedback, false);
+  assert.equal(body.power_chime, false, '第二次提交要基于服务端已确认的状态');
+  assert.equal(body.enabled, true);
+});
+
+test('即时保存开关：服务端拒绝时回填已确认状态，不能宣称已关闭', async () => {
+  const { fetch } = recordingFetch((href) => (href.includes('api/config/gpio')
+    ? { ok: false, error: '仅管理员可以修改按键配置' }
+    : gpioStatus({})));
+  const app = loadAppContext({ fetch });
+  app.resolve('render')(gpioStatus({}), true);
+
+  app.element('gpio-power-chime').checked = false;
+  await app.element('gpio-power-chime').listeners.get('change')();
+  assert.equal(app.element('gpio-power-chime').checked, true, '拒绝后要拨回已确认的开启状态');
+  assert.doesNotMatch(app.element('gpio-power-chime-status').textContent, /已关闭/);
+  assert.match(app.element('message-gpio').textContent, /保存失败/);
+});
+
+test('即时保存开关：请求结果不确定时回读服务端确认后再更新界面', async () => {
+  const fetch = async (url) => {
+    const href = String(url);
+    if (href.includes('api/config/gpio')) {
+      throw Object.assign(new Error('Failed to fetch'), { name: 'TypeError' });
+    }
+    return { ok: true, status: 200, json: async () => gpioStatus({ power_chime: false }) };
+  };
+  const app = loadAppContext({ fetch });
+  app.resolve('render')(gpioStatus({}), true);
+
+  app.element('gpio-power-chime').checked = false;
+  await app.element('gpio-power-chime').listeners.get('change')();
+  assert.equal(app.element('gpio-power-chime').checked, false, '服务端确认已关闭才显示关闭');
+  assert.match(app.element('message-gpio').textContent, /不确定/);
+});
+
+test('即时保存开关：请求与回读都失败时标记状态未知', async () => {
+  const fetch = async () => {
+    throw Object.assign(new Error('Failed to fetch'), { name: 'TypeError' });
+  };
+  const app = loadAppContext({ fetch });
+  app.resolve('render')(gpioStatus({}), true);
+
+  app.element('gpio-feedback').checked = false;
+  await app.element('gpio-feedback').listeners.get('change')();
+  assert.match(app.element('gpio-feedback-status').textContent, /状态未知/);
+});

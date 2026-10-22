@@ -1,8 +1,10 @@
 package powerguard
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -2162,46 +2164,108 @@ func curve40to90() []FanPoint {
 }
 
 // TestOffModeAlarmMuteSilencesChimeUntilOffModeExit 关停档的 20 秒故障/超温
-// 蜂鸣报警可以临时静音：静音期间不响也不推进节流，解除后立即补响；界面
-// 报警状态与风扇停转策略不变，退出关停档后必须自动解除，避免长期漏报。
+// 蜂鸣报警可以临时静音：静音期间不响也不推进节流；在 20 秒节流窗口内解除
+// 静音必须立即补响，而不是继续被节流；退出关停档后静音自动解除。
 func TestOffModeAlarmMuteSilencesChimeUntilOffModeExit(t *testing.T) {
 	manager := newFanDebugTestManager(t)
 	const id = "it8613:hwmon3:fan1"
+	logBuf := &bytes.Buffer{}
+	manager.SetLogger(log.New(logBuf, "", 0))
+
+	t0 := time.Date(2026, 10, 22, 9, 0, 0, 0, time.UTC)
+	now := t0
+	manager.nowFn = func() time.Time { return now }
+	chimes := 0
+	fanAlarmChimeHook = func([]GPIOToneSpec) { chimes++ }
+	t.Cleanup(func() { fanAlarmChimeHook = nil })
+
+	// 真报警场景：CPU 温度越过紧急阈值，关停档只报警、风扇保持停转。
+	coretemp := filepath.Join(manager.Root, "sys", "class", "hwmon", "hwmon9")
+	writeTestValue(t, filepath.Join(coretemp, "temp1_input"), "90000")
 	if err := manager.SaveFanConfig(offModeZeroCurveConfig(id)); err != nil {
-		t.Fatalf("save off mode: %v", err)
+		t.Fatalf("关停档超温是正当维修场景，保存必须成功: %v", err)
 	}
+	if chimes != 1 {
+		t.Fatalf("首次报警应立即蜂鸣一次，实际 %d 次", chimes)
+	}
+	if !strings.Contains(logBuf.String(), "已蜂鸣报警") {
+		t.Fatalf("真的响了之后日志要写「已蜂鸣报警」，实际 %q", logBuf.String())
+	}
+
+	// 20 秒节流窗口内：不重复响。
+	now = t0.Add(5 * time.Second)
+	// 关停档报警期间 ApplyFanCurrent 会返回 errOffModeAlarm（只报警不起转），
+	// 这是预期结果，测试只需确认没有其它错误。
+	if err := manager.ApplyFanCurrent(); err != nil && !errors.Is(err, errOffModeAlarm) {
+		t.Fatalf("apply: %v", err)
+	}
+	if chimes != 1 {
+		t.Fatalf("20 秒内不得重复蜂鸣，实际 %d 次", chimes)
+	}
+
+	// 静音后持续报警：不响、不推进节流时刻，日志明确写「已临时静音」。
 	if err := manager.SetFanAlarmMute(true); err != nil {
 		t.Fatalf("关停档下应允许临时静音: %v", err)
 	}
-	if !manager.Status().FanControl.AlarmMuted {
-		t.Fatal("状态里必须反映静音开关已打开")
+	now = t0.Add(8 * time.Second)
+	// 关停档报警期间 ApplyFanCurrent 会返回 errOffModeAlarm（只报警不起转），
+	// 这是预期结果，测试只需确认没有其它错误。
+	if err := manager.ApplyFanCurrent(); err != nil && !errors.Is(err, errOffModeAlarm) {
+		t.Fatalf("apply: %v", err)
 	}
-
-	// 静音期间既不响，也不更新节流时刻：解除静音后要能立刻补响。
+	if chimes != 1 {
+		t.Fatalf("静音期间不得蜂鸣，实际 %d 次", chimes)
+	}
 	manager.mu.Lock()
-	manager.fanOffAlarmChimeAt = time.Time{}
-	manager.chimeOffModeAlarmLocked()
-	mutedAt := manager.fanOffAlarmChimeAt
+	chimeAt := manager.fanOffAlarmChimeAt
 	manager.mu.Unlock()
-	if !mutedAt.IsZero() {
-		t.Fatal("静音期间不得播放蜂鸣，也不该更新节流时刻")
+	if !chimeAt.Equal(t0) {
+		t.Fatalf("静音期间不得推进节流时刻，实际 %v，期望 %v", chimeAt, t0)
+	}
+	if !strings.Contains(logBuf.String(), "蜂鸣已临时静音") {
+		t.Fatalf("静音时日志必须说明已静音，实际 %q", logBuf.String())
 	}
 
+	// 关键时序：距离上次真响不足 20 秒就解除静音，仍必须立刻补响。
+	now = t0.Add(10 * time.Second)
 	if err := manager.SetFanAlarmMute(false); err != nil {
 		t.Fatalf("解除静音失败: %v", err)
 	}
+	if chimes != 2 {
+		t.Fatalf("解除静音后应立即补响一次（不能被节流挡住），实际 %d 次", chimes)
+	}
 	manager.mu.Lock()
-	manager.chimeOffModeAlarmLocked()
-	chimeAt := manager.fanOffAlarmChimeAt
+	chimeAt = manager.fanOffAlarmChimeAt
 	manager.mu.Unlock()
-	if chimeAt.IsZero() {
-		t.Fatal("解除静音后应立即恢复蜂鸣")
+	if !chimeAt.Equal(now) {
+		t.Fatalf("补响应把节流时刻更新到解除时刻，实际 %v，期望 %v", chimeAt, now)
+	}
+
+	// 补响后仍按 20 秒节流；满 20 秒后恢复重响。
+	now = t0.Add(12 * time.Second)
+	// 关停档报警期间 ApplyFanCurrent 会返回 errOffModeAlarm（只报警不起转），
+	// 这是预期结果，测试只需确认没有其它错误。
+	if err := manager.ApplyFanCurrent(); err != nil && !errors.Is(err, errOffModeAlarm) {
+		t.Fatalf("apply: %v", err)
+	}
+	if chimes != 2 {
+		t.Fatalf("补响后的节流窗口内不得重复蜂鸣，实际 %d 次", chimes)
+	}
+	now = t0.Add(31 * time.Second)
+	// 关停档报警期间 ApplyFanCurrent 会返回 errOffModeAlarm（只报警不起转），
+	// 这是预期结果，测试只需确认没有其它错误。
+	if err := manager.ApplyFanCurrent(); err != nil && !errors.Is(err, errOffModeAlarm) {
+		t.Fatalf("apply: %v", err)
+	}
+	if chimes != 3 {
+		t.Fatalf("距上次蜂鸣满 20 秒应重响，实际 %d 次", chimes)
 	}
 
 	// 再次静音后退出关停档：开关必须自动恢复，下一次真故障照常报警。
 	if err := manager.SetFanAlarmMute(true); err != nil {
 		t.Fatalf("再次静音失败: %v", err)
 	}
+	writeTestValue(t, filepath.Join(coretemp, "temp1_input"), "50000")
 	on := DefaultFanConfig()
 	on.Enabled = true
 	on.CPUFanIDs = []string{id}
@@ -2211,17 +2275,42 @@ func TestOffModeAlarmMuteSilencesChimeUntilOffModeExit(t *testing.T) {
 	if manager.Status().FanControl.AlarmMuted {
 		t.Fatal("退出关停档后静音开关必须自动解除")
 	}
+
+	// 静音已解除：再次进入关停并真报警时必须照常蜂鸣。
+	writeTestValue(t, filepath.Join(coretemp, "temp1_input"), "90000")
+	if err := manager.SaveFanConfig(offModeZeroCurveConfig(id)); err != nil {
+		t.Fatalf("重新进入关停档: %v", err)
+	}
+	if chimes != 4 {
+		t.Fatalf("退出关停后静音必须失效，真报警要再次蜂鸣，实际 %d 次", chimes)
+	}
 }
 
 // TestFanAlarmMuteRejectedOutsideOffMode 非关停档下没有 20 秒报警可静音，
-// 接口必须直接拒绝，界面据此提示用户先切到关停档。
+// 接口必须直接拒绝，且不得改变风扇控制（过温策略照旧）。
 func TestFanAlarmMuteRejectedOutsideOffMode(t *testing.T) {
 	manager := newFanDebugTestManager(t)
-	if err := manager.SetFanAlarmMute(true); err == nil {
-		t.Fatal("非关停档下静音必须被拒绝")
+	const id = "it8613:hwmon3:fan1"
+	pwm1 := filepath.Join(manager.Root, "sys", "class", "hwmon", "hwmon3", "pwm1")
+
+	cfg := DefaultFanConfig()
+	cfg.Enabled = true
+	cfg.CPUFanIDs = []string{id}
+	cfg.Curve = clampCurvePWM(curve40to90(), cfg.MinPWMPercent)
+	if err := manager.SaveFanConfig(cfg); err != nil {
+		t.Fatalf("save normal: %v", err)
+	}
+	before, _ := readInt(pwm1)
+	for _, muted := range []bool{true, false} {
+		if err := manager.SetFanAlarmMute(muted); err == nil {
+			t.Fatalf("非关停档下静音(%v)必须被拒绝", muted)
+		}
 	}
 	if manager.Status().FanControl.AlarmMuted {
-		t.Fatal("被拒绝的静音请求不得改变状态")
+		t.Fatal("被拒绝的静音请求不得改变运行状态")
+	}
+	if after, _ := readInt(pwm1); after != before {
+		t.Fatalf("被拒绝的静音请求不得改变风扇控制，pwm %d → %d", before, after)
 	}
 }
 

@@ -6667,19 +6667,67 @@ function updateGPIOFeedbackStatus() {
     : '已关闭：按键触发动作不再蜂鸣，也不再闪灯。';
 }
 
-$('gpio-feedback').addEventListener('change', async () => {
-  const enabled = $('gpio-feedback').checked;
-  updateGPIOFeedbackStatus();
-  const config = gpioConfigFromInputs();
+// 即时保存单个按键开关：只提交「服务端已确认的配置 + 本次改动的一个字段」，
+// 绝不夹带页面上其他未保存的草稿（否则用户只切了提示音，却把刚改过的 enabled
+// 等状态一并写了进去）。失败分两种：服务端明确拒绝时回填已确认状态；网络结果
+// 不确定时回读服务端确认，读不到就明确标注「状态未知」，不能继续宣称已关闭。
+function gpioFlagConfirmed(field) {
+  const gpio = currentStatus?.config?.gpio || {};
+  return gpio[field] !== false; // 缺省开启，与 fillGPIOInputs 的回显口径一致
+}
+
+function syncGPIOFlagInput(field) {
+  if (field === 'feedback') {
+    $('gpio-feedback').checked = gpioFlagConfirmed('feedback');
+    updateGPIOFeedbackStatus();
+    return;
+  }
+  $('gpio-power-chime').checked = gpioFlagConfirmed('power_chime');
+  updatePowerChimeStatus();
+}
+
+async function saveGPIOFlag(field, enabled, successText) {
+  const confirmed = currentStatus?.config?.gpio;
+  if (!confirmed) {
+    syncGPIOFlagInput(field);
+    showMessage('尚未加载按键配置，请刷新页面后重试。', true, 'message-gpio');
+    return;
+  }
+  // 从已确认配置克隆，页面上其他输入框的未保存草稿不会被顺带提交。
+  const payload = JSON.parse(JSON.stringify(confirmed));
+  payload[field] = enabled;
   setBusy(true);
   try {
-    render(await request('api/config/gpio', { method: 'POST', body: JSON.stringify(config) }), true);
-    showMessage(enabled ? '按键声光反馈已开启。' : '按键声光反馈已关闭。', false, 'message-gpio');
+    render(await request('api/config/gpio', { method: 'POST', body: JSON.stringify(payload) }), true);
+    showMessage(successText, false, 'message-gpio');
   } catch (error) {
-    showMessage(`保存失败：${error.message}`, true, 'message-gpio');
+    if (error?.name === 'TypeError') {
+      // 连接中断/超时：服务端可能已经保存，不能自行宣称成功或失败，回读确认。
+      try {
+        render(await request('api/status'), true);
+        syncGPIOFlagInput(field);
+        showMessage('请求结果不确定，已按服务端状态刷新。', true, 'message-gpio');
+      } catch (refreshError) {
+        const target = $(field === 'feedback' ? 'gpio-feedback-status' : 'gpio-power-chime-status');
+        if (target) {
+          target.textContent = '状态未知：保存请求结果不确定，请刷新页面确认实际状态。';
+        }
+        showMessage(`保存结果未知：${error.message}`, true, 'message-gpio');
+      }
+    } else {
+      // 服务端明确拒绝：把开关拨回已确认的状态，别让界面停留在未生效的草稿上。
+      syncGPIOFlagInput(field);
+      showMessage(`保存失败：${error.message}`, true, 'message-gpio');
+    }
   } finally {
     setBusy(false);
   }
+}
+
+$('gpio-feedback').addEventListener('change', async () => {
+  const enabled = $('gpio-feedback').checked;
+  updateGPIOFeedbackStatus();
+  await saveGPIOFlag('feedback', enabled, enabled ? '按键声光反馈已开启。' : '按键声光反馈已关闭。');
 });
 
 // 开机/关机提示音开关：与按键反馈一样切换即落盘，不必再点「保存按钮控制」。
@@ -6696,16 +6744,7 @@ function updatePowerChimeStatus() {
 $('gpio-power-chime').addEventListener('change', async () => {
   const enabled = $('gpio-power-chime').checked;
   updatePowerChimeStatus();
-  const config = gpioConfigFromInputs();
-  setBusy(true);
-  try {
-    render(await request('api/config/gpio', { method: 'POST', body: JSON.stringify(config) }), true);
-    showMessage(enabled ? '开机与关机提示音已开启。' : '开机与关机提示音已关闭。', false, 'message-gpio');
-  } catch (error) {
-    showMessage(`保存失败：${error.message}`, true, 'message-gpio');
-  } finally {
-    setBusy(false);
-  }
+  await saveGPIOFlag('power_chime', enabled, enabled ? '开机与关机提示音已开启。' : '开机与关机提示音已关闭。');
 });
 
 // 关停档报警临时静音：切换即调用专用接口（不落盘，退出关停自动解除）。
