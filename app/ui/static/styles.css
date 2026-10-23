@@ -2146,13 +2146,47 @@ input[type="file"]:focus { border-color: #8cb4ff; box-shadow: 0 0 0 3px rgba(52,
 .firmware-row > button { margin-bottom: 1px; }
 .firmware-confirm { margin: 2px 0 10px; white-space: normal; }
 
-/* 手动升级 BIOS 标题右侧：工具徽标与「显示手动升级」开关纵向排列 */
+/* 手动升级 BIOS 标题右侧：工具徽标纵向排列（开关已内联到 h2 后面） */
 .firmware-bios-heading-side {
   display: flex;
   flex-direction: column;
   flex: 0 0 auto;
   align-items: flex-end;
   gap: 8px;
+}
+
+/* BIOS 在线升级卡底部的"手动升级 BIOS"开关：独立一行，左对齐 */
+.firmware-manual-trigger {
+  display: flex;
+  justify-content: flex-start;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border);
+}
+
+/* 网卡固件卡按钮区：与上方 hint 拉开距离，强制升级按钮大红色 */
+.firmware-nic-actions {
+  margin-top: 14px;
+}
+.firmware-nic-actions .danger {
+  background: #c0282b !important;
+  color: #fff !important;
+  border: 1px solid #a02023;
+  font-weight: 600;
+}
+.firmware-nic-actions .danger:hover:not(:disabled) {
+  background: #d63034 !important;
+}
+
+/* 原来标题行内联样式保留，开关在标题里时用 */
+.firmware-bios-toggle-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 0;
+  font-size: 14px;
+  font-weight: normal;
+  cursor: pointer;
 }
 
 .firmware-nic-status {

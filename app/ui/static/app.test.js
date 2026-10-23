@@ -189,7 +189,7 @@ function recordingFetch(responseFor) {
 
 const { resolve } = loadAppContext();
 
-test('盘位覆盖层标签：empty/present/used/warning/unknown 各状态文案统一', () => {
+test('盘位覆盖层标签：活动词只给 used，其余状态统一占位', () => {
   const storageSlotStatusLabel = resolve('storageSlotStatusLabel');
   assert.equal(storageSlotStatusLabel({ state: 'empty' }, 'empty'), '空置');
   assert.equal(storageSlotStatusLabel({ state: 'present' }), '未使用');
@@ -200,21 +200,20 @@ test('盘位覆盖层标签：empty/present/used/warning/unknown 各状态文案
   assert.equal(storageSlotStatusLabel({ state: 'used', activity: 'busy' }), '繁忙');
   assert.equal(storageSlotStatusLabel({ state: 'used', activity: 'full' }), '满载');
   assert.equal(storageSlotStatusLabel({ state: 'used', activity: 'sleeping' }), '休眠');
-  assert.equal(storageSlotStatusLabel({ state: 'warning' }), '告警');
-  assert.equal(storageSlotStatusLabel({ state: 'unknown' }), '未知');
+  // warning/unknown/高温都不是正常"在用"，活动行统一「未使用」占位，告警由健康行独占展示
+  assert.equal(storageSlotStatusLabel({ state: 'warning' }), '未使用');
+  assert.equal(storageSlotStatusLabel({ state: 'unknown' }), '未使用');
+  assert.equal(storageSlotStatusLabel({ state: 'used', kind: 'front', temperature_c: 56, activity: 'idle' }), '空闲');
 });
 
-test('盘位覆盖层标签：used 无活动读数显示"已使用"，不得伪装成 SMART 健康', () => {
+test('盘位覆盖层标签：used 无活动读数不伪装健康词', () => {
   const storageSlotStatusLabel = resolve('storageSlotStatusLabel');
   assert.equal(storageSlotStatusLabel({ state: 'used', activity: 'unknown' }), '未知');
-  assert.equal(storageSlotStatusLabel({ state: 'used' }), '已使用');
+  assert.equal(storageSlotStatusLabel({ state: 'used' }), '');
 });
 
-test('盘位覆盖层标签：高温优先于活动状态，前置与 M.2 阈值各自生效', () => {
-  const storageSlotStatusLabel = resolve('storageSlotStatusLabel');
+test('盘位高温阈值：前置 55°C、M.2 70°C 各自生效', () => {
   const isStorageHot = resolve('isStorageHot');
-  assert.equal(storageSlotStatusLabel({ state: 'used', kind: 'front', temperature_c: 56, activity: 'idle' }), '高温');
-  assert.equal(storageSlotStatusLabel({ state: 'used', kind: 'm2', temperature_c: 71, activity: 'idle' }), '高温');
   assert.equal(isStorageHot({ kind: 'front', temperature_c: 55 }), true);
   assert.equal(isStorageHot({ kind: 'm2', temperature_c: 70 }), true);
   assert.equal(isStorageHot({ kind: 'front', temperature_c: 54.9 }), false);
@@ -2719,27 +2718,33 @@ test('固件状态渲染：刷写工具徽标、网卡字段、目标版本与�
   assert.equal(app.element('firmware-nic-flash').disabled, true);
 });
 
-test('BIOS 刷写：未勾确认不发请求；二次确认后才提交 confirm=FLASH 与镜像', async () => {
+test('BIOS 刷写：双重对话框都确认后才提交 confirm=FLASH 与镜像', async () => {
   const { requests, fetch } = recordingFetch(() => ({ job: { kind: 'bios', state: 'running', logs: ['刷写中'] } }));
   const app = loadAppContext({ fetch, FormData });
   const baseline = requests.length; // 页面初始化会先拉状态，只看本用例新增的请求
 
   app.element('firmware-bios-file').files = [{ name: 'bios.bin' }];
-  await app.resolve('flashBIOS')();
-  assert.equal(requests.length, baseline, '未勾确认不得发请求');
-  assert.match(app.element('firmware-bios-log').textContent, /勾选/);
-
-  app.element('firmware-bios-confirm').checked = true;
-  // 勾选后还有第二重弹窗：取消时不得发请求
-  const cancelled = app.resolve('flashBIOS')();
+  // 第一对话框（备份确认）取消：不发请求
+  const cancelFirst = app.resolve('flashBIOS')();
   await nextTick();
-  assert.equal(requests.length, baseline, '二次确认前不得发请求');
+  assert.equal(requests.length, baseline, '第一对话框确认前不得发请求');
   await app.click('confirm-cancel');
-  await cancelled;
-  assert.equal(requests.length, baseline, '取消二次确认不得发请求');
+  await cancelFirst;
+  assert.equal(requests.length, baseline, '取消第一对话框不得发请求');
   assert.match(app.element('firmware-bios-log').textContent, /已取消/);
 
+  // 第一对话框确认、第二对话框（刷写最终确认）取消：同样不发请求
+  const cancelSecond = app.resolve('flashBIOS')();
+  await nextTick();
+  await app.click('confirm-ok');
+  await nextTick();
+  await app.click('confirm-cancel');
+  await cancelSecond;
+  assert.equal(requests.length, baseline, '取消第二对话框不得发请求');
+
   const pending = app.resolve('flashBIOS')();
+  await nextTick();
+  await app.click('confirm-ok');
   await nextTick();
   await app.click('confirm-ok');
   await pending;
@@ -2752,19 +2757,24 @@ test('BIOS 刷写：未勾确认不发请求；二次确认后才提交 confirm=
   assert.equal(app.element('firmware-bios-log').textContent, '刷写中');
 });
 
-test('网卡刷写：勾选后还需二次确认，确认后才提交 confirm=UPGRADE', async () => {
+test('网卡刷写：双重对话框都确认后才提交 confirm=UPGRADE', async () => {
   const { requests, fetch } = recordingFetch(() => ({ job: { kind: 'nic', state: 'running', logs: ['安装 MFT'] } }));
   const app = loadAppContext({ fetch, FormData });
   const baseline = requests.length;
 
-  await app.resolve('flashNIC')();
-  assert.equal(requests.length, baseline, '未勾确认不得发请求');
-  assert.match(app.element('firmware-nic-log').textContent, /勾选/);
+  // 第一对话框（型号/断电确认）取消：不发请求
+  const cancelFirst = app.resolve('flashNIC')();
+  await nextTick();
+  await app.click('confirm-cancel');
+  await cancelFirst;
+  assert.equal(requests.length, baseline, '取消第一对话框不得发请求');
+  assert.match(app.element('firmware-nic-log').textContent, /已取消/);
 
-  app.element('firmware-nic-confirm').checked = true;
   const pending = app.resolve('flashNIC')();
   await nextTick();
-  assert.equal(requests.length, baseline, '二次确认前不得发请求');
+  assert.equal(requests.length, baseline, '对话框确认前不得发请求');
+  await app.click('confirm-ok');
+  await nextTick();
   await app.click('confirm-ok');
   await pending;
   assert.equal(requests.length, baseline + 1);
@@ -2773,7 +2783,7 @@ test('网卡刷写：勾选后还需二次确认，确认后才提交 confirm=UP
   assert.equal(sent.init.body.get('confirm'), 'UPGRADE');
 });
 
-test('BIOS 在线升级状态渲染：有新版本显示徽标/更新日志，勾选后刷写按钮才可用', () => {
+test('BIOS 在线升级状态渲染：有新版本显示徽标/更新日志并放开刷写按钮', () => {
   const app = loadAppContext();
   const renderBIOSOnline = app.resolve('renderBIOSOnline');
 
@@ -2795,10 +2805,7 @@ test('BIOS 在线升级状态渲染：有新版本显示徽标/更新日志，�
   assert.match(app.element('bios-online-badge').className, /success/);
   assert.match(app.element('bios-online-changelog').textContent, /更新日志（TAD6S4N10G-BIOS-N100-2026_06_25\.zip）：\n1\. 修复风扇曲线/);
   assert.equal(app.element('bios-online-changelog').hidden, false);
-  // 未勾确认时按钮必须保持禁用
-  assert.equal(app.element('bios-online-flash').disabled, true);
-  app.element('bios-online-confirm').checked = true;
-  app.resolve('updateBIOSOnlineFlashButton')();
+  // 有可升级候选即放开刷写（刷写本身走双重对话框确认，不再依赖勾选框）
   assert.equal(app.element('bios-online-flash').disabled, false);
 });
 
@@ -2815,12 +2822,11 @@ test('BIOS 在线升级状态渲染：已是最新隐藏日志并禁用刷写，
     candidate_build_date: '2026-06-24 21:55',
     update_available: false,
   });
-  assert.equal(app.element('bios-online-badge').textContent, '已是最新');
-  assert.match(app.element('bios-online-hint').textContent, /已是最新/);
+  // 已是最新：badge 与 hint 都保持空白，只禁用刷写按钮
+  assert.equal(app.element('bios-online-badge').textContent, '');
+  assert.equal(app.element('bios-online-hint').textContent, '');
   assert.equal(app.element('bios-online-changelog').hidden, true);
-  app.element('bios-online-confirm').checked = true;
-  app.resolve('updateBIOSOnlineFlashButton')();
-  assert.equal(app.element('bios-online-flash').disabled, true, '无更新时勾选也不得放开刷写');
+  assert.equal(app.element('bios-online-flash').disabled, true, '无更新时不得放开刷写');
 
   renderBIOSOnline({ model: '', error: '读取云端 BIOS 索引失败: 404' });
   assert.equal(app.element('bios-online-badge').textContent, '检查失败');
@@ -2828,7 +2834,7 @@ test('BIOS 在线升级状态渲染：已是最新隐藏日志并禁用刷写，
   assert.match(app.element('bios-online-hint').textContent, /404/);
 });
 
-test('BIOS 在线升级检查：点击后发 POST 请求并渲染结果，未勾确认不发起刷写', async () => {
+test('BIOS 在线升级检查：点击后发 POST 请求并渲染结果，刷写需双重对话框确认', async () => {
   const { requests, fetch } = recordingFetch((url) => {
     if (/bios-online\/check$/.test(url)) {
       return {
@@ -2852,22 +2858,18 @@ test('BIOS 在线升级检查：点击后发 POST 请求并渲染结果，未勾
   assert.equal(checkReq.init.method, 'POST');
   assert.equal(app.element('bios-online-badge').textContent, '有新版本');
 
-  // 未勾确认：刷写直接拦截，不发请求
+  // 第一对话框（备份确认）取消：不发刷写请求
   const beforeFlash = requests.length;
-  await app.resolve('flashBIOSOnline')();
-  assert.equal(requests.length, beforeFlash);
-  assert.match(app.element('bios-online-hint').textContent, /勾选/);
-
-  // 勾选后还要过二次确认：取消不得发请求
-  app.element('bios-online-confirm').checked = true;
   const cancelled = app.resolve('flashBIOSOnline')();
   await nextTick();
   await app.click('confirm-cancel');
   await cancelled;
-  assert.equal(requests.length, beforeFlash, '取消二次确认不得发请求');
+  assert.equal(requests.length, beforeFlash, '取消第一对话框不得发请求');
   assert.match(app.element('bios-online-hint').textContent, /已取消刷写/);
 
   const pending = app.resolve('flashBIOSOnline')();
+  await nextTick();
+  await app.click('confirm-ok');
   await nextTick();
   await app.click('confirm-ok');
   await pending;

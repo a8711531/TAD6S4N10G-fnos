@@ -201,6 +201,63 @@ func TestNICFlashPSIDMismatchStopsBeforeBurn(t *testing.T) {
 	}
 }
 
+func TestEnsureFlashromDownloads(t *testing.T) {
+	root := t.TempDir()
+	manager := &Manager{StatePath: filepath.Join(root, "original-state.json")}
+	payload := append([]byte{0x7f, 'E', 'L', 'F'}, []byte("fake-flashrom")...)
+	oldHash := flashromExpectedSHA256
+	flashromExpectedSHA256 = sha256Hex(payload)
+	defer func() { flashromExpectedSHA256 = oldHash }()
+	firmwareDownloadHook = func(ctx context.Context, address string) ([]byte, error) {
+		if address != flashromToolURL() {
+			t.Fatalf("下载地址异常: %s", address)
+		}
+		return payload, nil
+	}
+	defer func() { firmwareDownloadHook = nil }()
+	manager.firmwareExec = func(ctx context.Context, dir, name string, args []string) (string, error) {
+		return "flashrom v1.3", nil
+	}
+	path, err := manager.ensureFlashrom(context.Background())
+	if err != nil {
+		t.Fatalf("自动下载 flashrom 失败: %v", err)
+	}
+	if path != manager.downloadedFlashromPath() {
+		t.Fatalf("应使用数据目录副本: %s", path)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != string(payload) {
+		t.Fatalf("落盘内容异常: %v", err)
+	}
+	// 第二次调用应直接命中已下载副本，不再走网络。
+	firmwareDownloadHook = func(ctx context.Context, address string) ([]byte, error) {
+		t.Fatal("已下载副本存在时不应再下载")
+		return nil, nil
+	}
+	if again, err := manager.ensureFlashrom(context.Background()); err != nil || again != path {
+		t.Fatalf("应复用已下载副本: %s %v", again, err)
+	}
+}
+
+func TestEnsureFlashromRejectsHashMismatch(t *testing.T) {
+	root := t.TempDir()
+	manager := &Manager{StatePath: filepath.Join(root, "original-state.json")}
+	payload := append([]byte{0x7f, 'E', 'L', 'F'}, []byte("fake-flashrom")...)
+	oldHash := flashromExpectedSHA256
+	flashromExpectedSHA256 = strings.Repeat("0", 64)
+	defer func() { flashromExpectedSHA256 = oldHash }()
+	firmwareDownloadHook = func(ctx context.Context, address string) ([]byte, error) {
+		return payload, nil
+	}
+	defer func() { firmwareDownloadHook = nil }()
+	if _, err := manager.ensureFlashrom(context.Background()); err == nil || !strings.Contains(err.Error(), "校验和不匹配") {
+		t.Fatalf("校验和不匹配应报错: %v", err)
+	}
+	if _, err := os.Stat(manager.downloadedFlashromPath()); !os.IsNotExist(err) {
+		t.Fatalf("校验失败不得落盘: %v", err)
+	}
+}
+
 func waitFirmwareJob(t *testing.T, manager *Manager) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)

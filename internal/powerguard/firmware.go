@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -169,13 +170,80 @@ func (m *Manager) activeFPTPath() string {
 }
 
 // flashromPath 返回可用的 flashrom：Linux 下刷写 BIOS 区域的首选工具。
+// 依次查找：自定义配置路径、系统安装、之前自动下载到数据目录的副本。
 func (m *Manager) flashromPath() string {
 	if m.firmwareFlashrom != "" {
 		if info, err := os.Stat(m.firmwareFlashrom); err == nil && info.Mode().IsRegular() {
 			return m.firmwareFlashrom
 		}
 	}
-	return findTool("flashrom", []string{"/usr/sbin/flashrom", "/usr/bin/flashrom", "/sbin/flashrom", "/bin/flashrom"})
+	if path := findTool("flashrom", []string{"/usr/sbin/flashrom", "/usr/bin/flashrom", "/sbin/flashrom", "/bin/flashrom"}); path != "" {
+		return path
+	}
+	if path := m.downloadedFlashromPath(); path != "" {
+		if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() {
+			return path
+		}
+	}
+	return ""
+}
+
+// downloadedFlashromPath 是自动下载的 flashrom 存放路径（数据目录下）。
+func (m *Manager) downloadedFlashromPath() string {
+	dir := m.firmwareDataDir()
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, "flashrom")
+}
+
+// flashromExpectedSHA256 是服务器上分发的 flashrom 二进制的 SHA256，
+// 下载后必须匹配才会落盘使用，防止下载到被篡改/截断的文件。测试可覆盖。
+var flashromExpectedSHA256 = "73D8E8076561977615D8C46C9FEAF425D3CC8C333A5820C5228D0C973AD3B400"
+
+// flashromToolURL 返回服务器上 flashrom 二进制的下载地址（与 BIOS 索引同目录）。
+func flashromToolURL() string {
+	return filesURL([]string{
+		"TANK订制主板相关",
+		"TAD6S4N10G(N00_N305)",
+		"主板BIOS",
+		"flashrom",
+	})
+}
+
+// ensureFlashrom 保证有可用 flashrom：系统未安装时从 ky.mi-d.cn 下载一份到数据目录。
+// 部分用户主机没装 flashrom（只有刷写/读取 BIOS 才需要），自动下载省去手动装包的步骤。
+func (m *Manager) ensureFlashrom(ctx context.Context) (string, error) {
+	if path := m.flashromPath(); path != "" {
+		return path, nil
+	}
+	target := m.downloadedFlashromPath()
+	if target == "" {
+		return "", errors.New("未找到 flashrom，且模块数据目录不可用，无法自动下载")
+	}
+	data, err := downloadFirmwareFile(ctx, flashromToolURL(), firmwareToolMaxBytes)
+	if err != nil {
+		return "", fmt.Errorf("未找到 flashrom，自动下载失败: %w", err)
+	}
+	if !isLinuxELF(data) {
+		return "", errors.New("下载的 flashrom 不是 Linux ELF 可执行文件")
+	}
+	if hash := sha256Hex(data); !strings.EqualFold(hash, flashromExpectedSHA256) {
+		return "", fmt.Errorf("下载的 flashrom 校验和不匹配（期望 %s，实际 %s）", flashromExpectedSHA256, hash)
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(target, data, 0o755); err != nil {
+		return "", fmt.Errorf("保存 flashrom 失败: %w", err)
+	}
+	// 落盘后跑一次 --version 确认依赖库齐全（目标主机缺 libftdi/libjaylink 时直接报错，
+	// 不留一个跑不起来的坏副本）。
+	if output, err := m.runFirmwareCommand(ctx, filepath.Dir(target), target, []string{"--version"}); err != nil {
+		_ = os.Remove(target)
+		return "", fmt.Errorf("下载的 flashrom 无法运行（可能缺依赖库）: %v %s", err, trimCommandOutput(output))
+	}
+	return target, nil
 }
 
 // activeBIOSBackend 选择 BIOS 刷写后端：优先 flashrom（随系统安装即可用），
@@ -372,7 +440,12 @@ func (m *Manager) StartBIOSFlash(image []byte) error {
 	}
 	backend, path := m.activeBIOSBackend()
 	if path == "" {
-		return errors.New("未找到 BIOS 刷写工具：请先在系统安装 flashrom，或在「高级：自定义 FPT」中上传 Linux 版 FPT")
+		// 系统既没装 flashrom 也没上传 FPT 时，自动从服务器下载 flashrom 到数据目录。
+		if downloaded, err := m.ensureFlashrom(context.Background()); err == nil {
+			backend, path = "flashrom", downloaded
+		} else {
+			return fmt.Errorf("未找到 BIOS 刷写工具（%v），也可在「高级：自定义 FPT」中上传 Linux 版 FPT", err)
+		}
 	}
 	if backend == "fpt" {
 		data, err := os.ReadFile(path)
@@ -648,7 +721,8 @@ func (m *Manager) installMFT(ctx context.Context) error {
 	}
 	m.firmwareSetStep("安装 MFT 工具", 25)
 	m.firmwareLog("执行 %s", installer)
-	output, err := m.runFirmwareCommand(ctx, filepath.Dir(installer), "sh", []string{installer})
+	// install.sh 用 bash 语法（[[ ]]），Debian 默认 sh 是 dash 会报 "[[: not found"
+	output, err := m.runFirmwareCommand(ctx, filepath.Dir(installer), "bash", []string{installer})
 	m.firmwareLog("install.sh 输出: %s", trimCommandOutput(output))
 	if err != nil {
 		return fmt.Errorf("安装 MFT 失败: %v", err)
@@ -705,7 +779,7 @@ func downloadFirmwareFile(ctx context.Context, address string, limit int64) ([]b
 	if err != nil {
 		return nil, err
 	}
-	client := &http.Client{Timeout: 10 * time.Minute}
+	client := &http.Client{Timeout: 10 * time.Minute, Transport: firmwareHTTPTransport()}
 	response, err := client.Do(request)
 	if err != nil {
 		return nil, err
@@ -722,6 +796,38 @@ func downloadFirmwareFile(ctx context.Context, address string, limit int64) ([]b
 		return nil, fmt.Errorf("文件超过 %d MB 上限", limit>>20)
 	}
 	return data, nil
+}
+
+// firmwareHTTPTransport：部分测试主机的 /etc/resolv.conf 只配了 IPv6 DNS
+// （如 AliDNS 2402:4e00::），但本机 IPv6 出口不通，Go 纯 resolver 会一路
+// 等超时。这里自定义解析器：DNS 查询一律走 IPv4 传输；遇上 IPv6 的
+// nameserver 直接替换成公共 IPv4 DNS，保证能解析出 ky.mi-d.cn 的 A 记录。
+// 对端服务器只有 A 记录，数据面本来就走 IPv4，不受影响。
+func firmwareHTTPTransport() *http.Transport {
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			if host, port, err := net.SplitHostPort(address); err == nil {
+				if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
+					address = net.JoinHostPort("223.5.5.5", port)
+				}
+			}
+			if strings.HasPrefix(network, "udp") {
+				network = "udp4"
+			} else if strings.HasPrefix(network, "tcp") {
+				network = "tcp4"
+			}
+			dialer := &net.Dialer{Timeout: 5 * time.Second}
+			return dialer.DialContext(ctx, network, address)
+		},
+	}
+	return &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+			Resolver:  resolver,
+		}).DialContext,
+	}
 }
 
 func firmwareMFTURL() string {

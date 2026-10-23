@@ -33,7 +33,7 @@
       } catch (error) { /* localStorage 不可用时跟随系统 */ }
     })();
   </script>
-  <link rel="stylesheet" href="styles.css?v=0.10.68">
+  <link rel="stylesheet" href="styles.css?v=0.10.71">
   <script>
     // 样式自愈：升级包后浏览器可能仍持有带长缓存的远古样式表（无 CSS 变量，
     // 表现为图表坐标线消失、文字变黑、主题切换无反应）。绕过缓存拉取服务端
@@ -677,9 +677,7 @@
             <div class="panel-heading">
               <div>
                 <h2 id="firmware-online-heading">BIOS 在线升级</h2>
-                <p>从官方资源站读取固件索引（zip.txt），按本机 CPU 型号严格匹配压缩包（N150 与 N100/N305 互刷会砖，N100 与 N305 互刷也有问题，跨机型一律拦截）；仅当云端构建日期比当前 BIOS 新时才允许下载刷写。</p>
               </div>
-              <span id="bios-online-badge" class="inline-status">未检查</span>
             </div>
             <div class="firmware-nic-status">
               <div><span>本机型号</span><b id="bios-online-model">—</b></div>
@@ -692,21 +690,21 @@
             <div class="actions">
               <button id="bios-online-check" type="button">检查更新</button>
             </div>
-            <label class="toggle firmware-confirm"><input id="bios-online-confirm" type="checkbox"><span></span>我已备份 BIOS，并接受刷写失败的救砖风险</label>
             <div class="actions">
               <button id="bios-online-flash" type="button" class="danger" disabled>下载并刷写 BIOS</button>
             </div>
+            <div class="firmware-manual-trigger">
+              <label class="toggle firmware-bios-toggle-inline"><input id="firmware-bios-manual-toggle" type="checkbox"><span></span>手动升级 BIOS</label>
+            </div>
           </section>
 
-          <section class="card firmware-panel" aria-labelledby="firmware-bios-heading">
+          <section class="card firmware-panel firmware-bios-manual-card" aria-labelledby="firmware-bios-heading" hidden>
             <div class="panel-heading">
               <div>
                 <h2 id="firmware-bios-heading">手动升级 BIOS</h2>
-                <p>默认隐藏，仅用于手动选择本地 BIOS 镜像刷写：优先使用系统 flashrom 仅读写 BIOS 区域，缺少 flashrom 时回退到内置或上传的 Linux 版 FPT。刷写前会自动尝试备份当前 BIOS。刷写进度日志在展开后可见，在线升级时也会自动展开。</p>
               </div>
               <div class="firmware-bios-heading-side">
                 <span id="firmware-tool-badge" class="inline-status">未检测</span>
-                <label class="toggle"><input id="firmware-bios-manual-toggle" type="checkbox"><span></span>显示手动升级</label>
               </div>
             </div>
             <div id="firmware-bios-manual-body" hidden>
@@ -717,7 +715,6 @@
                   <small>选择与主板匹配的完整 BIOS 镜像（1–64 MB）。刷写过程中不能断电。</small>
                 </label>
               </div>
-              <label class="toggle firmware-confirm"><input id="firmware-bios-confirm" type="checkbox"><span></span>我已备份 BIOS，并接受刷写失败的救砖风险</label>
               <div class="actions">
                 <button id="firmware-bios-flash" type="button" class="danger">开始刷写 BIOS</button>
               </div>
@@ -750,12 +747,12 @@
               <div><span>当前固件</span><b id="firmware-nic-fw">—</b></div>
               <div><span>PSID</span><b id="firmware-nic-psid">—</b></div>
               <div><span>MFT 工具</span><b id="firmware-nic-mft">—</b></div>
-              <div><span>目标固件</span><b id="firmware-nic-target">—</b></div>
+              <div><span>线上固件</span><b id="firmware-nic-target">—</b></div>
             </div>
             <p id="firmware-nic-hint" class="inline-status">正在读取网卡状态…</p>
-            <label class="toggle firmware-confirm"><input id="firmware-nic-confirm" type="checkbox"><span></span>我已确认网卡型号为 MCX4421A-ACQ，并接受刷写后的断电要求</label>
-            <div class="actions">
-              <button id="firmware-nic-flash" type="button" class="danger">开始升级网卡固件</button>
+            <div class="actions firmware-nic-actions">
+              <button id="firmware-nic-flash" type="button" class="primary">开始升级网卡固件</button>
+              <button id="firmware-nic-flash-force" type="button" class="danger" hidden>使用强制命令升级</button>
             </div>
             <pre id="firmware-nic-log" class="firmware-log" aria-live="polite">等待操作…</pre>
           </section>
@@ -1100,6 +1097,6 @@
       </footer>
     </div>
   </div>
-  <script src="app.js?v=0.10.68" defer></script>
+  <script src="app.js?v=0.10.71" defer></script>
 </body>
 </html>

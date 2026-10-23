@@ -258,9 +258,10 @@ func (m *Manager) readCurrentBIOSFID(ctx context.Context) (biosFID, error) {
 			return biosFID{}, err
 		}
 	} else {
-		tool := m.flashromPath()
-		if tool == "" {
-			return biosFID{}, errors.New("未找到 flashrom，无法读取当前 BIOS 版本")
+		// 系统没装 flashrom 时自动从服务器下载（读取当前版本也需要 dump BIOS 区域）。
+		tool, err := m.ensureFlashrom(ctx)
+		if err != nil {
+			return biosFID{}, err
 		}
 		dir := m.firmwareDataDir()
 		if dir == "" {

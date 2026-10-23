@@ -596,21 +596,20 @@ function renderStorageVisual(storage = {}) {
       const health = marker.querySelector('.storage-slot-text .health-label');
       const slotType = marker.querySelector('.storage-slot-text .slot-type');
       marker.querySelector('.storage-slot-text b').textContent = id.split('-').pop();
-      // 盘类型直接用后端 device_type：
-      //   front 槽 → SSD / HDD
-      //   m2  槽 → NVMe / SATA（M.2 槽两种协议都可能）
+      // 盘类型行仅前置仓显示（2026-10-23 用户要求 M.2 面板退回旧版三行布局，
+      // 不再显示盘类型/健康行，暂时维持不变）：front 槽 → SSD / HDD
       if (slotType) {
-        if (tone !== 'empty') {
+        if (group.kind === 'front' && tone !== 'empty') {
           slotType.textContent = (slot.device_type || '').toUpperCase() || 'HDD';
           slotType.hidden = false;
         } else {
           slotType.hidden = true;
         }
       }
-      // 健康状态行：显示在活动状态和温度之间。
+      // 健康状态行：显示在活动状态和温度之间。同样仅前置仓显示，M.2 面板维持旧版。
       // 优先级：高温 → SMART/RM 等告警 → 后端 health 字段
       if (health) {
-        if (tone !== 'empty') {
+        if (group.kind === 'front' && tone !== 'empty') {
           const healthVal = storageHealthLabel(slot); // 已内含高温/告警/正常优先级
           const isHot = isStorageHot(slot);
           const isWarn = !isHot && (slot.state === 'warning' || Boolean(slot.warning) || healthVal === '告警');
@@ -634,7 +633,8 @@ function renderStorageVisual(storage = {}) {
       }
       if (status) {
         status.textContent = storageSlotStatusLabel(slot, tone);
-        status.hidden = tone === 'empty';
+        // 空仓隐藏状态词只应用于前置仓；M.2 面板维持旧版「空置」占位。
+        status.hidden = group.kind === 'front' && tone === 'empty';
       }
     });
   });
@@ -2875,9 +2875,11 @@ function firmwareFile(inputID) {
 // 手动升级 BIOS 默认折叠：只有显式打开开关才显示本地刷写入口。
 // 在线刷写进行中会自动展开，否则进度日志被藏在折叠区里看不见。
 function setManualBIOSVisible(visible) {
+  const card = document.querySelector('.firmware-bios-manual-card');
   const body = $('firmware-bios-manual-body');
   const toggle = $('firmware-bios-manual-toggle');
   if (toggle) toggle.checked = Boolean(visible);
+  if (card) card.hidden = !visible;
   if (body) body.hidden = !visible;
 }
 
@@ -2958,14 +2960,33 @@ function renderFirmwareStatus(status) {
   setText('firmware-nic-psid', nic.psid);
   setText('firmware-nic-mft', nic.mft_installed ? '已安装' : '未安装（升级时自动安装）');
   setText('firmware-nic-target', nic.target_fw || NIC_TARGET_FW);
-  if (nic.error) showFirmwareHint(`检测失败：${nic.error}`, true);
-  else if (nic.present) {
+  const flash = $('firmware-nic-flash');
+  const force = $('firmware-nic-flash-force');
+  if (nic.error) {
+    showFirmwareHint(`检测失败：${nic.error}`, true);
+    if (flash) { flash.disabled = false; flash.hidden = false; }
+    if (force) force.hidden = true;
+  } else if (nic.present) {
     const hint = $('firmware-nic-hint');
+    const currentFw = (nic.fw_version || '').trim();
+    const targetFw = (nic.target_fw || NIC_TARGET_FW || '').trim();
+    const sameVersion = currentFw && targetFw && currentFw === targetFw;
     if (hint) {
-      hint.textContent = `已检测到 ${nic.model || 'Mellanox 网卡'}，当前固件 ${nic.fw_version || '未知'}，可开始升级。`;
-      hint.className = 'inline-status';
+      if (sameVersion) {
+        hint.textContent = `已检测到 ${nic.model || 'Mellanox 网卡'}，当前固件 ${currentFw} 与在线版本一致不用升级。`;
+        hint.className = 'inline-status';
+      } else {
+        hint.textContent = `已检测到 ${nic.model || 'Mellanox 网卡'}，当前固件 ${currentFw || '未知'}，可开始升级。`;
+        hint.className = 'inline-status';
+      }
     }
-  } else showFirmwareHint('尚未检测到 Mellanox 网卡，请点击「检测网卡」。');
+    if (flash) { flash.disabled = sameVersion; flash.hidden = false; }
+    if (force) force.hidden = !sameVersion;
+  } else {
+    showFirmwareHint('尚未检测到 Mellanox 网卡，请点击「检测网卡」。');
+    if (flash) { flash.disabled = false; flash.hidden = false; }
+    if (force) force.hidden = true;
+  }
   renderFirmwareJob(status.job);
 }
 
@@ -3015,26 +3036,27 @@ async function uploadFPT() {
 }
 
 async function flashBIOS() {
-  if (!$('firmware-bios-confirm').checked) {
-    showFirmwareLog('bios', '请先勾选「我已备份 BIOS」确认项。', true);
-    return;
-  }
   const file = firmwareFile('firmware-bios-file');
   if (!file) {
     showFirmwareLog('bios', '请先选择 BIOS 镜像文件。', true);
     return;
   }
-  // 刷写是不可逆的高风险动作：勾选确认后还要再过一重弹窗
+  // 第一对话框：备份确认（替代原 checkbox）
+  const backed = await showAppConfirm({
+    title: '确认备份 BIOS',
+    message: `即将用「${file.name}」刷写 BIOS。请确认已备份当前 BIOS，并接受刷写失败的救砖风险。`,
+    confirmText: '已备份并接受风险',
+    danger: true,
+  });
+  if (!backed) { showFirmwareLog('bios', '已取消刷写。'); return; }
+  // 第二对话框：刷写最终确认
   const confirmed = await showAppConfirm({
     title: '再确认：刷写 BIOS',
-    message: `即将用「${file.name}」刷写 BIOS。刷写期间不能断电，计划关机与系统关机会被拦截；刷写失败可能导致主板无法启动，请确认型号匹配且有救砖方案。`,
+    message: `刷写期间不能断电，计划关机与系统关机会被拦截；刷写失败可能导致主板无法启动，请确认型号匹配且有救砖方案。`,
     confirmText: '确认刷写',
     danger: true,
   });
-  if (!confirmed) {
-    showFirmwareLog('bios', '已取消刷写。');
-    return;
-  }
+  if (!confirmed) { showFirmwareLog('bios', '已取消刷写。'); return; }
   const button = $('firmware-bios-flash');
   if (button) button.disabled = true;
   try {
@@ -3068,26 +3090,31 @@ async function checkNIC() {
   }
 }
 
-async function flashNIC() {
-  if (!$('firmware-nic-confirm').checked) {
-    showFirmwareLog('nic', '请先勾选网卡型号与断电要求确认项。', true);
-    return;
-  }
+async function flashNIC(force = false) {
+  // 第一对话框：网卡型号与断电确认（替代原 checkbox，不再额外加 secondaryText 避免双取消）
+  const modelOk = await showAppConfirm({
+    title: force ? '强制升级网卡固件' : '确认网卡型号',
+    message: force
+      ? `当前固件已与线上版本 ${NIC_TARGET_FW} 一致。强制刷写通常用于固件损坏或分区修复。刷写后必须完全断电再上电。`
+      : `即将升级网卡固件到 ${NIC_TARGET_FW}。请确认网卡型号为 MCX4421A-ACQ，并接受刷写后必须完全断电再上电。`,
+    confirmText: force ? '强制刷写' : '已确认型号并接受断电要求',
+    danger: true,
+  });
+  if (!modelOk) { showFirmwareLog('nic', '已取消升级。'); return; }
+  // 第二对话框：升级最终确认
   const confirmed = await showAppConfirm({
     title: '再确认：升级网卡固件',
-    message: `即将把网卡固件升级到 ${NIC_TARGET_FW}。升级期间不能断电，计划关机与系统关机会被拦截；刷写完成后必须完全断电再上电。`,
+    message: `升级期间不能断电，计划关机与系统关机会被拦截；刷写完成后必须完全断电再上电。`,
     confirmText: '确认升级',
     danger: true,
   });
-  if (!confirmed) {
-    showFirmwareLog('nic', '已取消升级。');
-    return;
-  }
-  const button = $('firmware-nic-flash');
+  if (!confirmed) { showFirmwareLog('nic', '已取消升级。'); return; }
+  const button = force ? $('firmware-nic-flash-force') : $('firmware-nic-flash');
   if (button) button.disabled = true;
   try {
     const form = new FormData();
     form.append('confirm', 'UPGRADE');
+    if (force) form.append('force', '1');
     renderFirmwareStatus(await postForm('api/firmware/nic/flash', form));
     startFirmwarePoll();
   } catch (error) {
@@ -3139,25 +3166,26 @@ function renderBIOSOnline(status) {
   const flashButton = $('bios-online-flash');
   biosOnlineUpdateAvailable = Boolean(status.update_available);
   if (status.error) {
-    if (badge) { badge.textContent = '检查失败'; badge.className = 'inline-status error'; }
     showBIOSOnlineHint(status.error, true);
-  } else if (!status.candidate_zip) {
-    if (badge) { badge.textContent = '未检查'; badge.className = 'inline-status'; }
   } else if (status.update_available) {
-    if (badge) { badge.textContent = '有新版本'; badge.className = 'inline-status success'; }
-    showBIOSOnlineHint(`发现新版本 ${status.candidate_version}（${status.candidate_build_date}），勾选确认后可下载刷写。`);
-  } else {
-    if (badge) { badge.textContent = '已是最新'; badge.className = 'inline-status'; }
-    showBIOSOnlineHint('当前 BIOS 已是最新，无需升级。');
+    showBIOSOnlineHint(`发现新版本 ${status.candidate_version}（${status.candidate_build_date}），可下载刷写。`);
+  } else if (status.candidate_zip) {
+    // 已是最新：不再显示 badge 状态，hint 保持空白让面板更干净
+    showBIOSOnlineHint('');
+  }
+  if (badge) {
+    if (status.update_available) { badge.textContent = '有新版本'; badge.className = 'inline-status success'; }
+    else if (status.error) { badge.textContent = '检查失败'; badge.className = 'inline-status error'; }
+    else if (status.candidate_zip) { badge.textContent = ''; badge.className = 'inline-status'; }
+    else { badge.textContent = '未检查'; badge.className = 'inline-status'; }
   }
   updateBIOSOnlineFlashButton();
 }
 
 function updateBIOSOnlineFlashButton() {
   const flashButton = $('bios-online-flash');
-  const confirmNode = $('bios-online-confirm');
   if (!flashButton) return;
-  flashButton.disabled = !biosOnlineUpdateAvailable || !(confirmNode && confirmNode.checked);
+  flashButton.disabled = !biosOnlineUpdateAvailable;
 }
 
 async function checkBIOSOnline() {
@@ -3180,21 +3208,23 @@ async function checkBIOSOnline() {
 }
 
 async function flashBIOSOnline() {
-  if (!$('bios-online-confirm').checked) {
-    showBIOSOnlineHint('请先勾选「我已备份 BIOS」确认项。', true);
-    return;
-  }
   const target = biosOnlineCandidateLabel || '云端候选固件';
+  // 第一对话框：备份确认（替代原 checkbox）
+  const backed = await showAppConfirm({
+    title: '确认备份 BIOS',
+    message: `即将下载并刷写 ${target}。请确认已备份当前 BIOS，并接受刷写失败的救砖风险。`,
+    confirmText: '已备份并接受风险',
+    danger: true,
+  });
+  if (!backed) { showBIOSOnlineHint('已取消刷写。'); return; }
+  // 第二对话框：刷写最终确认
   const confirmed = await showAppConfirm({
     title: '再确认：下载并刷写 BIOS',
-    message: `即将下载并刷写 ${target}。刷写期间不能断电，计划关机与系统关机会被拦截；刷写失败可能导致主板无法启动，请确认已有救砖方案。`,
+    message: `刷写期间不能断电，计划关机与系统关机会被拦截；刷写失败可能导致主板无法启动，请确认已有救砖方案。`,
     confirmText: '确认刷写',
     danger: true,
   });
-  if (!confirmed) {
-    showBIOSOnlineHint('已取消刷写。');
-    return;
-  }
+  if (!confirmed) { showBIOSOnlineHint('已取消刷写。'); return; }
   const button = $('bios-online-flash');
   if (button) button.disabled = true;
   try {
@@ -7745,10 +7775,10 @@ $('firmware-bios-manual-toggle').addEventListener('change', () => {
   setManualBIOSVisible($('firmware-bios-manual-toggle').checked);
 });
 $('firmware-nic-check').addEventListener('click', checkNIC);
-$('firmware-nic-flash').addEventListener('click', flashNIC);
+$('firmware-nic-flash').addEventListener('click', () => flashNIC(false));
+$('firmware-nic-flash-force').addEventListener('click', () => flashNIC(true));
 $('bios-online-check').addEventListener('click', checkBIOSOnline);
 $('bios-online-flash').addEventListener('click', flashBIOSOnline);
-$('bios-online-confirm').addEventListener('change', updateBIOSOnlineFlashButton);
 // 开关机计划：工具栏 + 编辑器
 $('schedule-add').addEventListener('click', () => openScheduleEditor(-1));
 $('schedule-edit').addEventListener('click', () => openScheduleEditor(powerScheduleSelected));
