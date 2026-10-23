@@ -364,6 +364,11 @@
         } else {
           gpioMsgShow(d.readable === true, d.readable === true ? "当前接线可读（已读到电源数据）" : "未检测到电源：请检查 PSCL/PSDA 接线，或点「自动识别保存」重新识别");
         }
+        // 首次打开未识别到信号：自动弹出连线图引导接线
+        if (!wiringAutoShown && d.readable !== true) {
+          wiringAutoShown = true;
+          wiringOpen();
+        }
       })
       .catch(function () { gpioMsgShow(false, "无法读取 GPIO 配置"); });
   }
@@ -431,6 +436,8 @@
   var wiringImg = $("wiring-img");
   var wiringZoomLabel = $("wiring-zoom-label");
   var wiringZoom = 1;
+  // 首次打开页面且未识别到信号时自动弹出连线图引导接线，每次进页面最多一次
+  var wiringAutoShown = false;
   var WIRING_ZOOM_MIN = 0.25, WIRING_ZOOM_MAX = 4, WIRING_ZOOM_STEP = 0.25;
   function wiringApplyZoom() {
     if (wiringImg) wiringImg.style.width = Math.round(wiringZoom * 100) + "%";
