@@ -2912,9 +2912,12 @@ function renderFirmwareJob(job) {
   target.textContent = firmwareLogText(job);
   target.className = `firmware-log${state === 'success' ? ' success' : state === 'failed' ? ' error' : ''}`;
   const running = state === 'running';
-  ['firmware-fpt-upload', 'firmware-bios-flash', 'firmware-nic-check', 'firmware-nic-flash', 'bios-online-check'].forEach((id) => {
+  ['firmware-fpt-upload', 'firmware-bios-flash', 'firmware-nic-check', 'firmware-nic-flash', 'firmware-nic-flash-force', 'firmware-nic-mft-install', 'bios-online-check'].forEach((id) => {
     const button = $(id);
-    if (button) button.disabled = running;
+    if (!button) return;
+    // 网卡升级键的 disabled 归 renderFirmwareStatus 的同版本逻辑管，空闲时不得强制放开
+    if (!running && id === 'firmware-nic-flash') return;
+    button.disabled = running;
   });
   if (running) {
     const onlineFlash = $('bios-online-flash');
@@ -2958,21 +2961,32 @@ function renderFirmwareStatus(status) {
   setText('firmware-nic-pci', nic.pci_address);
   setText('firmware-nic-fw', nic.fw_version);
   setText('firmware-nic-psid', nic.psid);
-  setText('firmware-nic-mft', nic.mft_installed ? '已安装' : '未安装（升级时自动安装）');
+  setText('firmware-nic-mft', nic.mft_installed ? '已安装' : '未安装（可手动安装，升级时也会自动安装）');
   setText('firmware-nic-target', nic.target_fw || NIC_TARGET_FW);
   const flash = $('firmware-nic-flash');
   const force = $('firmware-nic-flash-force');
-  if (nic.error) {
-    showFirmwareHint(`检测失败：${nic.error}`, true);
-    if (flash) { flash.disabled = false; flash.hidden = false; }
+  const mftBtn = $('firmware-nic-mft-install');
+  // 三个操作按钮都只在检测到网卡之后才出现（2026-10-23 用户要求）
+  if (!nic.present) {
+    if (nic.error) {
+      showFirmwareHint(`检测失败：${nic.error}`, true);
+    } else {
+      showFirmwareHint('尚未检测到 Mellanox 网卡，请点击「检测网卡」。');
+    }
+    if (flash) flash.hidden = true;
     if (force) force.hidden = true;
-  } else if (nic.present) {
+    if (mftBtn) mftBtn.hidden = true;
+  } else {
     const hint = $('firmware-nic-hint');
     const currentFw = (nic.fw_version || '').trim();
     const targetFw = (nic.target_fw || NIC_TARGET_FW || '').trim();
-    const sameVersion = currentFw && targetFw && currentFw === targetFw;
+    const sameVersion = !!(currentFw && targetFw && currentFw === targetFw);
+    const mftMissing = !nic.mft_installed;
     if (hint) {
-      if (sameVersion) {
+      if (mftMissing) {
+        hint.textContent = `已检测到 ${nic.model || 'Mellanox 网卡'}，但未安装 MFT 工具：可先点「安装 MFT 工具」（自动从服务器下载安装），或直接开始升级。`;
+        hint.className = 'inline-status';
+      } else if (sameVersion) {
         hint.textContent = `已检测到 ${nic.model || 'Mellanox 网卡'}，当前固件 ${currentFw} 与在线版本一致不用升级。`;
         hint.className = 'inline-status';
       } else {
@@ -2980,12 +2994,9 @@ function renderFirmwareStatus(status) {
         hint.className = 'inline-status';
       }
     }
-    if (flash) { flash.disabled = sameVersion; flash.hidden = false; }
+    if (mftBtn) mftBtn.hidden = !mftMissing;
+    if (flash) { flash.hidden = false; flash.disabled = sameVersion; }
     if (force) force.hidden = !sameVersion;
-  } else {
-    showFirmwareHint('尚未检测到 Mellanox 网卡，请点击「检测网卡」。');
-    if (flash) { flash.disabled = false; flash.hidden = false; }
-    if (force) force.hidden = true;
   }
   renderFirmwareJob(status.job);
 }
@@ -3119,6 +3130,25 @@ async function flashNIC(force = false) {
     startFirmwarePoll();
   } catch (error) {
     showFirmwareLog('nic', `升级启动失败：${error.message}`, true);
+    if (button) button.disabled = false;
+  }
+}
+
+// 手动安装 MFT：检测到网卡但没装 MFT 时显示，自动从服务器下载并安装。
+async function installMFTTool() {
+  const ok = await showAppConfirm({
+    title: '安装 MFT 工具',
+    message: '将自动从服务器下载 MFT 4.37.0 并安装到系统，过程约 1–2 分钟，期间请勿关闭页面。',
+    confirmText: '开始安装',
+  });
+  if (!ok) { showFirmwareLog('nic', '已取消安装。'); return; }
+  const button = $('firmware-nic-mft-install');
+  if (button) button.disabled = true;
+  try {
+    renderFirmwareStatus(await postForm('api/firmware/nic/install-mft', new FormData()));
+    startFirmwarePoll();
+  } catch (error) {
+    showFirmwareLog('nic', `安装启动失败：${error.message}`, true);
     if (button) button.disabled = false;
   }
 }
@@ -7777,6 +7807,7 @@ $('firmware-bios-manual-toggle').addEventListener('change', () => {
 $('firmware-nic-check').addEventListener('click', checkNIC);
 $('firmware-nic-flash').addEventListener('click', () => flashNIC(false));
 $('firmware-nic-flash-force').addEventListener('click', () => flashNIC(true));
+$('firmware-nic-mft-install').addEventListener('click', installMFTTool);
 $('bios-online-check').addEventListener('click', checkBIOSOnline);
 $('bios-online-flash').addEventListener('click', flashBIOSOnline);
 // 开关机计划：工具栏 + 编辑器

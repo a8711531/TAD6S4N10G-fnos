@@ -33,7 +33,7 @@
       } catch (error) { /* localStorage 不可用时跟随系统 */ }
     })();
   </script>
-  <link rel="stylesheet" href="styles.css?v=0.10.72">
+  <link rel="stylesheet" href="styles.css?v=0.10.73">
   <script>
     // 样式自愈：升级包后浏览器可能仍持有带长缓存的远古样式表（无 CSS 变量，
     // 表现为图表坐标线消失、文字变黑、主题切换无反应）。绕过缓存拉取服务端
@@ -751,7 +751,8 @@
             </div>
             <p id="firmware-nic-hint" class="inline-status">正在读取网卡状态…</p>
             <div class="actions firmware-nic-actions">
-              <button id="firmware-nic-flash" type="button" class="primary">开始升级网卡固件</button>
+              <button id="firmware-nic-mft-install" type="button" hidden>安装 MFT 工具</button>
+              <button id="firmware-nic-flash" type="button" class="primary" hidden>开始升级网卡固件</button>
               <button id="firmware-nic-flash-force" type="button" class="danger" hidden>使用强制命令升级</button>
             </div>
             <pre id="firmware-nic-log" class="firmware-log" aria-live="polite">等待操作…</pre>
@@ -1097,6 +1098,6 @@
       </footer>
     </div>
   </div>
-  <script src="app.js?v=0.10.72" defer></script>
+  <script src="app.js?v=0.10.73" defer></script>
 </body>
 </html>

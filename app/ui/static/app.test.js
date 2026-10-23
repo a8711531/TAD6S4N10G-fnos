@@ -2718,6 +2718,64 @@ test('固件状态渲染：刷写工具徽标、网卡字段、目标版本与�
   assert.equal(app.element('firmware-nic-flash').disabled, true);
 });
 
+test('网卡操作按钮：检测到网卡才显示，未装 MFT 时出现手动安装按钮', () => {
+  const app = loadAppContext();
+  const renderFirmwareStatus = app.resolve('renderFirmwareStatus');
+
+  // 未检测到网卡：三个按钮全部隐藏
+  renderFirmwareStatus({ flashrom: { present: true }, fpt: {}, nic: {}, job: {} });
+  assert.equal(app.element('firmware-nic-flash').hidden, true);
+  assert.equal(app.element('firmware-nic-flash-force').hidden, true);
+  assert.equal(app.element('firmware-nic-mft-install').hidden, true);
+
+  // 检测到网卡但未装 MFT：显示「安装 MFT 工具」与升级按钮，提示手动安装
+  renderFirmwareStatus({
+    flashrom: { present: true },
+    fpt: {},
+    nic: { present: true, model: 'ConnectX-4 Lx', pci_address: '01:00.0', mft_installed: false, target_fw: '14.32.1900', error: '未安装 MFT 工具' },
+    job: {},
+  });
+  assert.equal(app.element('firmware-nic-mft-install').hidden, false);
+  assert.equal(app.element('firmware-nic-flash').hidden, false);
+  assert.equal(app.element('firmware-nic-flash').disabled, false);
+  assert.equal(app.element('firmware-nic-flash-force').hidden, true);
+  assert.match(app.element('firmware-nic-hint').textContent, /安装 MFT 工具/);
+
+  // MFT 已安装且固件一致：强制升级出现，安装 MFT 隐藏，主按钮禁用
+  renderFirmwareStatus({
+    flashrom: { present: true },
+    fpt: {},
+    nic: { present: true, model: 'ConnectX-4 Lx', fw_version: '14.32.1900', mft_installed: true, target_fw: '14.32.1900' },
+    job: {},
+  });
+  assert.equal(app.element('firmware-nic-mft-install').hidden, true);
+  assert.equal(app.element('firmware-nic-flash').hidden, false);
+  assert.equal(app.element('firmware-nic-flash').disabled, true);
+  assert.equal(app.element('firmware-nic-flash-force').hidden, false);
+});
+
+test('手动安装 MFT：确认对话框后才 POST install-mft', async () => {
+  const { requests, fetch } = recordingFetch(() => ({ job: { kind: 'nic', state: 'running', logs: ['下载 MFT 工具'] } }));
+  const app = loadAppContext({ fetch, FormData });
+  const baseline = requests.length;
+
+  const cancelled = app.resolve('installMFTTool')();
+  await nextTick();
+  await app.click('confirm-cancel');
+  await cancelled;
+  assert.equal(requests.length, baseline, '取消确认不得发请求');
+  assert.match(app.element('firmware-nic-log').textContent, /已取消/);
+
+  const pending = app.resolve('installMFTTool')();
+  await nextTick();
+  await app.click('confirm-ok');
+  await pending;
+  assert.equal(requests.length, baseline + 1);
+  const sent = requests[requests.length - 1];
+  assert.match(sent.url, /api\/firmware\/nic\/install-mft$/);
+  assert.equal(sent.init.method, 'POST');
+});
+
 test('BIOS 刷写：双重对话框都确认后才提交 confirm=FLASH 与镜像', async () => {
   const { requests, fetch } = recordingFetch(() => ({ job: { kind: 'bios', state: 'running', logs: ['刷写中'] } }));
   const app = loadAppContext({ fetch, FormData });

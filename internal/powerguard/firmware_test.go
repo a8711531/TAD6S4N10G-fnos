@@ -239,6 +239,35 @@ func TestEnsureFlashromDownloads(t *testing.T) {
 	}
 }
 
+func TestStartNICMFTInstallSkipsWhenInstalled(t *testing.T) {
+	root := t.TempDir()
+	manager := &Manager{StatePath: filepath.Join(root, "state.json")}
+	// 伪装 MFT 已安装：flint/mst 指向真实存在的文件，installMFT 不应被触发。
+	tool := filepath.Join(root, "flint")
+	if err := os.WriteFile(tool, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manager.firmwareFlint = tool
+	manager.firmwareMST = tool
+	firmwareDownloadHook = func(ctx context.Context, address string) ([]byte, error) {
+		t.Fatal("MFT 已安装时不应再下载")
+		return nil, nil
+	}
+	defer func() { firmwareDownloadHook = nil }()
+	if err := manager.StartNICMFTInstall(); err != nil {
+		t.Fatalf("启动 MFT 安装任务失败: %v", err)
+	}
+	waitFirmwareJob(t, manager)
+	status := manager.FirmwareStatus()
+	if status.Job.State != firmwareJobSuccess {
+		t.Fatalf("已安装时应直接成功，实际 %s: %s", status.Job.State, status.Job.Error)
+	}
+	if err := manager.StartNICMFTInstall(); err != nil {
+		t.Fatalf("空闲状态下应能再次启动: %v", err)
+	}
+	waitFirmwareJob(t, manager)
+}
+
 func TestEnsureFlashromRejectsHashMismatch(t *testing.T) {
 	root := t.TempDir()
 	manager := &Manager{StatePath: filepath.Join(root, "original-state.json")}

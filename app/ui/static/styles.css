@@ -2167,6 +2167,7 @@ input[type="file"]:focus { border-color: #8cb4ff; box-shadow: 0 0 0 3px rgba(52,
 /* 网卡固件卡按钮区：与上方 hint 拉开距离，强制升级按钮大红色 */
 .firmware-nic-actions {
   margin-top: 14px;
+  justify-content: flex-end;
 }
 .firmware-nic-actions .danger {
   background: #c0282b !important;

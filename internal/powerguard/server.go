@@ -137,6 +137,7 @@ func (s *Server) ListenAndServe() error {
 	mux.HandleFunc("/api/firmware/bios-online/flash", s.handleBIOSOnlineFlash)
 	mux.HandleFunc("/api/firmware/nic/check", s.handleFirmwareNICCheck)
 	mux.HandleFunc("/api/firmware/nic/flash", s.handleFirmwareNICFlash)
+	mux.HandleFunc("/api/firmware/nic/install-mft", s.handleFirmwareNICInstallMFT)
 	mux.HandleFunc("/api/stress", s.handleStressStatus)
 	mux.HandleFunc("/api/stress/start", s.handleStressStart)
 	mux.HandleFunc("/api/stress/stop", s.handleStressStop)
@@ -1266,6 +1267,27 @@ func (s *Server) handleFirmwareNICFlash(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if err := s.Manager.StartNICFlash(firmware); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, errFirmwareBusy) {
+			status = http.StatusConflict
+		}
+		writeError(w, status, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, s.Manager.FirmwareStatus())
+}
+
+// handleFirmwareNICInstallMFT 手动安装 MFT：下载、解压、安装并启动 mst。
+func (s *Server) handleFirmwareNICInstallMFT(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w)
+		return
+	}
+	if !isAdmin(r) {
+		writeError(w, http.StatusForbidden, "仅管理员可以安装 MFT 工具")
+		return
+	}
+	if err := s.Manager.StartNICMFTInstall(); err != nil {
 		status := http.StatusBadRequest
 		if errors.Is(err, errFirmwareBusy) {
 			status = http.StatusConflict

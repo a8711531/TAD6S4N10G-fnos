@@ -477,6 +477,39 @@ func (m *Manager) StartNICFlash(firmware []byte) error {
 	return nil
 }
 
+// StartNICMFTInstall 手动安装 MFT：检测到网卡但未安装 MFT 时由页面触发，
+// 自动从服务器下载、解压、安装并启动 mst，安装后刷新网卡缓存状态。
+func (m *Manager) StartNICMFTInstall() error {
+	if err := m.beginFirmwareJob(firmwareJobKindNIC); err != nil {
+		return err
+	}
+	go m.runMFTInstall()
+	return nil
+}
+
+func (m *Manager) runMFTInstall() {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	defer cancel()
+	if m.flintPath() != "" && m.mstPath() != "" {
+		m.firmwareFinish(nil, "MFT 工具已安装，无需重复安装。")
+		return
+	}
+	if err := m.installMFT(ctx); err != nil {
+		m.firmwareFinish(err, "")
+		return
+	}
+	m.firmwareSetStep("启动 MST", 80)
+	if output, err := m.runFirmwareCommand(ctx, "", m.mstPath(), []string{"start"}); err != nil {
+		m.firmwareLog("mst start: %v %s", err, trimCommandOutput(output))
+	}
+	// 安装后刷新网卡缓存，页面立刻能看到 MFT 已安装与固件版本。
+	info := m.detectNIC(ctx)
+	m.firmwareMu.Lock()
+	m.firmwareNIC = info
+	m.firmwareMu.Unlock()
+	m.firmwareFinish(nil, "MFT 工具安装完成，可开始升级网卡固件。")
+}
+
 func (m *Manager) beginFirmwareJob(kind string) error {
 	m.firmwareMu.Lock()
 	if m.firmwareJob.state == firmwareJobRunning {
