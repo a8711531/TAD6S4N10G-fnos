@@ -40,13 +40,15 @@ type mockPIO struct {
 	failOutbOnPort int            // 非负时仅该端口 outb 失败 (测试局部写失败, 如 sioWrite 数据口)
 	failInb        bool           // true 时 inb 恒失败 (测试端口读错误向上传播)
 	failWhen       map[int64]bool // 定点故障注入: key=port<<8|v, 命中一次 outb(port,v) 失败后自动清除
+	failOnNth      map[int64]int  // 第 N 次 outb(port,v) 才失败 (同值写多次时精确打击第 N 次)
+	matchCount     map[int64]int  // failOnNth 的已匹配计数
 	sioExits       int            // 记录 sioExit (outb 0x2E=0xAA) 执行次数
 	writes         int
 }
 
 func newMockPIO() *mockPIO {
 	return &mockPIO{mem: map[int]byte{}, readMask: map[int]byte{}, failOutbOnPort: -1,
-		failWhen: map[int64]bool{}}
+		failWhen: map[int64]bool{}, failOnNth: map[int64]int{}, matchCount: map[int64]int{}}
 }
 
 // injectOutbFail 定点注入: 仅下一次 outb(port, v) 失败 (测试"仅方向寄存器索引
@@ -55,6 +57,21 @@ func (m *mockPIO) injectOutbFail(port int, v byte) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.failWhen[int64(port)<<8|int64(v)] = true
+}
+
+// injectOutbFailOnNth 第 N 次 outb(port, v) 才注入失败 (如"复位末尾 SDA 释放"
+// 与 initDirs 写同一值, 需跳过前几次命中精确打击最后一次)
+func (m *mockPIO) injectOutbFailOnNth(port int, v byte, n int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.failOnNth[int64(port)<<8|int64(v)] = n
+}
+
+// resetOutbCounts 清零 failOnNth 匹配计数 (测试准备阶段的写入不计入 N)
+func (m *mockPIO) resetOutbCounts() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.matchCount = map[int64]int{}
 }
 
 func (m *mockPIO) inb(port int) (byte, error) {
@@ -79,6 +96,12 @@ func (m *mockPIO) outb(port int, v byte) error {
 	if m.failWhen[key] {
 		delete(m.failWhen, key) // 一次性: 命中后自动恢复, 后续同参数写入正常
 		return errors.New("mock: 定点写失败")
+	}
+	if n, ok := m.failOnNth[key]; ok {
+		m.matchCount[key]++
+		if m.matchCount[key] == n { // 第 N 次同参数写入才失败 (前 N-1 次放行)
+			return errors.New("mock: 定点写失败")
+		}
 	}
 	if port == 0x2E && v == 0xAA {
 		m.sioExits++
@@ -469,7 +492,7 @@ func TestDetectApplyFailure(t *testing.T) {
 	mock := newMockPIO()
 	mock.failOutb = true // 方向写全失败: 应用必败
 	b.pio = mock
-	srv := &AppServer{Bus: b, DetectFn: func(context.Context) (string, string) { return "Pin19", "Pin20" }}
+	srv := &AppServer{Bus: b, DetectFn: func(context.Context) (string, string, error) { return "Pin19", "Pin20", nil }}
 	req := httptest.NewRequest(http.MethodPost, "/api/crps/detect", nil)
 	rec := httptest.NewRecorder()
 	srv.APIHandler().ServeHTTP(rec, req)
@@ -500,7 +523,7 @@ func TestDetectSaveFailure(t *testing.T) {
 	srv := &AppServer{
 		Bus:        b,
 		ConfigPath: filepath.Join(t.TempDir(), "no-such-dir", "crps.json"), // 目录不存在: 写盘必败
-		DetectFn:   func(context.Context) (string, string) { return "Pin19", "Pin20" },
+		DetectFn:   func(context.Context) (string, string, error) { return "Pin19", "Pin20", nil },
 	}
 	req := httptest.NewRequest(http.MethodPost, "/api/crps/detect", nil)
 	rec := httptest.NewRecorder()
@@ -528,6 +551,345 @@ func TestNewBusInvalidPinsStayUnconfigured(t *testing.T) {
 		if len(b.drivenPins()) != 0 {
 			t.Fatalf("非法配置 %v 不得写方向寄存器 (driven 追踪应为空)", tc)
 		}
+	}
+}
+
+// ---------------- autoDetect 收尾 restore ----------------
+
+// 未配置总线探测收尾: 只释放扫描期间驱动过的针脚, 不得驱动任何引脚 (含原 SCL)。
+// 旧实现 restore 无条件 switchPin(orig)+busReset, 会把未配置机器的默认 SCL
+// 驱动为输出, 违反"未配置不碰 GPIO 方向"的安全前提 (探测取消/无匹配同样适用)。
+func TestAutoDetectRestoreUnconfiguredReleasesAllDriven(t *testing.T) {
+	stubPortAvailable(t, true)
+	b := NewBus("Pin19", "Pin20", false)
+	b.pio = newMockPIO()
+
+	// 模拟扫描中途状态: Pin19/Pin21 已被驱动为输出 (driven 追踪在案)
+	b.mu.Lock()
+	if err := b.setPinDir("Pin19", GPPins["Pin19"], true); err != nil {
+		t.Fatalf("预置驱动 Pin19 失败: %v", err)
+	}
+	if err := b.setPinDir("Pin21", GPPins["Pin21"], true); err != nil {
+		t.Fatalf("预置驱动 Pin21 失败: %v", err)
+	}
+	b.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // 立即取消: 第一轮 sleepCtx 即失败, 直接走 restore
+	scl, sda, err := b.autoDetect(ctx)
+	if scl != "" || sda != "" {
+		t.Fatalf("已取消的探测不应命中接线, 得到 %s/%s", scl, sda)
+	}
+	if err != nil {
+		t.Fatalf("清理成功时错误应为 nil, 得到 %v", err)
+	}
+	if pins := b.drivenPins(); len(pins) != 0 {
+		t.Fatalf("未配置收尾应释放全部已驱动针脚, 仍残留 %v", pins)
+	}
+	if b.isConfigured() {
+		t.Fatal("探测收尾不得改变 configured 状态")
+	}
+}
+
+// 未配置收尾释放失败必须如实保留 driven 追踪 (可重试), 不得假报已恢复;
+// 故障清除后重试应全部释放。
+func TestAutoDetectRestoreUnconfiguredFailureKeepsTracking(t *testing.T) {
+	stubPortAvailable(t, true)
+	b := NewBus("Pin19", "Pin20", false)
+	mock := newMockPIO()
+	b.pio = mock
+
+	b.mu.Lock()
+	if err := b.setPinDir("Pin21", GPPins["Pin21"], true); err != nil {
+		t.Fatalf("预置驱动 Pin21 失败: %v", err)
+	}
+	b.mu.Unlock()
+
+	// 数据口 0x2F 写全失败: 释放必败, driven 追踪应保留, 清理错误如实返回
+	mock.failOutbOnPort = 0x2F
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, err := b.autoDetect(ctx)
+	if err == nil {
+		t.Fatal("释放失败时必须返回清理错误, 不得静默吞掉")
+	}
+	if !strings.Contains(err.Error(), "Pin21") {
+		t.Fatalf("清理错误应点名失败针脚 Pin21, 得到 %v", err)
+	}
+	if pins := b.drivenPins(); len(pins) == 0 {
+		t.Fatal("释放失败时不得清空 driven 追踪 (假报已恢复)")
+	}
+
+	// 故障清除后重试: 全部释放, 错误消失
+	mock.failOutbOnPort = -1
+	if _, _, err := b.autoDetect(ctx); err != nil {
+		t.Fatalf("故障清除后重试清理应成功, 得到 %v", err)
+	}
+	if pins := b.drivenPins(); len(pins) != 0 {
+		t.Fatalf("故障清除后重试应释放全部针脚, 仍残留 %v", pins)
+	}
+}
+
+// 已配置总线探测收尾: 恢复原引脚并保持 SCL 驱动, 扫描残留针脚全部释放,
+// configured 状态保持不变。
+func TestAutoDetectRestoreConfiguredRestoresOriginalPins(t *testing.T) {
+	stubPortAvailable(t, true)
+	b := NewBus("Pin19", "Pin20", false)
+	b.pio = newMockPIO()
+	if ok, msg := b.reconfigure(nil, nil); !ok {
+		t.Fatalf("reconfigure 应成功: %s", msg)
+	}
+	// 模拟扫描残留: Pin21 已被驱动
+	b.mu.Lock()
+	if err := b.setPinDir("Pin21", GPPins["Pin21"], true); err != nil {
+		t.Fatalf("预置驱动 Pin21 失败: %v", err)
+	}
+	b.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := b.autoDetect(ctx); err != nil {
+		t.Fatalf("已配置收尾应成功 (switchPin+busReset 均无故障), 得到 %v", err)
+	}
+
+	if scl, sda := b.pinNames(); scl != "Pin19" || sda != "Pin20" {
+		t.Fatalf("已配置收尾应恢复原引脚, 得到 %s/%s", scl, sda)
+	}
+	pins := b.drivenPins()
+	if len(pins) != 1 || pins[0] != "Pin19" {
+		t.Fatalf("收尾后应仅剩原 SCL (Pin19) 保持驱动, 实际 %v", pins)
+	}
+	if !b.isConfigured() {
+		t.Fatal("已配置收尾不得清除 configured 状态")
+	}
+}
+
+// 已配置收尾的两条失败路径都必须经 autoDetect 第三返回值上报:
+//  1. switchPin 恢复原引脚失败 (failOutb 全写失败) -> "恢复原引脚失败"
+//  2. switchPin 成功但 busReset 末尾 sdaRelease 端口写失败 -> "总线复位失败",
+//     SDA 滞留输出须保留在 driven 追踪; 故障清除后重试应释放并消除错误。
+// 复位末尾的释放与 initDirs 的 SDA 置输入写同一值 (Pin20: 0xCD 寄存器清 bit0
+// => sioWrite 数据口 0x2F 写 0x06), 用 failOnNth 跳过 initDirs 那次精确打击复位末尾。
+func TestAutoDetectRestoreConfiguredFailurePropagates(t *testing.T) {
+	stubPortAvailable(t, true)
+
+	// 路径 1: switchPin 失败
+	b1 := NewBus("Pin19", "Pin20", false)
+	m1 := newMockPIO()
+	b1.pio = m1
+	if ok, msg := b1.reconfigure(nil, nil); !ok {
+		t.Fatalf("reconfigure 应成功: %s", msg)
+	}
+	m1.failOutb = true
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := b1.autoDetect(ctx); err == nil || !strings.Contains(err.Error(), "恢复原引脚失败") {
+		t.Fatalf("switchPin 失败应报 '恢复原引脚失败', 得到 %v", err)
+	}
+
+	// 路径 2: busReset 末尾 sdaRelease 失败
+	b := NewBus("Pin19", "Pin20", false)
+	mock := newMockPIO()
+	b.pio = mock
+	if ok, msg := b.reconfigure(nil, nil); !ok {
+		t.Fatalf("reconfigure 应成功: %s", msg)
+	}
+	mock.resetOutbCounts()                  // reconfigure 准备阶段的写入不计入
+	mock.injectOutbFailOnNth(0x2F, 0x06, 2) // 第 1 次=initDirs 置 SDA 输入(放行), 第 2 次=复位末尾释放(失败)
+	if _, _, err := b.autoDetect(ctx); err == nil || !strings.Contains(err.Error(), "总线复位失败") {
+		t.Fatalf("busReset 失败应报 '总线复位失败', 得到 %v", err)
+	}
+	pins := b.drivenPins()
+	stuck := false
+	for _, p := range pins {
+		if p == "Pin20" {
+			stuck = true
+		}
+	}
+	if !stuck {
+		t.Fatalf("SDA 释放失败应保留 Pin20 在 driven 追踪 (滞留输出), 实际 %v", pins)
+	}
+	// 故障已一次性消耗: 重试应完成收尾, 释放 SDA 并消除错误
+	if _, _, err := b.autoDetect(ctx); err != nil {
+		t.Fatalf("故障清除后重试收尾应成功, 得到 %v", err)
+	}
+	pins = b.drivenPins()
+	if len(pins) != 1 || pins[0] != "Pin19" {
+		t.Fatalf("重试后应仅剩原 SCL (Pin19) 保持驱动, 实际 %v", pins)
+	}
+	if !b.isConfigured() {
+		t.Fatal("已配置收尾不得清除 configured 状态")
+	}
+}
+
+// detect 接口走真实 autoDetect (不注入 DetectFn): 已配置总线复位末尾 SDA 释放
+// 失败时, 响应必须带 cleanup_failed:true 且不回内部针脚细节; 故障消耗后重试
+// 恢复为普通未命中提示。用已取消的请求 ctx 让探测第一轮即走收尾。
+func TestDetectCleanupFailureFromBusReset(t *testing.T) {
+	stubAdmin(t, true)
+	stubPortAvailable(t, true)
+	b := NewBus("Pin19", "Pin20", false)
+	mock := newMockPIO()
+	b.pio = mock
+	if ok, msg := b.reconfigure(nil, nil); !ok {
+		t.Fatalf("reconfigure 应成功: %s", msg)
+	}
+	mock.resetOutbCounts()
+	mock.injectOutbFailOnNth(0x2F, 0x06, 2)
+	srv := &AppServer{Bus: b}
+
+	post := func() string {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		req := httptest.NewRequest(http.MethodPost, "/api/crps/detect", nil).WithContext(ctx)
+		rec := httptest.NewRecorder()
+		srv.APIHandler().ServeHTTP(rec, req)
+		return rec.Body.String()
+	}
+
+	body := post()
+	if !strings.Contains(body, `"cleanup_failed":true`) {
+		t.Fatalf("复位清理失败应带 cleanup_failed:true, 得到 %s", body)
+	}
+	if strings.Contains(body, "Pin20") || strings.Contains(body, "0x06") {
+		t.Fatalf("响应不得泄露内部针脚/寄存器细节, 得到 %s", body)
+	}
+
+	body = post() // 一次性故障已消耗: 重试清理成功, 回到普通未命中
+	if !strings.Contains(body, "未探测到电源接线") || strings.Contains(body, "cleanup_failed") {
+		t.Fatalf("重试清理成功应回普通未命中提示, 得到 %s", body)
+	}
+	if pins := b.drivenPins(); len(pins) != 1 || pins[0] != "Pin19" {
+		t.Fatalf("重试后应仅剩原 SCL 保持驱动, 实际 %v", pins)
+	}
+}
+
+// 恢复收尾与后台读总线并发: 方向写入经 b.mu 串行 (switchPin/busReset 自取锁,
+// 未配置分支持 b.mu 调 setPinDir), 不得死锁; -race 下同时验证无数据竞争。
+func TestAutoDetectRestoreConcurrentWithReads(t *testing.T) {
+	stubPortAvailable(t, true)
+	b := NewBus("Pin19", "Pin20", false)
+	b.pio = newMockPIO()
+	if ok, msg := b.reconfigure(nil, nil); !ok {
+		t.Fatalf("reconfigure 应成功: %s", msg)
+	}
+	done := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		defer close(done)
+		b.autoDetect(ctx) // 50ms 后取消, 收尾走已配置 restore 路径
+	}()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		_ = b.readWord(Cmd["READ_VIN"]) // 与 restore 并发的总线读
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("autoDetect 与并发读总线发生死锁")
+	}
+}
+
+// detect 接口: 探测未命中时, 收尾清理成功与清理失败必须给出不同响应——
+// 清理失败意味着针脚可能仍为输出, 调用方需要知道必须重试,
+// 不能与 "未找到且已清理完成" 混为同一句提示。
+func TestDetectCleanupFailureDistinctFromCleanMiss(t *testing.T) {
+	stubAdmin(t, true)
+	stubPortAvailable(t, true)
+
+	// 情形 1: 未命中 + 清理完成 -> 原有提示, 无 cleanup_failed 标记
+	b := NewBus("Pin19", "Pin20", false)
+	b.pio = newMockPIO()
+	srv := &AppServer{
+		Bus:      b,
+		DetectFn: func(context.Context) (string, string, error) { return "", "", nil },
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/crps/detect", nil)
+	rec := httptest.NewRecorder()
+	srv.APIHandler().ServeHTTP(rec, req)
+	body := rec.Body.String()
+	if !strings.Contains(body, "未探测到电源接线") {
+		t.Fatalf("清理完成的未命中应回原提示, 得到 %s", body)
+	}
+	if strings.Contains(body, "cleanup_failed") {
+		t.Fatalf("清理完成不得带 cleanup_failed 标记, 得到 %s", body)
+	}
+
+	// 情形 2: 未命中 + 清理失败 -> cleanup_failed:true + 明确清理失败提示
+	b2 := NewBus("Pin19", "Pin20", false)
+	b2.pio = newMockPIO()
+	srv2 := &AppServer{
+		Bus: b2,
+		DetectFn: func(context.Context) (string, string, error) {
+			return "", "", errors.New("针脚 Pin21 未能释放回输入")
+		},
+	}
+	rec2 := httptest.NewRecorder()
+	srv2.APIHandler().ServeHTTP(rec2, httptest.NewRequest(http.MethodPost, "/api/crps/detect", nil))
+	body2 := rec2.Body.String()
+	if !strings.Contains(body2, `"cleanup_failed":true`) {
+		t.Fatalf("清理失败应带 cleanup_failed:true, 得到 %s", body2)
+	}
+	if !strings.Contains(body2, "清理 GPIO 失败") {
+		t.Fatalf("清理失败应含明确清理失败提示, 得到 %s", body2)
+	}
+	if strings.Contains(body2, "Pin21") {
+		t.Fatalf("响应不得泄露内部针脚细节 (只记服务端日志), 得到 %s", body2)
+	}
+	if strings.Contains(body2, "未探测到电源接线") {
+		t.Fatalf("清理失败不得与未找到混淆, 得到 %s", body2)
+	}
+}
+
+// 未配置探测扫描中途中断: 扫描会把引脚字段切到候选组合 (如 Pin19/Pin21),
+// 收尾必须还原为探测前 orig——否则残留组合会让 reconfigure 只传一侧引脚时
+// 拼出错误搭档。readMask 强制数据口读回全 1 (NACK) 使所有组合都不命中,
+// 等扫描切走字段后取消, 验证收尾还原字段并释放全部驱动针脚。
+func TestAutoDetectRestoresPinFieldsAfterScanResidue(t *testing.T) {
+	stubPortAvailable(t, true)
+	b := NewBus("Pin19", "Pin20", false)
+	mock := newMockPIO()
+	mock.readMask[0xA01] = 0xFF // Pin19/Pin21 数据口: 读回全 1 => SDA 恒高 => NACK => 不命中
+	mock.readMask[0xA05] = 0xFF // Pin20/Pin22 数据口: 同上
+	b.pio = mock
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _, _ = b.autoDetect(ctx)
+	}()
+	// 等扫描把引脚字段切离 orig (第 2 个候选组合 switchPin 成功后)
+	moved := false
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		if s, d := b.pinNames(); s != "Pin19" || d != "Pin20" {
+			moved = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !moved {
+		t.Fatal("扫描未在 3s 内切换引脚字段 (mock 行为与预期不符)")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("取消后 autoDetect 未及时返回")
+	}
+	// 收尾: 字段还原 orig, 驱动针脚全部释放, 未配置状态不变
+	if s, d := b.pinNames(); s != "Pin19" || d != "Pin20" {
+		t.Fatalf("收尾应还原引脚字段为 orig Pin19/Pin20, 得到 %s/%s", s, d)
+	}
+	if pins := b.drivenPins(); len(pins) != 0 {
+		t.Fatalf("收尾应释放全部驱动针脚, 仍残留 %v", pins)
+	}
+	if b.isConfigured() {
+		t.Fatal("探测收尾不得改变 configured 状态")
 	}
 }
 

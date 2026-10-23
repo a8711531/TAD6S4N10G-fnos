@@ -408,11 +408,44 @@ func (b *Bus) reconfigure(scl, sda *string) (bool, string) {
 
 // autoDetect 自动扫描候选针脚组合, 找到电源实际接的 PSCL/PSDA (默认扫 Pin19~22)。
 // 支持 ctx 取消; 中途取消会恢复探测前引脚。
-func (b *Bus) autoDetect(ctx context.Context) (string, string) {
+// 第三个返回值是收尾清理错误: 释放扫描期间驱动过的针脚失败时如实返回,
+// 调用方必须上报 (针脚可能仍为输出); driven 追踪保留, 下次探测/切换会重试释放。
+func (b *Bus) autoDetect(ctx context.Context) (string, string, error) {
 	origScl, origSda := b.pinNames()
-	restore := func() {
-		b.switchPin(origScl, origSda)
-		b.busReset() // 探测结束复位, 让电源回到正常态
+	// restore 收尾分两种: 已配置 -> switchPin 恢复原引脚(其内部持 b.mu 释放扫描
+	// 期间驱动过的其它针脚)+ busReset; 未配置 -> 只把扫描期间驱动过的针脚全部
+	// 释放回输入, 不驱动任何引脚——switchPin/busReset 都会把原 SCL 设为输出,
+	// 未配置机器不该因此残留输出脚 (探测取消/无匹配时尤其如此)。释放走
+	// setPinDir, 须持 b.mu 调用 (锁约定); 释放失败保留 driven 追踪并聚合上报,
+	// 下次重试。未配置分支同时把引脚字段还原为 orig (不写方向), 否则残留的
+	// 扫描组合会让 reconfigure 只传一侧引脚时拼出错误搭档。
+	restore := func() error {
+		if !b.isConfigured() {
+			b.mu.Lock()
+			defer b.mu.Unlock()
+			var failed []string
+			for _, name := range b.drivenPins() {
+				if err := b.setPinDir(name, GPPins[name], false); err != nil {
+					failed = append(failed, name)
+				}
+			}
+			b.sclName = origScl
+			b.sclCfg = GPPins[origScl]
+			b.sdaName = origSda
+			b.sdaCfg = GPPins[origSda]
+			if len(failed) > 0 {
+				return fmt.Errorf("针脚 %s 未能释放回输入", strings.Join(failed, ", "))
+			}
+			return nil
+		}
+		if ok, msg := b.switchPin(origScl, origSda); !ok {
+			return fmt.Errorf("恢复原引脚失败: %s", msg)
+		}
+		if err := b.busReset(); err != nil {
+			// 复位末尾 sdaRelease 的端口写失败会让 SDA 滞留输出, 必须如实上报
+			return fmt.Errorf("总线复位失败: %w", err)
+		}
+		return nil
 	}
 	for _, scl := range UIPins {
 		for _, sda := range UIPins {
@@ -420,8 +453,7 @@ func (b *Bus) autoDetect(ctx context.Context) (string, string) {
 				continue
 			}
 			if !sleepCtx(ctx, 300*time.Millisecond) { // 等电源稳定, 不做总线复位(避免干扰读数)
-				restore()
-				return "", ""
+				return "", "", restore()
 			}
 			if ok, _ := b.switchPin(scl, sda); !ok {
 				continue
@@ -430,12 +462,11 @@ func (b *Bus) autoDetect(ctx context.Context) (string, string) {
 			Logf("  [detect] try %s/SCL + %s/SDA  VIN=%sV%s", scl, sda, ptrStr(linear11Ptr(raw)), rawStr(raw))
 			if raw != nil { // 读到非 None 即命中(错误组合全是 None)
 				b.busReset()
-				return scl, sda
+				return scl, sda, nil
 			}
 		}
 	}
-	restore() // 未找到: 恢复探测前引脚
-	return "", ""
+	return "", "", restore() // 未找到: 恢复探测前引脚
 }
 
 // readVinWithRetry 读 VIN 并带 n 次重试; 供 autoDetect / readable 复用(去重重试逻辑)
