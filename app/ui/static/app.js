@@ -3198,7 +3198,7 @@ function renderBIOSOnline(status) {
   if (status.error) {
     showBIOSOnlineHint(status.error, true);
   } else if (status.update_available) {
-    showBIOSOnlineHint(`发现新版本 ${status.candidate_version}（${status.candidate_build_date}），可下载刷写。`);
+    showBIOSOnlineHint(`发现新版本 ${status.candidate_version}（${status.candidate_build_date}），可下载更新。`);
   } else if (status.candidate_zip) {
     // 已是最新：不再显示 badge 状态，hint 保持空白让面板更干净
     showBIOSOnlineHint('');

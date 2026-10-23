@@ -1332,10 +1332,9 @@ func (s *Server) handleBIOSOnlineFlash(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "仅管理员可以刷写 BIOS")
 		return
 	}
-	if err := r.ParseForm(); err != nil {
-		writeError(w, http.StatusBadRequest, "解析请求失败: "+err.Error())
-		return
-	}
+	// 前端用 FormData（multipart）提交 confirm：绝不能在这里显式 ParseForm——
+	// 它不解析 multipart 请求体，还会把 r.Form 置成非 nil，导致 FormValue 跳过
+	// 惰性 ParseMultipartForm，confirm 永远取不到。FormValue 自身兼容两种编码。
 	if strings.TrimSpace(r.FormValue("confirm")) != "FLASH" {
 		writeError(w, http.StatusBadRequest, "缺少刷写确认")
 		return
