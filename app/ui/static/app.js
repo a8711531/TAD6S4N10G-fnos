@@ -254,8 +254,10 @@ function storageChip(text, tone = 'muted', options = {}) {
 }
 
 function storageHealthLabel(slot = {}) {
-  if (slot.warning) return '告警';
-  return slot.health || '—';
+  // 健康状态行优先级：高温 > SMART / RM / purpose 等告警 > 后端 health 字段
+  if (isStorageHot(slot)) return '高温';
+  if (slot.warning || slot.state === 'warning') return '告警';
+  return slot.health || '正常';
 }
 
 function storageHealthDetail(slot = {}) {
@@ -311,15 +313,18 @@ function storageTempTone(slot = {}) {
 }
 
 function storageSlotStatusLabel(slot = {}, tone = '') {
+  // 活动行规则：
+  // - empty → 空置
+  // - present → 未使用（已插未挂，确实没负载）
+  // - warning/unknown/hot → 未使用（异常状态也不应该显示"空闲"这种会和正常盘混淆的词，
+  //   健康行独占告警展示，活动行统一显示"未使用"占位，表示没在干活）
+  // - used → 活动词（空闲/休眠/轻载/繁忙等真实负载）
   if (tone === 'empty') return '空置';
-  if (slot.state === 'present') return '未使用';
-  if (slot.state === 'unknown') return STORAGE_STATE_LABELS.unknown;
-  // state=warning（SMART 告警/高温告警/RM 告警等）不再覆盖活动状态词，
-  // 告警已在下方健康状态行单独显示，活动行专注展示空闲/休眠/繁忙等运行时状态。
-  if (isStorageHot(slot)) return '高温';
-  return STORAGE_ACTIVITY_LABELS[slot.activity]
-    || STORAGE_STATE_LABELS[slot.state]
-    || STORAGE_STATE_LABELS.unknown;
+  if (slot.state === 'used') {
+    return STORAGE_ACTIVITY_LABELS[slot.activity] || '';
+  }
+  // present / warning / unknown / hot 统一走这里：都不是正常"在用"状态
+  return '未使用';
 }
 
 function connectedFans(fanStatus = {}, limit = 0) {
@@ -603,16 +608,17 @@ function renderStorageVisual(storage = {}) {
         }
       }
       // 健康状态行：显示在活动状态和温度之间。
-      // state=warning 或 SMART 属性告警 → "告警" 红色；health=未读取 → 灰色；否则 "正常"。
+      // 优先级：高温 → SMART/RM 等告警 → 后端 health 字段
       if (health) {
         if (tone !== 'empty') {
-          const hasWarning = slot.state === 'warning'
-            || Boolean(slot.warning)
-            || storageHealthLabel(slot) === '告警';
-          const healthVal = storageHealthLabel(slot);
-          health.textContent = hasWarning ? '告警' : (healthVal || '正常');
-          health.classList.toggle('is-warning', hasWarning);
-          health.classList.toggle('is-unknown', !hasWarning && healthVal === '未读取');
+          const healthVal = storageHealthLabel(slot); // 已内含高温/告警/正常优先级
+          const isHot = isStorageHot(slot);
+          const isWarn = !isHot && (slot.state === 'warning' || Boolean(slot.warning) || healthVal === '告警');
+          const isBad = isHot || isWarn;
+          health.textContent = healthVal;
+          health.classList.toggle('is-warning', isBad);
+          health.classList.toggle('is-unknown', !isBad && healthVal === '未读取');
+          health.classList.toggle('is-hot', isHot);
           health.hidden = false;
         } else {
           health.hidden = true;
@@ -628,6 +634,7 @@ function renderStorageVisual(storage = {}) {
       }
       if (status) {
         status.textContent = storageSlotStatusLabel(slot, tone);
+        status.hidden = tone === 'empty';
       }
     });
   });
