@@ -1,12 +1,18 @@
-﻿#requires -Version 5.1
+#requires -Version 5.1
 # fix-fpk-lf.ps1 —— fnpack 出包后解包，把包内文本文件 CRLF→LF，再重新打包为 tad-module-lf.fpk
 # 必须在 fnpack build 之后运行：fnpack 会重排 manifest 并写回 CRLF，只改源文件没用。
 param(
   [string]$Fpk = "tad-module.fpk",
-  [string]$Out = "tad-module-lf.fpk"
+  # 默认从源 manifest 读版本号生成 tad-module-lf-<version>.fpk，避免交付时拿错版本
+  [string]$Out = ""
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
+if (-not $Out) {
+  $m = Select-String -Path (Join-Path $root "manifest") -Pattern '^version\s*=\s*(\S+)'
+  $ver = if ($m) { $m.Matches[0].Groups[1].Value } else { "unknown" }
+  $Out = "tad-module-lf-$ver.fpk"
+}
 Push-Location $root
 try {
   $tmp = Join-Path $root ".cache\fpk-lf"
