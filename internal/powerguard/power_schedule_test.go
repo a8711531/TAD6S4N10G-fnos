@@ -238,6 +238,45 @@ func TestPowerScheduleTickFiresShutdownOnce(t *testing.T) {
 	}
 }
 
+func TestPowerScheduleTickSkipsShutdownDuringFirmwareJob(t *testing.T) {
+	now := time.Date(2026, 10, 23, 1, 0, 20, 0, powerScheduleTestZone) // 周五 01:00:20
+	m := newPowerScheduleTestManager(t, &now)
+	cfg := PowerScheduleConfig{Entries: []PowerScheduleEntry{
+		{Enabled: true, Days: "weekday", Time: "01:00", Action: "poweroff"},
+	}}
+	if err := m.SavePowerScheduleConfig(cfg); err != nil {
+		t.Fatalf("保存失败: %v", err)
+	}
+	calls := 0
+	old := powerScheduleShutdownHook
+	powerScheduleShutdownHook = func(ctx context.Context) error { calls++; return nil }
+	defer func() { powerScheduleShutdownHook = old }()
+
+	// 刷写任务运行中：计划关机必须让路，且不得占用同分钟去重键
+	m.firmwareMu.Lock()
+	m.firmwareJob.state = firmwareJobRunning
+	m.firmwareMu.Unlock()
+	m.PowerScheduleTick(context.Background())
+	if calls != 0 {
+		t.Fatalf("固件刷写期间不得关机，实际 %d 次", calls)
+	}
+	m.mu.Lock()
+	firedKey := m.powerScheduleFiredKey
+	m.mu.Unlock()
+	if firedKey != "" {
+		t.Fatalf("跳过关机时不得占用去重键，实际 %q", firedKey)
+	}
+
+	// 刷写结束，同一分钟内下一 tick 补触发一次
+	m.firmwareMu.Lock()
+	m.firmwareJob.state = firmwareJobIdle
+	m.firmwareMu.Unlock()
+	m.PowerScheduleTick(context.Background())
+	if calls != 1 {
+		t.Fatalf("刷写结束后同一分钟应补触发一次，实际 %d 次", calls)
+	}
+}
+
 func TestPowerScheduleTickSyncsWakeAlarm(t *testing.T) {
 	now := time.Date(2026, 10, 23, 9, 0, 0, 0, powerScheduleTestZone)
 	m := newPowerScheduleTestManager(t, &now)

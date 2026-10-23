@@ -190,6 +190,14 @@ func (m *Manager) activeBIOSBackend() (string, string) {
 	return "", ""
 }
 
+// firmwareJobActive 报告当前是否有固件刷写任务在跑。计划关机必须避开刷写窗口：
+// BIOS/网卡写到一半断电有变砖风险。
+func (m *Manager) firmwareJobActive() bool {
+	m.firmwareMu.Lock()
+	defer m.firmwareMu.Unlock()
+	return m.firmwareJob.state == firmwareJobRunning
+}
+
 // FirmwareStatus 只返回缓存状态，不在轮询路径上执行外部命令。
 func (m *Manager) FirmwareStatus() FirmwareStatus {
 	m.firmwareMu.Lock()
@@ -396,8 +404,8 @@ func (m *Manager) StartNICFlash(firmware []byte) error {
 
 func (m *Manager) beginFirmwareJob(kind string) error {
 	m.firmwareMu.Lock()
-	defer m.firmwareMu.Unlock()
 	if m.firmwareJob.state == firmwareJobRunning {
+		m.firmwareMu.Unlock()
 		return errFirmwareBusy
 	}
 	m.firmwareJob = firmwareJobState{
@@ -406,6 +414,10 @@ func (m *Manager) beginFirmwareJob(kind string) error {
 		step:      "准备中",
 		startedAt: time.Now(),
 	}
+	m.firmwareMu.Unlock()
+	// 刷写窗口内持有系统关机 inhibitor：外部关机/休眠请求会被推迟到刷写结束，
+	// 避免写一半断电变砖（本模块自己的计划关机另行跳过，见 PowerScheduleTick）。
+	m.holdSystemInhibitor("固件刷写中，禁止关机")
 	return nil
 }
 
@@ -432,6 +444,8 @@ func (m *Manager) firmwareLog(format string, args ...any) {
 func (m *Manager) firmwareFinish(err error, success string) {
 	m.firmwareMu.Lock()
 	defer m.firmwareMu.Unlock()
+	// 任务无论成功失败都要释放系统关机 inhibitor，否则用户关机被永久挡住。
+	defer m.releaseSystemInhibitor()
 	m.firmwareJob.finishedAt = time.Now()
 	if err != nil {
 		m.firmwareJob.state = firmwareJobFailed

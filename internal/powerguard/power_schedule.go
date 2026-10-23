@@ -264,13 +264,15 @@ func (m *Manager) TestPowerSchedule(minutes int) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("测试提前量需在 1–30 分钟之间")
 	}
 	at := m.now().Add(time.Duration(minutes) * time.Minute)
+	// 写闹钟与设保护窗口必须在同一把锁内：否则中间插入的 tick 会误以为
+	// wakealarm 与计划不一致，把测试闹钟改回计划闹钟，测试悄悄失效。
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if err := m.writeWakeAlarm(at); err != nil {
 		return time.Time{}, err
 	}
-	m.mu.Lock()
 	m.powerScheduleTestUntil = at.Add(time.Minute)
 	m.logf("power schedule: test wake alarm set to %s (%d 分钟后)", at.Format("2006-01-02 15:04:05"), minutes)
-	m.mu.Unlock()
 	return at, nil
 }
 
@@ -344,7 +346,8 @@ func (m *Manager) SavePowerScheduleConfig(schedule PowerScheduleConfig) error {
 
 // PowerScheduleTick 定时检查（主循环每 30 秒一次）：
 //  1. 到点的关机计划触发 shutdown（同一分钟去重，触发前先写开机唤醒）；
-//  2. wakealarm 与下次开机计划不一致时重新同步（覆盖测试唤醒/意外清空）。
+//  2. wakealarm 与下次开机计划不一致时重新同步（覆盖测试唤醒/意外清空）；
+//  3. 固件刷写任务运行期间不触发计划关机，避免刷写中断电变砖。
 func (m *Manager) PowerScheduleTick(ctx context.Context) {
 	m.mu.Lock()
 	cfg, err := m.loadConfigLocked()
@@ -354,7 +357,6 @@ func (m *Manager) PowerScheduleTick(ctx context.Context) {
 	}
 	now := m.now()
 	firedKey := ""
-	var fired bool
 	for _, entry := range cfg.PowerSchedule.Entries {
 		if !entry.Enabled || entry.Action != "poweroff" {
 			continue
@@ -366,21 +368,27 @@ func (m *Manager) PowerScheduleTick(ctx context.Context) {
 		if m.powerScheduleFiredKey == key {
 			continue
 		}
-		m.powerScheduleFiredKey = key
 		firedKey = key
-		fired = true
 		break
 	}
-	if fired {
+	m.mu.Unlock()
+
+	if firedKey != "" {
+		// 固件刷写期间禁止计划关机：写到一半断电有变砖风险。此刻不占用同分钟
+		// 去重键，刷写结束后同一分钟内仍能补触发，不必等到下次计划时间。
+		if m.firmwareJobActive() {
+			m.logf("power schedule: 固件刷写进行中，跳过计划关机（%s）", firedKey)
+			return
+		}
+		m.mu.Lock()
 		// 触发关机前先把开机唤醒写好，保证关机后能按计划自动上电
 		if _, err := m.applyPowerScheduleLocked(); err != nil {
 			m.logf("power schedule: apply wake alarm before shutdown failed: %v", err)
 		}
+		m.powerScheduleFiredKey = firedKey
 		m.logf("power schedule: 触发计划关机（%s）", firedKey)
-	}
-	m.mu.Unlock()
+		m.mu.Unlock()
 
-	if fired {
 		if err := powerScheduleShutdownHook(ctx); err != nil {
 			m.mu.Lock()
 			m.logf("power schedule: shutdown failed: %v", err)

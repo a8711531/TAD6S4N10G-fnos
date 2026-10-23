@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -358,6 +359,12 @@ type Manager struct {
 	// powerScheduleTestUntil 测试唤醒的保护窗口：TestPowerSchedule 写入的
 	// 临时闹钟在窗口内不被 tick 的计划同步覆盖，给用户留出手动关机的时间。
 	powerScheduleTestUntil time.Time
+
+	// firmwareInhibitor 固件刷写期间持有的系统关机 inhibitor（systemd-inhibit
+	// 子进程，见 firmware_inhibit_linux.go），随 inhibitMu 保护。非 Linux 平台
+	// 为空实现，字段本身不参与逻辑。
+	inhibitMu         sync.Mutex
+	firmwareInhibitor *exec.Cmd
 }
 
 // SetLogger 注入运行日志器（main 启动时调用）。
@@ -372,6 +379,13 @@ func (m *Manager) logf(format string, args ...any) {
 	if m.logger != nil {
 		m.logger.Printf(format, args...)
 	}
+}
+
+// logfSafe 给未持有 m.mu 的调用方用（logf 要求调用方持锁）。
+func (m *Manager) logfSafe(format string, args ...any) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.logf(format, args...)
 }
 
 // saveConfigLocked 用户主动保存的统一写盘出口：成功即记一条运行日志。
