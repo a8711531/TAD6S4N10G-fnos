@@ -199,7 +199,9 @@ func (m *Manager) downloadedFlashromPath() string {
 
 // flashromExpectedSHA256 是服务器上分发的 flashrom 二进制的 SHA256，
 // 下载后必须匹配才会落盘使用，防止下载到被篡改/截断的文件。测试可覆盖。
-var flashromExpectedSHA256 = "73D8E8076561977615D8C46C9FEAF425D3CC8C333A5820C5228D0C973AD3B400"
+// 当前二进制：v1.3.0 meson 构建，未启用 libusb/libftdi/libjaylink 编程器
+// （客户机缺这些库，Debian 官方包提取的版本跑不起来），只依赖 libpci/libc。
+var flashromExpectedSHA256 = "5FC51D03F21C497C4AAB4EC6CDDBDA39CE9705CEC1D345E32A1B79AEC5858D18"
 
 // flashromToolURL 返回服务器上 flashrom 二进制的下载地址（与 BIOS 索引同目录）。
 func flashromToolURL() string {
