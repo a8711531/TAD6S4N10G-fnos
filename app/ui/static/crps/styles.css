@@ -232,7 +232,7 @@ footer { display: flex; justify-content: space-between; margin-top: 14px; color:
 
 /* 融合模式下宿主 CSP (style-src 'self') 会忽略 HTML 行内 style 属性,
    初始隐藏统一用 class; JS 动态 element.style 优先级高于类, 不受影响 */
-.hidden { display: none; }
+.hidden { display: none !important; }
 
 /* 未保存 GPIO 配置前只留 GPIO 配置区: 其余区块默认隐藏, JS 确认已配置后给 body 加 cfg-ok 显示。
    banner 用 ID 选择器 (className 会被 setBanner 重置); 后端不可达时 banner 例外显示报错 */
