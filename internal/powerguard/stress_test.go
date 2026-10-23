@@ -55,6 +55,33 @@ func TestNormalizeStressMemoryLimit(t *testing.T) {
 	}
 }
 
+func TestNormalizeStressMemoryAuto(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "proc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	meminfoPath := filepath.Join(root, "proc", "meminfo")
+	if err := os.WriteFile(meminfoPath, []byte("MemTotal:       8388608 kB\nMemAvailable:   2097152 kB\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	manager := &Manager{Root: root}
+	// 自动预留：可用 2048 MB − 256 MB = 1792 MB，传入的 MemoryMB 被忽略
+	options, err := manager.normalizeStressOptions(StressOptions{Memory: true, MemoryAuto: true, MemoryMB: 9000})
+	if err != nil {
+		t.Fatalf("自动预留应通过: %v", err)
+	}
+	if options.MemoryMB != 1792 || !options.MemoryAuto {
+		t.Fatalf("自动预留取值错误: %+v", options)
+	}
+	// 可用内存扣除 256 MB 后不足 64 MB：拒绝，避免把系统压死
+	if err := os.WriteFile(meminfoPath, []byte("MemTotal:       8388608 kB\nMemAvailable:   262144 kB\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.normalizeStressOptions(StressOptions{Memory: true, MemoryAuto: true}); err == nil {
+		t.Fatal("可用内存不足时自动预留应拒绝")
+	}
+}
+
 func TestCPUSampleAndUtilization(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(root, "proc"), 0o755); err != nil {

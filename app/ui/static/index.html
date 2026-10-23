@@ -33,7 +33,7 @@
       } catch (error) { /* localStorage 不可用时跟随系统 */ }
     })();
   </script>
-  <link rel="stylesheet" href="styles.css?v=0.10.61">
+  <link rel="stylesheet" href="styles.css?v=0.10.68">
   <script>
     // 样式自愈：升级包后浏览器可能仍持有带长缓存的远古样式表（无 CSS 变量，
     // 表现为图表坐标线消失、文字变黑、主题切换无反应）。绕过缓存拉取服务端
@@ -61,7 +61,7 @@
           <button id="tab-gpio" type="button" role="tab" aria-selected="false" aria-controls="panel-gpio" tabindex="-1"><img src="images/panel/按键映射图标.svg" alt="">按键映射</button>
           <button id="tab-power" type="button" role="tab" aria-selected="false" aria-controls="panel-power" tabindex="-1"><img src="images/panel/功耗设置图标.svg" alt="">功耗设置</button>
           <button id="tab-schedule" type="button" role="tab" aria-selected="false" aria-controls="panel-schedule" tabindex="-1"><span class="debug-tab-icon" aria-hidden="true">◷</span>开关计划</button>
-          <button id="tab-crps" type="button" role="tab" aria-selected="false" aria-controls="panel-crps" tabindex="-1"><img src="images/panel/CRPS图标.svg" alt="">电源</button>
+          <button id="tab-crps" type="button" role="tab" aria-selected="false" aria-controls="panel-crps" tabindex="-1"><img src="images/panel/CRPS图标.svg" alt="">电源监控</button>
           <button id="tab-firmware" type="button" role="tab" aria-selected="false" aria-controls="panel-firmware" tabindex="-1"><img src="images/panel/固件升级图标.svg" alt="">固件升级</button>
           <button id="tab-stress" type="button" role="tab" aria-selected="false" aria-controls="panel-stress" tabindex="-1"><img src="images/panel/压力测试图标.svg" alt="">压力测试</button>
           <button id="tab-debug" type="button" role="tab" aria-selected="false" aria-controls="panel-debug" tabindex="-1"><span class="debug-tab-icon" aria-hidden="true">&lt;/&gt;</span>调试</button>
@@ -701,34 +701,39 @@
           <section class="card firmware-panel" aria-labelledby="firmware-bios-heading">
             <div class="panel-heading">
               <div>
-                <h2 id="firmware-bios-heading">BIOS 升级（flashrom）</h2>
-                <p>优先使用系统 flashrom 仅读写 BIOS 区域；系统缺少 flashrom 时回退到内置或上传的 Linux 版 FPT。刷写前会自动尝试备份当前 BIOS 到模块数据目录。</p>
+                <h2 id="firmware-bios-heading">手动升级 BIOS</h2>
+                <p>默认隐藏，仅用于手动选择本地 BIOS 镜像刷写：优先使用系统 flashrom 仅读写 BIOS 区域，缺少 flashrom 时回退到内置或上传的 Linux 版 FPT。刷写前会自动尝试备份当前 BIOS。刷写进度日志在展开后可见，在线升级时也会自动展开。</p>
               </div>
-              <span id="firmware-tool-badge" class="inline-status">未检测</span>
+              <div class="firmware-bios-heading-side">
+                <span id="firmware-tool-badge" class="inline-status">未检测</span>
+                <label class="toggle"><input id="firmware-bios-manual-toggle" type="checkbox"><span></span>显示手动升级</label>
+              </div>
             </div>
-            <div class="firmware-row">
-              <label class="field">
-                <span>BIOS 镜像</span>
-                <input id="firmware-bios-file" type="file" accept=".bin,.rom,.fd,application/octet-stream">
-                <small>选择与主板匹配的完整 BIOS 镜像（1–64 MB）。刷写过程中不能断电。</small>
-              </label>
-            </div>
-            <label class="toggle firmware-confirm"><input id="firmware-bios-confirm" type="checkbox"><span></span>我已备份 BIOS，并接受刷写失败的救砖风险</label>
-            <div class="actions">
-              <button id="firmware-bios-flash" type="button" class="danger">开始刷写 BIOS</button>
-            </div>
-            <details class="firmware-advanced">
-              <summary>高级：自定义 FPT 工具</summary>
+            <div id="firmware-bios-manual-body" hidden>
               <div class="firmware-row">
                 <label class="field">
-                  <span>FPT 工具（Linux ELF）</span>
-                  <input id="firmware-fpt-file" type="file" accept=".bin,application/octet-stream">
-                  <small>仅当系统没有 flashrom 或需要指定版本时上传。CSME 16 官方不再提供 Linux 版 FPT；Fpt.efi 是 UEFI 程序，Linux 下无法执行。</small>
+                  <span>BIOS 镜像</span>
+                  <input id="firmware-bios-file" type="file" accept=".bin,.rom,.fd,application/octet-stream">
+                  <small>选择与主板匹配的完整 BIOS 镜像（1–64 MB）。刷写过程中不能断电。</small>
                 </label>
-                <button id="firmware-fpt-upload" type="button">上传 FPT</button>
               </div>
-            </details>
-            <pre id="firmware-bios-log" class="firmware-log" aria-live="polite">等待操作…</pre>
+              <label class="toggle firmware-confirm"><input id="firmware-bios-confirm" type="checkbox"><span></span>我已备份 BIOS，并接受刷写失败的救砖风险</label>
+              <div class="actions">
+                <button id="firmware-bios-flash" type="button" class="danger">开始刷写 BIOS</button>
+              </div>
+              <details class="firmware-advanced">
+                <summary>高级：自定义 FPT 工具</summary>
+                <div class="firmware-row">
+                  <label class="field">
+                    <span>FPT 工具（Linux ELF）</span>
+                    <input id="firmware-fpt-file" type="file" accept=".bin,application/octet-stream">
+                    <small>仅当系统没有 flashrom 或需要指定版本时上传。CSME 16 官方不再提供 Linux 版 FPT；Fpt.efi 是 UEFI 程序，Linux 下无法执行。</small>
+                  </label>
+                  <button id="firmware-fpt-upload" type="button">上传 FPT</button>
+                </div>
+              </details>
+              <pre id="firmware-bios-log" class="firmware-log" aria-live="polite">等待操作…</pre>
+            </div>
           </section>
 
           <section class="card firmware-panel" aria-labelledby="firmware-nic-heading">
@@ -779,12 +784,21 @@
               <label class="field">
                 <span>内存压力</span>
                 <div class="input-wrap"><input id="stress-memory-mb" type="number" min="64" step="64" value="512"><b>MB</b></div>
-                <small>默认 512 MB，不设固定上限；后端按当前可用内存校验并预留 256 MB</small>
+                <small>默认不预留：手填 MB（默认 512），后端按当前可用内存校验并预留 256 MB；勾选「自动预留」后按可用内存扣除 256 MB 拉满。</small>
               </label>
             </div>
+            <label class="toggle stress-memory-auto"><input id="stress-memory-auto" type="checkbox"><span></span>自动预留（可用内存 − 256 MB）</label>
             <div class="actions">
               <button id="stress-start" type="button" class="primary">开始压力测试</button>
               <button id="stress-stop" type="button" class="danger" disabled>停止</button>
+            </div>
+            <div id="stress-off-warning" class="stress-off-warning" role="alert" hidden>
+              <span class="warning-icon" aria-hidden="true">!</span>
+              <div>
+                <strong>风扇处于「关停」档（维修模式）</strong>
+                <p>压力测试会持续升温，而关停档下风扇不会自动起转、超温只蜂鸣报警，可能造成硬件损坏。关停前的三条曲线已记录，可立即恢复。</p>
+              </div>
+              <button id="stress-off-restore" type="button" class="primary">恢复关停前状态</button>
             </div>
             <p id="stress-status-text" class="message" role="status" aria-live="polite">未开始</p>
             <p id="stress-gpu-hint" class="inline-status">GPU 压测由后端通过 VAAPI 调用核显（需 root 权限）。</p>
@@ -1086,6 +1100,6 @@
       </footer>
     </div>
   </div>
-  <script src="app.js?v=0.10.61" defer></script>
+  <script src="app.js?v=0.10.68" defer></script>
 </body>
 </html>

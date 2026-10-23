@@ -666,15 +666,46 @@ small {
 .storage-visual-slot.is-empty .storage-slot-text span { display: none; }
 
 .storage-visual-front .storage-visual-slot { width: 12.5%; height: 67.8%; top:  47.85%; }
-/* 前置仓固定三行槽位（数字/状态/温度，与 M.2 的状态在上、温度在下一致）：
-   各行锚定固定高度，温度为空或空仓也保留槽位，空仓的"空置"与在位盘的
-   状态词对齐在同一行 */
+/* 前置仓固定四行槽位（数字/HDD/状态/健康/温度），绝对定位锚定：
+   新增健康状态行只改自己的 top，不动其他行位置 */
 .storage-visual-front .storage-slot-text b {
   position: absolute;
   left: 0;
   right: 0;
   top: 12%;
 }
+.storage-visual-front .storage-slot-text .slot-type {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 28%;
+  text-align: center;
+  font-style: normal;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  color: var(--muted);
+  line-height: 1;
+}
+.storage-visual-front .storage-slot-text small:not(.health-label) {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 36%;
+}
+.storage-visual-front .storage-slot-text .health-label {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  text-align: center;
+  font-size: 9px;
+  font-weight: 500;
+  line-height: 1;
+  color: var(--label);
+}
+.storage-visual-front .storage-slot-text .health-label.is-warning { color: var(--danger); }
+.storage-visual-front .storage-slot-text .health-label.is-unknown { color: var(--muted); }
 .storage-visual-front .storage-slot-text span {
   position: absolute;
   left: 0;
@@ -682,12 +713,6 @@ small {
   top: 66%;
   white-space: pre-line;
   line-height: 1.05;
-}
-.storage-visual-front .storage-slot-text small {
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: 36%;
 }
 .storage-visual-front .storage-visual-slot[data-slot="front-6"] { left: 15.5%; }
 .storage-visual-front .storage-visual-slot[data-slot="front-5"] { left: 29.3%; }
@@ -2121,6 +2146,15 @@ input[type="file"]:focus { border-color: #8cb4ff; box-shadow: 0 0 0 3px rgba(52,
 .firmware-row > button { margin-bottom: 1px; }
 .firmware-confirm { margin: 2px 0 10px; white-space: normal; }
 
+/* 手动升级 BIOS 标题右侧：工具徽标与「显示手动升级」开关纵向排列 */
+.firmware-bios-heading-side {
+  display: flex;
+  flex-direction: column;
+  flex: 0 0 auto;
+  align-items: flex-end;
+  gap: 8px;
+}
+
 .firmware-nic-status {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -2182,6 +2216,27 @@ input[type="file"]:focus { border-color: #8cb4ff; box-shadow: 0 0 0 3px rgba(52,
   grid-template-columns: repeat(2, minmax(0, 1fr));
   margin-bottom: 12px;
 }
+
+.stress-memory-auto { margin: 0 0 12px; white-space: normal; }
+
+/* 压测期间检测到风扇关停档时的告警条：只在压力测试启用/运行时出现 */
+.stress-off-warning {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin: 12px 0;
+  padding: 12px 14px;
+  border: 1px solid #f0b8b5;
+  border-radius: var(--radius);
+  color: #a73430;
+  background: #fff1f0;
+}
+
+.stress-off-warning[hidden] { display: none; }
+.stress-off-warning > div { flex: 1 1 auto; min-width: 0; }
+.stress-off-warning strong { display: block; margin: 1px 0 4px; font-size: 13px; }
+.stress-off-warning p { margin: 0; color: #9a4b47; font-size: 12px; line-height: 1.55; }
+.stress-off-warning > button { flex: 0 0 auto; }
 
 .stress-metrics {
   display: grid;
@@ -2536,8 +2591,27 @@ button.danger {
 [data-theme="dark"] .storage-chip.tone-idle { color: #aab3c2; border-color: #3d434e; background: var(--surface-muted); }
 [data-theme="dark"] .storage-chip.tone-temp { color: var(--text-body); border-color: var(--line-strong); background: var(--surface-muted); }
 [data-theme="dark"] .storage-chip.tone-muted { color: var(--muted); border-color: var(--line-strong); background: var(--surface-muted); }
+/* 硬盘面板 SVG 面板底图（4M2 / 6SATA）原始色值偏亮，
+   暗色主题下降到 72% 亮度、略微降饱和，避免在深背景上刺眼。 */
+[data-theme="dark"] .storage-visual-base { filter: brightness(0.72) saturate(0.85); }
+/* 各 tone 槽位覆盖图在暗色下分别微调：
+   - red（报警）：保持 1.0 醒目，略提亮保证深底上可见
+   - green（健康）：降到 0.85，不抢红色报警风头
+   - blue（休眠）：降到 0.80，暗底上不会太亮
+   - gray（空置/未使用）：原色本来就淡，只做轻微降噪
+   - empty（空仓托盘）：降到 0.72 跟底图统一 */
+[data-theme="dark"] .storage-visual-slot.tone-red   .storage-slot-overlay { filter: brightness(1.05) saturate(1.0); }
+[data-theme="dark"] .storage-visual-slot.tone-green .storage-slot-overlay { filter: brightness(0.85) saturate(0.9); }
+[data-theme="dark"] .storage-visual-slot.tone-blue  .storage-slot-overlay { filter: brightness(0.80) saturate(0.9); }
+[data-theme="dark"] .storage-visual-slot.tone-gray  .storage-slot-overlay { filter: brightness(0.95); }
+[data-theme="dark"] .storage-visual-slot.tone-empty .storage-slot-overlay { filter: brightness(0.72) saturate(0.85); }
+/* 设备外观图（设备名称卡片 + 关于页）跟硬盘底图同素材级亮度 */
+[data-theme="dark"] .device-identity img,
+[data-theme="dark"] .about-heading img { filter: brightness(0.72) saturate(0.85); }
 [data-theme="dark"] .fan-driver-warning { color: #e2a49f; border-color: #6b3532; background: #2c1615; }
 [data-theme="dark"] .fan-driver-warning p { color: #e2a49f; }
+[data-theme="dark"] .stress-off-warning { color: #e2a49f; border-color: #6b3532; background: #2c1615; }
+[data-theme="dark"] .stress-off-warning p { color: #e2a49f; }
 [data-theme="dark"] .fan-driver-warning a { color: #f0918a; }
 [data-theme="dark"] .script-risk-notice { color: #e2a49f; background: #2c1615; }
 [data-theme="dark"] .gpio-script-card .delete-script { color: #f39a9a; border-color: #6b3532; background: #2c1615; }

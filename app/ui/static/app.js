@@ -312,11 +312,11 @@ function storageTempTone(slot = {}) {
 
 function storageSlotStatusLabel(slot = {}, tone = '') {
   if (tone === 'empty') return '空置';
-  if (slot.state === 'warning') return STORAGE_STATE_LABELS.warning;
-  if (isStorageHot(slot)) return '高温';
   if (slot.state === 'present') return '未使用';
   if (slot.state === 'unknown') return STORAGE_STATE_LABELS.unknown;
-  // used 只代表"已使用"，不等于 SMART 健康；无活动读数时回退状态标签。
+  // state=warning（SMART 告警/高温告警/RM 告警等）不再覆盖活动状态词，
+  // 告警已在下方健康状态行单独显示，活动行专注展示空闲/休眠/繁忙等运行时状态。
+  if (isStorageHot(slot)) return '高温';
   return STORAGE_ACTIVITY_LABELS[slot.activity]
     || STORAGE_STATE_LABELS[slot.state]
     || STORAGE_STATE_LABELS.unknown;
@@ -488,9 +488,15 @@ function initializeStorageVisual() {
       const text = document.createElement('div');
       text.className = 'storage-slot-text';
       const name = document.createElement('b');
-      const temperature = document.createElement('span');
+      const type = document.createElement('em');
+      type.className = 'slot-type';
+      type.hidden = true;
       const status = document.createElement('small');
-      text.append(name, temperature, status);
+      const health = document.createElement('small');
+      health.className = 'health-label';
+      health.hidden = true;
+      const temperature = document.createElement('span');
+      text.append(name, type, status, health, temperature);
       marker.append(overlay, text);
       frame.append(marker);
     });
@@ -520,9 +526,42 @@ function storageVisualTone(slot = {}) {
   return 'green';
 }
 
+// 硬盘槽位状态 demo：方便在不插盘时预览 all 状态的暗色主题效果。
+// 触发方式（任选其一，动态生效——设完不用刷新，下一次状态轮询就切换）：
+//   1) 模块页面里 F12 打开控制台，执行 localStorage.setItem('storage-demo','1')
+//   2) 直接访问模块时 URL 加 ?storage-demo=1
+// 关闭：localStorage.removeItem('storage-demo')
+function storageDemoSlots() {
+  let enabled = false;
+  try {
+    const q = new URLSearchParams(window.location.search);
+    enabled = q.get('storage-demo') === '1' || localStorage.getItem('storage-demo') === '1';
+  } catch (e) { /* localStorage 不可用时忽略 */ }
+  if (!enabled) return null;
+  const map = new Map();
+  // 6 SATA：空/健康/休眠/未用/报警/空
+  [
+    ['front-6',  { kind: 'front', slot: 6,  state: 'empty',   activity: 'unknown', temperature_c: 0 }],
+    ['front-5',  { kind: 'front', slot: 5,  state: 'present', activity: 'busy',     temperature_c: 38.5, health_status: 'ok' }],
+    ['front-4',  { kind: 'front', slot: 4,  state: 'present', activity: 'sleeping', temperature_c: 28.0, health_status: 'ok' }],
+    ['front-3',  { kind: 'front', slot: 3,  state: 'present', activity: 'idle',     temperature_c: 32.0, health_status: 'ok' }],
+    ['front-2',  { kind: 'front', slot: 2,  state: 'warning', activity: 'heavy',    temperature_c: 62.0, health_status: 'critical' }],
+    ['front-1',  { kind: 'front', slot: 1,  state: 'empty',   activity: 'unknown', temperature_c: 0 }],
+    // 4 M.2：健康/报警/休眠/未用
+    ['m2-4',     { kind: 'm2',    slot: 4,  state: 'present', activity: 'busy',     temperature_c: 45.0, health_status: 'ok' }],
+    ['m2-2',     { kind: 'm2',    slot: 2,  state: 'warning', activity: 'busy',     temperature_c: 78.0, health_status: 'critical' }],
+    ['m2-3',     { kind: 'm2',    slot: 3,  state: 'present', activity: 'sleeping', temperature_c: 30.0, health_status: 'ok' }],
+    ['m2-1',     { kind: 'm2',    slot: 1,  state: 'present', activity: 'unknown',  temperature_c: 35.0, health_status: 'ok' }],
+  ].forEach(([id, slot]) => map.set(id, slot));
+  return map;
+}
+
 function renderStorageVisual(storage = {}) {
   initializeStorageVisual();
-  const slots = new Map((storage.slots || []).map((slot) => [slot.id || `${slot.kind}-${slot.slot}`, slot]));
+  const demo = storageDemoSlots();
+  const slots = demo
+    ? demo
+    : new Map((storage.slots || []).map((slot) => [slot.id || `${slot.kind}-${slot.slot}`, slot]));
   STORAGE_VISUAL_GROUPS.forEach((group) => {
     group.ids.forEach((id) => {
       const slot = slots.get(id) || { id, kind: group.kind, state: 'unknown', activity: 'unknown' };
@@ -548,16 +587,41 @@ function renderStorageVisual(storage = {}) {
       }
       overlay.hidden = false;
       const temperature = marker.querySelector('.storage-slot-text span');
-      const status = marker.querySelector('.storage-slot-text small');
+      const status = marker.querySelector('.storage-slot-text small:not(.health-label)');
+      const health = marker.querySelector('.storage-slot-text .health-label');
+      const slotType = marker.querySelector('.storage-slot-text .slot-type');
       marker.querySelector('.storage-slot-text b').textContent = id.split('-').pop();
+      // 盘类型直接用后端 device_type：
+      //   front 槽 → SSD / HDD
+      //   m2  槽 → NVMe / SATA（M.2 槽两种协议都可能）
+      if (slotType) {
+        if (tone !== 'empty') {
+          slotType.textContent = (slot.device_type || '').toUpperCase() || 'HDD';
+          slotType.hidden = false;
+        } else {
+          slotType.hidden = true;
+        }
+      }
+      // 健康状态行：显示在活动状态和温度之间。
+      // state=warning 或 SMART 属性告警 → "告警" 红色；health=未读取 → 灰色；否则 "正常"。
+      if (health) {
+        if (tone !== 'empty') {
+          const hasWarning = slot.state === 'warning'
+            || Boolean(slot.warning)
+            || storageHealthLabel(slot) === '告警';
+          const healthVal = storageHealthLabel(slot);
+          health.textContent = hasWarning ? '告警' : (healthVal || '正常');
+          health.classList.toggle('is-warning', hasWarning);
+          health.classList.toggle('is-unknown', !hasWarning && healthVal === '未读取');
+          health.hidden = false;
+        } else {
+          health.hidden = true;
+        }
+      }
       const hasTemperature = Number(slot.temperature_c) > 0;
-      // 前置仓固定三行槽位（数字/状态/温度，与 M.2 顺序一致），温度为空
-      // 也保留槽位：空仓的"空置"与在位盘的状态词落在同一高度，不随内容行数漂移。
       if (tone === 'empty' || !hasTemperature) {
         temperature.textContent = '';
       } else if (group.kind === 'front') {
-        // 前置仓窄（12.5% 宽），单行"35.5 °C"必被省略号截断：数值（一位
-        // 小数，与详情表格一致）与单位分两行完整显示
         temperature.textContent = `${Number(slot.temperature_c).toFixed(1)}\n°C`;
       } else {
         temperature.textContent = formatTemperature(slot.temperature_c);
@@ -2801,6 +2865,15 @@ function firmwareFile(inputID) {
   return files && files.length ? files[0] : null;
 }
 
+// 手动升级 BIOS 默认折叠：只有显式打开开关才显示本地刷写入口。
+// 在线刷写进行中会自动展开，否则进度日志被藏在折叠区里看不见。
+function setManualBIOSVisible(visible) {
+  const body = $('firmware-bios-manual-body');
+  const toggle = $('firmware-bios-manual-toggle');
+  if (toggle) toggle.checked = Boolean(visible);
+  if (body) body.hidden = !visible;
+}
+
 function firmwareLogText(job) {
   const logs = job && Array.isArray(job.logs) ? job.logs : [];
   return logs.length ? logs.join('\n') : '等待操作…';
@@ -2825,6 +2898,8 @@ function renderFirmwareJob(job) {
   const target = $(job.kind === 'nic' ? 'firmware-nic-log' : 'firmware-bios-log');
   if (!target) return;
   const state = job.state || 'idle';
+  // 在线升级的日志也在手动升级卡片里：刷写期间自动展开，避免进度被折叠隐藏
+  if (job.kind !== 'nic' && state === 'running') setManualBIOSVisible(true);
   target.textContent = firmwareLogText(job);
   target.className = `firmware-log${state === 'success' ? ' success' : state === 'failed' ? ' error' : ''}`;
   const running = state === 'running';
@@ -2942,6 +3017,17 @@ async function flashBIOS() {
     showFirmwareLog('bios', '请先选择 BIOS 镜像文件。', true);
     return;
   }
+  // 刷写是不可逆的高风险动作：勾选确认后还要再过一重弹窗
+  const confirmed = await showAppConfirm({
+    title: '再确认：刷写 BIOS',
+    message: `即将用「${file.name}」刷写 BIOS。刷写期间不能断电，计划关机与系统关机会被拦截；刷写失败可能导致主板无法启动，请确认型号匹配且有救砖方案。`,
+    confirmText: '确认刷写',
+    danger: true,
+  });
+  if (!confirmed) {
+    showFirmwareLog('bios', '已取消刷写。');
+    return;
+  }
   const button = $('firmware-bios-flash');
   if (button) button.disabled = true;
   try {
@@ -2980,6 +3066,16 @@ async function flashNIC() {
     showFirmwareLog('nic', '请先勾选网卡型号与断电要求确认项。', true);
     return;
   }
+  const confirmed = await showAppConfirm({
+    title: '再确认：升级网卡固件',
+    message: `即将把网卡固件升级到 ${NIC_TARGET_FW}。升级期间不能断电，计划关机与系统关机会被拦截；刷写完成后必须完全断电再上电。`,
+    confirmText: '确认升级',
+    danger: true,
+  });
+  if (!confirmed) {
+    showFirmwareLog('nic', '已取消升级。');
+    return;
+  }
   const button = $('firmware-nic-flash');
   if (button) button.disabled = true;
   try {
@@ -2995,6 +3091,8 @@ async function flashNIC() {
 
 // ---- BIOS 在线升级：拉取云端 zip.txt 索引，严格同机型判定 ----
 let biosOnlineUpdateAvailable = false;
+// 本次检查到的候选固件文案：二次确认弹窗里要写清楚刷的是哪个版本
+let biosOnlineCandidateLabel = '';
 
 function showBIOSOnlineHint(message, error = false) {
   const hint = $('bios-online-hint');
@@ -3019,6 +3117,7 @@ function renderBIOSOnline(status) {
     : '';
   setText('bios-online-latest', latest);
   setText('bios-online-zip', status.candidate_zip);
+  biosOnlineCandidateLabel = latest || status.candidate_zip || '';
   const changelog = $('bios-online-changelog');
   if (changelog) {
     if (status.changelog) {
@@ -3078,6 +3177,17 @@ async function flashBIOSOnline() {
     showBIOSOnlineHint('请先勾选「我已备份 BIOS」确认项。', true);
     return;
   }
+  const target = biosOnlineCandidateLabel || '云端候选固件';
+  const confirmed = await showAppConfirm({
+    title: '再确认：下载并刷写 BIOS',
+    message: `即将下载并刷写 ${target}。刷写期间不能断电，计划关机与系统关机会被拦截；刷写失败可能导致主板无法启动，请确认已有救砖方案。`,
+    confirmText: '确认刷写',
+    danger: true,
+  });
+  if (!confirmed) {
+    showBIOSOnlineHint('已取消刷写。');
+    return;
+  }
   const button = $('bios-online-flash');
   if (button) button.disabled = true;
   try {
@@ -3085,7 +3195,7 @@ async function flashBIOSOnline() {
     form.append('confirm', 'FLASH');
     renderFirmwareStatus(await postForm('api/firmware/bios-online/flash', form));
     startFirmwarePoll();
-    showBIOSOnlineHint('已开始下载并刷写，进度见下方「BIOS 升级（flashrom）」日志。');
+    showBIOSOnlineHint('已开始下载并刷写，进度见下方「手动升级 BIOS」卡片里的日志（刷写期间会自动展开）。');
   } catch (error) {
     showBIOSOnlineHint(`刷写启动失败：${error.message}`, true);
     updateBIOSOnlineFlashButton();
@@ -3287,7 +3397,26 @@ function stressOptionsFromForm() {
     ? 0
     : Math.min(3600, Math.max(10, Number.isFinite(durationValue) && durationValue > 0 ? Math.round(durationValue) : 300));
   const memoryMB = Math.max(64, Number.isFinite(memoryValue) && memoryValue > 0 ? Math.round(memoryValue) : 512);
-  return { cpu, gpu, memory, duration_seconds: duration, memory_mb: memoryMB };
+  const memoryAutoNode = $('stress-memory-auto');
+  const memoryAuto = Boolean(memory && memoryAutoNode && memoryAutoNode.checked);
+  // 自动预留时 MB 由后端按「可用内存 − 256 MB」计算，这里传 0 表示不用手填值
+  return { cpu, gpu, memory, duration_seconds: duration, memory_mb: memoryAuto ? 0 : memoryMB, memory_auto: memoryAuto };
+}
+
+// 勾选「自动预留」后禁用 MB 输入框，值不再参与计算
+function updateStressMemoryAuto() {
+  const auto = $('stress-memory-auto');
+  const input = $('stress-memory-mb');
+  if (!auto || !input) return;
+  input.disabled = Boolean(auto.checked);
+  input.placeholder = auto.checked ? '自动' : '';
+}
+
+// 只在压力测试运行期间检测风扇关停档：避免用户在不知情时一边压测一边停转导致超温
+function updateStressOffWarning(running = false) {
+  const warning = $('stress-off-warning');
+  if (!warning) return;
+  warning.hidden = !(running && fanOffModeActive());
 }
 
 function stressParts(options) {
@@ -3303,6 +3432,7 @@ function renderStressStatus(status) {
   if (!status) return;
   const options = status.options || {};
   const running = Boolean(status.running);
+  updateStressOffWarning(running);
   const parts = stressParts(options);
   const permanent = (options.duration_seconds || 0) === 0;
   const text = $('stress-status-text');
@@ -3401,6 +3531,18 @@ async function startStressRun() {
       text.className = 'message error';
     }
     return;
+  }
+  // 只在压力测试启用时检测关停档：压测持续升温而风扇不会起转，容易在不知情下超温
+  if (fanOffModeActive()) {
+    const result = await showAppConfirm({
+      title: '风扇处于「关停」档',
+      message: '压力测试会让整机持续升温，而关停档下风扇不会自动起转、超温只蜂鸣报警，可能造成硬件损坏。建议先恢复关停前的风扇曲线再开始压测。',
+      confirmText: '仍然开始压测',
+      danger: true,
+      secondaryText: '恢复关停前状态并开始',
+    });
+    if (!result) return;
+    if (result.secondary && !(await restoreFanOffState({ skipConfirm: true }))) return;
   }
   const button = $('stress-start');
   if (button) button.disabled = true;
@@ -4029,22 +4171,30 @@ async function applyFullSpeed() {
   if (result.secondary) await saveFanConfig();
 }
 
+// 恢复关停前记录的三条曲线并保存：压测拦截与再次点击「关停」共用这一条路。
+// 后端 5 分钟到期自动起转后，本地快照仍可用来恢复。
+async function restoreFanOffState({ skipConfirm = false } = {}) {
+  if (!skipConfirm) {
+    const result = await showAppConfirm({
+      title: '恢复原选定曲线',
+      message: '解除关停档，按关停前记下的三条曲线恢复并保存，风扇会立刻重新起转。',
+      confirmText: '恢复并保存',
+    });
+    if (!result) return false;
+  }
+  const fallback = clamp(Number($('fan-min').value) || DEFAULT_MIN_PWM_PERCENT, 30, 100);
+  const curves = tempCurveBackup || offModeCurveBackup || flatCurveSet(fallback);
+  await applyModeCurves('temp', curves, '已恢复关停前的曲线，正在下发起转…');
+  return saveFanConfig();
+}
+
 // 关停：全部 0%，优先级高于最低转速。第二次确认只留一个红色动作——
 // 关停必须落盘才算数，去掉「只改界面不保存」的主按钮，免得用户以为已经停了。
 // 关停档最长 5 分钟，后端到期自动恢复原曲线并起转；再次点击同一按钮也会
 // 直接退出关停、恢复原选定曲线。
 async function applyShutdown() {
   if (fanOffMode) {
-    const result = await showAppConfirm({
-      title: '恢复原选定曲线',
-      message: '解除关停档，按关停前记下的三条曲线恢复并保存，风扇会立刻重新起转。',
-      confirmText: '恢复并保存',
-    });
-    if (!result) return;
-    const fallback = clamp(Number($('fan-min').value) || DEFAULT_MIN_PWM_PERCENT, 30, 100);
-    const curves = tempCurveBackup || offModeCurveBackup || flatCurveSet(fallback);
-    await applyModeCurves('temp', curves, '已恢复关停前的曲线，正在下发起转…');
-    await saveFanConfig();
+    await restoreFanOffState();
     return;
   }
   const first = await showAppConfirm({
@@ -7584,6 +7734,9 @@ setupTabs();
 // 固件升级 / 压力测试
 $('firmware-fpt-upload').addEventListener('click', uploadFPT);
 $('firmware-bios-flash').addEventListener('click', flashBIOS);
+$('firmware-bios-manual-toggle').addEventListener('change', () => {
+  setManualBIOSVisible($('firmware-bios-manual-toggle').checked);
+});
 $('firmware-nic-check').addEventListener('click', checkNIC);
 $('firmware-nic-flash').addEventListener('click', flashNIC);
 $('bios-online-check').addEventListener('click', checkBIOSOnline);
@@ -7604,6 +7757,8 @@ document.querySelectorAll('[data-schedule-close]').forEach((node) => {
 });
 $('stress-start').addEventListener('click', startStressRun);
 $('stress-stop').addEventListener('click', stopStressRun);
+$('stress-memory-auto').addEventListener('change', updateStressMemoryAuto);
+$('stress-off-restore').addEventListener('click', () => { restoreFanOffState(); });
 $('stress-permanent').addEventListener('change', () => {
   const duration = $('stress-duration');
   if (!duration) return;

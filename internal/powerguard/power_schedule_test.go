@@ -277,6 +277,55 @@ func TestPowerScheduleTickSkipsShutdownDuringFirmwareJob(t *testing.T) {
 	}
 }
 
+func TestPowerScheduleTickSkipsShutdownNearPowerOn(t *testing.T) {
+	now := time.Date(2026, 10, 23, 1, 0, 20, 0, powerScheduleTestZone) // 周五 01:00:20
+	m := newPowerScheduleTestManager(t, &now)
+	cfg := PowerScheduleConfig{Entries: []PowerScheduleEntry{
+		{Enabled: true, Days: "weekday", Time: "01:00", Action: "poweroff"},
+		{Enabled: true, Days: "daily", Time: "01:05", Action: "poweron"}, // 4 分 40 秒后开机
+	}}
+	if err := m.SavePowerScheduleConfig(cfg); err != nil {
+		t.Fatalf("保存失败: %v", err)
+	}
+	calls := 0
+	old := powerScheduleShutdownHook
+	powerScheduleShutdownHook = func(ctx context.Context) error { calls++; return nil }
+	defer func() { powerScheduleShutdownHook = old }()
+
+	m.PowerScheduleTick(context.Background())
+	if calls != 0 {
+		t.Fatalf("距下次开机不足 10 分钟时不得关机，实际 %d 次", calls)
+	}
+	m.mu.Lock()
+	firedKey := m.powerScheduleFiredKey
+	m.mu.Unlock()
+	if firedKey == "" {
+		t.Fatalf("跳过关机后应占用同分钟去重键，避免反复尝试")
+	}
+	// 同一分钟再 tick 不得重复尝试，更不能关机
+	m.PowerScheduleTick(context.Background())
+	if calls != 0 {
+		t.Fatalf("保护窗口内的重复 tick 不得关机，实际 %d 次", calls)
+	}
+
+	// 开机计划离得远（30 分钟后）时，同一关机时刻应正常触发
+	now2 := time.Date(2026, 10, 23, 1, 0, 20, 0, powerScheduleTestZone)
+	m2 := newPowerScheduleTestManager(t, &now2)
+	cfg2 := PowerScheduleConfig{Entries: []PowerScheduleEntry{
+		{Enabled: true, Days: "weekday", Time: "01:00", Action: "poweroff"},
+		{Enabled: true, Days: "daily", Time: "01:30", Action: "poweron"},
+	}}
+	if err := m2.SavePowerScheduleConfig(cfg2); err != nil {
+		t.Fatalf("保存失败: %v", err)
+	}
+	farCalls := 0
+	powerScheduleShutdownHook = func(ctx context.Context) error { farCalls++; return nil }
+	m2.PowerScheduleTick(context.Background())
+	if farCalls != 1 {
+		t.Fatalf("距开机超过保护窗口应正常关机，实际 %d 次", farCalls)
+	}
+}
+
 func TestPowerScheduleTickSyncsWakeAlarm(t *testing.T) {
 	now := time.Date(2026, 10, 23, 9, 0, 0, 0, powerScheduleTestZone)
 	m := newPowerScheduleTestManager(t, &now)

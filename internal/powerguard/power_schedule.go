@@ -26,6 +26,10 @@ import (
 
 const powerScheduleMaxEntries = 32
 
+// powerScheduleShutdownGuard 关机前保护窗口：下一次开机计划在这个窗口内时，
+// 本次计划关机直接跳过——刚关机就到开机时间，关机动作本身会把开机窗口错过。
+const powerScheduleShutdownGuard = 10 * time.Minute
+
 var (
 	powerScheduleTimeRe = regexp.MustCompile(`^([01]\d|2[0-3]):[0-5]\d$`)
 	// powerScheduleShutdownHook 测试注入的关机实现；默认调用系统 shutdown。
@@ -381,6 +385,15 @@ func (m *Manager) PowerScheduleTick(ctx context.Context) {
 			return
 		}
 		m.mu.Lock()
+		// 延迟到临近开机时刻的关机要放弃：距下次开机不足保护窗口时关机，等于主动
+		// 错过开机窗口。占用去重键，避免 30 秒 tick 在同一分钟反复尝试、刷日志。
+		if next, ok := m.nextPowerOnAt(now); ok && next.Sub(now) <= powerScheduleShutdownGuard {
+			m.powerScheduleFiredKey = firedKey
+			m.logf("power schedule: 距下次开机（%s）不足 %d 分钟，跳过计划关机（%s）",
+				next.Format("2006-01-02 15:04"), int(powerScheduleShutdownGuard.Minutes()), firedKey)
+			m.mu.Unlock()
+			return
+		}
 		// 触发关机前先把开机唤醒写好，保证关机后能按计划自动上电
 		if _, err := m.applyPowerScheduleLocked(); err != nil {
 			m.logf("power schedule: apply wake alarm before shutdown failed: %v", err)

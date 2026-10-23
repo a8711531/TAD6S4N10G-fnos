@@ -26,6 +26,9 @@ type StressOptions struct {
 	Memory          bool `json:"memory"`
 	DurationSeconds int  `json:"duration_seconds"`
 	MemoryMB        int  `json:"memory_mb"`
+	// MemoryAuto 自动预留：按当前可用内存扣除 256 MB 系统预留后拉满，
+	// 此时 MemoryMB 由后端计算并回填进状态，前端传入值被忽略。
+	MemoryAuto bool `json:"memory_auto"`
 }
 
 type StressStatus struct {
@@ -197,6 +200,19 @@ func (m *Manager) normalizeStressOptions(options StressOptions) (StressOptions, 
 		options.DurationSeconds = 3600
 	}
 	if options.Memory {
+		if options.MemoryAuto {
+			// 自动预留：不设固定值，按当前可用内存扣掉 256 MB 系统预留后拉满。
+			available, ok := readMemAvailable(m.rooted("/proc/meminfo"))
+			if !ok || available <= 0 {
+				return options, errors.New("无法读取当前可用内存，不能使用自动预留")
+			}
+			limitMB := int(available>>20) - 256
+			if limitMB < 64 {
+				return options, fmt.Errorf("可用内存不足（%.0f MB），自动预留扣除 256 MB 后低于 64 MB", float64(available)/1024/1024)
+			}
+			options.MemoryMB = limitMB
+			return options, nil
+		}
 		if options.MemoryMB <= 0 {
 			options.MemoryMB = 512
 		}

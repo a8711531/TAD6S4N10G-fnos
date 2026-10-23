@@ -2556,7 +2556,7 @@ test('压力测试参数：一项都没勾返回 null，时长与内存按边界
 
   app.element('stress-cpu').checked = true;
   let result = { ...options() };
-  assert.deepEqual(result, { cpu: true, gpu: false, memory: false, duration_seconds: 300, memory_mb: 512 });
+  assert.deepEqual(result, { cpu: true, gpu: false, memory: false, duration_seconds: 300, memory_mb: 512, memory_auto: false });
 
   app.element('stress-duration').value = '5';
   app.element('stress-memory-mb').value = '16';
@@ -2579,6 +2579,96 @@ test('压力测试参数：一项都没勾返回 null，时长与内存按边界
   app.element('stress-cpu').checked = false;
   app.element('stress-gpu').checked = true;
   assert.equal(options().gpu, true);
+});
+
+test('压力测试内存自动预留：默认不预留，勾选后禁用输入框并提交 memory_auto', () => {
+  const app = loadAppContext();
+  const options = app.resolve('stressOptionsFromForm');
+  app.element('stress-memory').checked = true;
+  app.element('stress-memory-mb').value = '512';
+
+  assert.equal(options().memory_auto, false, '默认不预留');
+  assert.equal(options().memory_mb, 512);
+
+  app.element('stress-memory-auto').checked = true;
+  app.resolve('updateStressMemoryAuto')();
+  assert.equal(app.element('stress-memory-mb').disabled, true, '自动预留时不应再手填 MB');
+  const auto = options();
+  assert.equal(auto.memory_auto, true);
+  assert.equal(auto.memory_mb, 0, '自动预留由后端按可用内存计算，前端传 0');
+
+  app.element('stress-memory-auto').checked = false;
+  app.resolve('updateStressMemoryAuto')();
+  assert.equal(app.element('stress-memory-mb').disabled, false);
+  assert.equal(options().memory_mb, 512);
+});
+
+test('压力测试启动：关停档先拦截，取消不启动，运行中显示告警条', async () => {
+  const { requests, fetch } = recordingFetch(() => ({ config: { fan: { off_mode: true } } }));
+  const app = loadAppContext({ fetch });
+  const status = gpioStatus({});
+  status.config.fan = { off_mode: true };
+  app.resolve('render')(status, true);
+  assert.equal(app.resolve('fanOffModeActive')(), true, '前置：应处于关停档');
+
+  app.element('stress-cpu').checked = true;
+  const baseline = requests.length;
+  const pending = app.resolve('startStressRun')();
+  await nextTick();
+  assert.equal(requests.length, baseline, '拦截弹窗未处理前不得启动压测');
+  await app.click('confirm-cancel');
+  await pending;
+  assert.equal(requests.length, baseline, '取消拦截不得启动压测');
+
+  app.resolve('renderStressStatus')({ running: true, options: { cpu: true, duration_seconds: 0 } });
+  assert.equal(app.element('stress-off-warning').hidden, false, '运行中且关停档要显示告警条');
+  app.resolve('renderStressStatus')({ running: false, options: {} });
+  assert.equal(app.element('stress-off-warning').hidden, true, '未运行时不提示关停档');
+});
+
+test('压力测试启动：选择恢复关停前状态后先保存风扇配置再启动', async () => {
+  const { requests, fetch } = recordingFetch(() => ({}));
+  const app = loadAppContext({ fetch });
+  app.element('fan-min').value = '40';
+  app.element('fan-emergency').value = '85';
+  const status = gpioStatus({});
+  status.config.fan = { off_mode: true };
+  app.resolve('render')(status, true);
+
+  app.element('stress-cpu').checked = true;
+  const pending = app.resolve('startStressRun')();
+  await nextTick();
+  await app.click('confirm-secondary');
+  await pending;
+
+  const fanPost = requests.find((item) => item.url.includes('api/config/fan'));
+  assert.ok(fanPost, '恢复关停要先保存风扇配置');
+  assert.equal(JSON.parse(fanPost.init.body).off_mode, false, '恢复后不再是关停档');
+  assert.ok(requests.some((item) => /api\/stress\/start$/.test(item.url)), '恢复后要继续启动压测');
+});
+
+test('手动升级 BIOS：默认折叠，开关可展开，在线刷写运行中自动展开', async () => {
+  const app = loadAppContext();
+  const body = app.element('firmware-bios-manual-body');
+  const toggle = app.element('firmware-bios-manual-toggle');
+
+  // index.html 里内容区默认带 hidden、开关默认不勾选
+  app.resolve('setManualBIOSVisible')(false);
+  assert.equal(toggle.checked, false, '默认不显示手动升级');
+  assert.equal(body.hidden, true);
+
+  toggle.checked = true;
+  await toggle.listeners.get('change')();
+  assert.equal(body.hidden, false, '打开开关要显示手动升级内容');
+
+  toggle.checked = false;
+  await toggle.listeners.get('change')();
+  assert.equal(body.hidden, true, '关闭开关要重新折叠');
+
+  // 在线刷写运行中自动展开，进度日志不能被折叠藏住
+  app.resolve('renderFirmwareStatus')({ flashrom: { present: true }, fpt: {}, nic: {}, job: { kind: 'bios', state: 'running', logs: ['下载固件'] } });
+  assert.equal(toggle.checked, true);
+  assert.equal(body.hidden, false);
 });
 
 test('固件任务日志：空日志显示等待提示，多行按行拼接', () => {
@@ -2629,7 +2719,7 @@ test('固件状态渲染：刷写工具徽标、网卡字段、目标版本与�
   assert.equal(app.element('firmware-nic-flash').disabled, true);
 });
 
-test('BIOS 刷写：未勾确认不发请求；勾选后提交 confirm=FLASH 与镜像', async () => {
+test('BIOS 刷写：未勾确认不发请求；二次确认后才提交 confirm=FLASH 与镜像', async () => {
   const { requests, fetch } = recordingFetch(() => ({ job: { kind: 'bios', state: 'running', logs: ['刷写中'] } }));
   const app = loadAppContext({ fetch, FormData });
   const baseline = requests.length; // 页面初始化会先拉状态，只看本用例新增的请求
@@ -2640,7 +2730,19 @@ test('BIOS 刷写：未勾确认不发请求；勾选后提交 confirm=FLASH 与
   assert.match(app.element('firmware-bios-log').textContent, /勾选/);
 
   app.element('firmware-bios-confirm').checked = true;
-  await app.resolve('flashBIOS')();
+  // 勾选后还有第二重弹窗：取消时不得发请求
+  const cancelled = app.resolve('flashBIOS')();
+  await nextTick();
+  assert.equal(requests.length, baseline, '二次确认前不得发请求');
+  await app.click('confirm-cancel');
+  await cancelled;
+  assert.equal(requests.length, baseline, '取消二次确认不得发请求');
+  assert.match(app.element('firmware-bios-log').textContent, /已取消/);
+
+  const pending = app.resolve('flashBIOS')();
+  await nextTick();
+  await app.click('confirm-ok');
+  await pending;
   assert.equal(requests.length, baseline + 1);
   const sent = requests[requests.length - 1];
   assert.match(sent.url, /api\/firmware\/bios\/flash$/);
@@ -2648,6 +2750,27 @@ test('BIOS 刷写：未勾确认不发请求；勾选后提交 confirm=FLASH 与
   assert.equal(sent.init.body.get('confirm'), 'FLASH');
   assert.ok(sent.init.body.get('image'), '要带上 BIOS 镜像文件');
   assert.equal(app.element('firmware-bios-log').textContent, '刷写中');
+});
+
+test('网卡刷写：勾选后还需二次确认，确认后才提交 confirm=UPGRADE', async () => {
+  const { requests, fetch } = recordingFetch(() => ({ job: { kind: 'nic', state: 'running', logs: ['安装 MFT'] } }));
+  const app = loadAppContext({ fetch, FormData });
+  const baseline = requests.length;
+
+  await app.resolve('flashNIC')();
+  assert.equal(requests.length, baseline, '未勾确认不得发请求');
+  assert.match(app.element('firmware-nic-log').textContent, /勾选/);
+
+  app.element('firmware-nic-confirm').checked = true;
+  const pending = app.resolve('flashNIC')();
+  await nextTick();
+  assert.equal(requests.length, baseline, '二次确认前不得发请求');
+  await app.click('confirm-ok');
+  await pending;
+  assert.equal(requests.length, baseline + 1);
+  const sent = requests[requests.length - 1];
+  assert.match(sent.url, /api\/firmware\/nic\/flash$/);
+  assert.equal(sent.init.body.get('confirm'), 'UPGRADE');
 });
 
 test('BIOS 在线升级状态渲染：有新版本显示徽标/更新日志，勾选后刷写按钮才可用', () => {
@@ -2735,8 +2858,19 @@ test('BIOS 在线升级检查：点击后发 POST 请求并渲染结果，未勾
   assert.equal(requests.length, beforeFlash);
   assert.match(app.element('bios-online-hint').textContent, /勾选/);
 
+  // 勾选后还要过二次确认：取消不得发请求
   app.element('bios-online-confirm').checked = true;
-  await app.resolve('flashBIOSOnline')();
+  const cancelled = app.resolve('flashBIOSOnline')();
+  await nextTick();
+  await app.click('confirm-cancel');
+  await cancelled;
+  assert.equal(requests.length, beforeFlash, '取消二次确认不得发请求');
+  assert.match(app.element('bios-online-hint').textContent, /已取消刷写/);
+
+  const pending = app.resolve('flashBIOSOnline')();
+  await nextTick();
+  await app.click('confirm-ok');
+  await pending;
   const flashReq = requests.slice(beforeFlash).find((item) => /bios-online\/flash$/.test(item.url));
   assert.ok(flashReq, '刷写要 POST bios-online/flash');
   assert.equal(flashReq.init.body.get('confirm'), 'FLASH');
