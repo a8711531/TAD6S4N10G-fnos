@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -68,6 +70,13 @@ func TestSaveFPTBinaryRejectsNonELF(t *testing.T) {
 
 func TestStartBIOSFlashRequiresFPT(t *testing.T) {
 	manager := &Manager{StatePath: filepath.Join(t.TempDir(), "original-state.json")}
+	// 测试隔离（评审要求）：显式模拟工具「不可用」——下载失败、inhibitor 全桩，
+	// 绝不触碰真实网络或启动宿主 systemd-inhibit。
+	injectFakeInhibitor(manager)
+	firmwareDownloadHook = func(ctx context.Context, address string) ([]byte, error) {
+		return nil, errors.New("模拟下载不可用")
+	}
+	defer func() { firmwareDownloadHook = nil }()
 	image := make([]byte, 1<<20+1)
 	if err := manager.StartBIOSFlash(image); err == nil || !strings.Contains(err.Error(), "FPT") {
 		t.Fatalf("未上传 FPT 时应拒绝启动，实际 %v", err)
@@ -77,6 +86,7 @@ func TestStartBIOSFlashRequiresFPT(t *testing.T) {
 func TestBIOSFlashRunsFPTCommands(t *testing.T) {
 	root := t.TempDir()
 	manager := &Manager{StatePath: filepath.Join(root, "original-state.json")}
+	injectFakeInhibitor(manager)
 	elf := append([]byte{0x7f, 'E', 'L', 'F'}, make([]byte, 64)...)
 	if err := manager.SaveFPTBinary(elf); err != nil {
 		t.Fatalf("准备 FPT 失败: %v", err)
@@ -119,6 +129,7 @@ func TestBIOSFlashUsesFlashrom(t *testing.T) {
 		t.Fatalf("准备 flashrom 失败: %v", err)
 	}
 	manager := &Manager{StatePath: filepath.Join(root, "original-state.json"), firmwareFlashrom: flashrom}
+	injectFakeInhibitor(manager)
 	var commands []string
 	manager.firmwareExec = func(ctx context.Context, dir, name string, args []string) (string, error) {
 		commands = append(commands, name+" "+strings.Join(args, " "))
@@ -163,6 +174,7 @@ func TestNICFlashPSIDMismatchStopsBeforeBurn(t *testing.T) {
 		firmwareFlint: "flint",
 		firmwareMST:   "mst",
 	}
+	injectFakeInhibitor(manager)
 	lspci := "0000:01:00.0 网络控制器 [0200]: Mellanox Technologies MT27710 Family [ConnectX-4 Lx] [15b3:1015]\n"
 	burned := false
 	manager.firmwareExec = func(ctx context.Context, dir, name string, args []string) (string, error) {
@@ -242,6 +254,7 @@ func TestEnsureFlashromDownloads(t *testing.T) {
 func TestStartNICMFTInstallSkipsWhenInstalled(t *testing.T) {
 	root := t.TempDir()
 	manager := &Manager{StatePath: filepath.Join(root, "state.json")}
+	injectFakeInhibitor(manager)
 	// 伪装 MFT 已安装：flint/mst 指向真实存在的文件，installMFT 不应被触发。
 	tool := filepath.Join(root, "flint")
 	if err := os.WriteFile(tool, []byte("#!/bin/sh\n"), 0o755); err != nil {
@@ -284,6 +297,266 @@ func TestEnsureFlashromRejectsHashMismatch(t *testing.T) {
 	}
 	if _, err := os.Stat(manager.downloadedFlashromPath()); !os.IsNotExist(err) {
 		t.Fatalf("校验失败不得落盘: %v", err)
+	}
+}
+
+// 准备 flashrom 下载测试的公共桩：固定合法载荷与期望摘要，返回 manager 与载荷。
+func prepareFlashromDownload(t *testing.T) (*Manager, []byte) {
+	t.Helper()
+	manager := &Manager{StatePath: filepath.Join(t.TempDir(), "state.json")}
+	payload := append([]byte{0x7f, 'E', 'L', 'F'}, []byte("fake-flashrom")...)
+	oldHash := flashromExpectedSHA256
+	flashromExpectedSHA256 = sha256Hex(payload)
+	t.Cleanup(func() { flashromExpectedSHA256 = oldHash })
+	return manager, payload
+}
+
+// 原子发布：--version 试跑在临时文件上进行，失败只清理临时文件，正式路径不留副本。
+func TestEnsureFlashromVersionCheckFailureLeavesNoCache(t *testing.T) {
+	manager, payload := prepareFlashromDownload(t)
+	firmwareDownloadHook = func(ctx context.Context, address string) ([]byte, error) { return payload, nil }
+	defer func() { firmwareDownloadHook = nil }()
+	manager.firmwareExec = func(ctx context.Context, dir, name string, args []string) (string, error) {
+		if !strings.HasSuffix(name, ".tmp") {
+			t.Fatalf("--version 必须在临时文件上试跑，实际: %s", name)
+		}
+		return "", errors.New("libftdi1 缺失")
+	}
+	if _, err := manager.ensureFlashrom(context.Background()); err == nil || !strings.Contains(err.Error(), "无法运行") {
+		t.Fatalf("试跑失败应报错: %v", err)
+	}
+	if _, err := os.Stat(manager.downloadedFlashromPath()); !os.IsNotExist(err) {
+		t.Fatal("试跑失败不得留下正式缓存")
+	}
+	if _, err := os.Stat(manager.downloadedFlashromPath() + ".tmp"); !os.IsNotExist(err) {
+		t.Fatal("试跑失败要清理临时文件")
+	}
+}
+
+// 已有损坏缓存（旧版本写了一半）：不得凭「文件存在」被选中，重新下载后原子替换。
+func TestEnsureFlashromReplacesBrokenCache(t *testing.T) {
+	manager, payload := prepareFlashromDownload(t)
+	target := manager.downloadedFlashromPath()
+	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("partial"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := manager.flashromPath(); got != "" {
+		t.Fatalf("损坏缓存不得被选中，实际: %s", got)
+	}
+	firmwareDownloadHook = func(ctx context.Context, address string) ([]byte, error) { return payload, nil }
+	defer func() { firmwareDownloadHook = nil }()
+	manager.firmwareExec = func(ctx context.Context, dir, name string, args []string) (string, error) {
+		return "flashrom v1.3", nil
+	}
+	path, err := manager.ensureFlashrom(context.Background())
+	if err != nil {
+		t.Fatalf("坏缓存下重新下载应成功: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != string(payload) {
+		t.Fatalf("坏缓存应被完整替换: %v", err)
+	}
+}
+
+// 中途写失败：正式路径不得留下任何可选择的缓存（把 .tmp 预建成目录让 WriteFile 失败）。
+func TestEnsureFlashromWriteFailureLeavesNoCache(t *testing.T) {
+	manager, payload := prepareFlashromDownload(t)
+	firmwareDownloadHook = func(ctx context.Context, address string) ([]byte, error) { return payload, nil }
+	defer func() { firmwareDownloadHook = nil }()
+	target := manager.downloadedFlashromPath()
+	if err := os.MkdirAll(target+".tmp", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.RemoveAll(target + ".tmp") }()
+	if _, err := manager.ensureFlashrom(context.Background()); err == nil {
+		t.Fatal("写入失败应报错")
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatal("写失败不得留下正式缓存")
+	}
+}
+
+// 并发获取：互斥串行化 + 等锁复查，只下载一次，所有调用拿到同一路径。
+func TestEnsureFlashromConcurrentDownload(t *testing.T) {
+	manager, payload := prepareFlashromDownload(t)
+	var downloads int32
+	firmwareDownloadHook = func(ctx context.Context, address string) ([]byte, error) {
+		atomic.AddInt32(&downloads, 1)
+		time.Sleep(20 * time.Millisecond) // 放大并发窗口
+		return payload, nil
+	}
+	defer func() { firmwareDownloadHook = nil }()
+	manager.firmwareExec = func(ctx context.Context, dir, name string, args []string) (string, error) {
+		return "flashrom v1.3", nil
+	}
+	const callers = 8
+	var wg sync.WaitGroup
+	paths := make([]string, callers)
+	errs := make([]error, callers)
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			paths[index], errs[index] = manager.ensureFlashrom(context.Background())
+		}(i)
+	}
+	wg.Wait()
+	for i := 0; i < callers; i++ {
+		if errs[i] != nil {
+			t.Fatalf("并发获取失败: %v", errs[i])
+		}
+		if paths[i] != manager.downloadedFlashromPath() {
+			t.Fatalf("并发获取应得到同一路径，实际: %s", paths[i])
+		}
+	}
+	if got := atomic.LoadInt32(&downloads); got != 1 {
+		t.Fatalf("并发获取只应下载一次，实际 %d 次", got)
+	}
+}
+
+// 下载 Transport：克隆默认 Transport 保留环境代理，只定向覆盖 IPv4 拨号。
+func TestFirmwareTransportKeepsEnvironmentProxy(t *testing.T) {
+	transport := firmwareHTTPTransport()
+	if transport.Proxy == nil {
+		t.Fatal("必须保留默认 Transport 的环境代理（ProxyFromEnvironment），只能定向覆盖拨号")
+	}
+	if transport.DialContext == nil {
+		t.Fatal("自定义 IPv4 拨号必须保留")
+	}
+}
+
+// MFT 安装结果分级上报（评审要求）：安装成功但 mst start 失败、lspci 失败、
+// flint 查询失败、无网卡、全部成功五种情形必须分别表达，任务日志和最终状态
+// 不得把这些结果混成「可开始升级」。全程命令/下载/发现桩，不触碰真实安装与硬件。
+type mftInstallScenario struct {
+	name           string
+	mstStartErr    error // mst start 是否报错
+	lspciErr       error // lspci 执行失败
+	lspciOutput    string
+	flintQueryErr  error // flint q 查询失败
+	flintQueryText string
+	wantState      string // 期望最终任务状态
+	wantLogMatch   string // 任务日志必须包含
+	wantLogReject  string // 任务日志不得包含
+}
+
+func TestRunMFTInstallGradedOutcomes(t *testing.T) {
+	lspciFound := "0000:01:00.0 网络控制器 [0200]: Mellanox Technologies MT27710 Family [ConnectX-4 Lx] [15b3:1015]\n"
+	scenarios := []mftInstallScenario{
+		{
+			name:           "安装成功但 mst start 失败（探测链路仍通）",
+			mstStartErr:    errors.New("mst 模块加载失败"),
+			lspciOutput:    lspciFound,
+			flintQueryText: "FW Version: 14.32.1900\nPSID: MT_2420110034\n",
+			wantState:      firmwareJobSuccess,
+			wantLogMatch:   "mst start 报错",
+			wantLogReject:  "",
+		},
+		{
+			name:           "安装成功但 mst start 失败且无网卡",
+			mstStartErr:    errors.New("mst 模块加载失败"),
+			lspciOutput:    "0000:00:1f.0 ISA bridge: Intel\n",
+			wantState:      firmwareJobSuccess,
+			wantLogMatch:   "暂不能升级固件",
+			wantLogReject:  "可开始升级",
+		},
+		{
+			name:          "lspci 失败",
+			lspciErr:      errors.New("lspci: command not found"),
+			wantState:     firmwareJobFailed,
+			wantLogMatch:  "网卡探测失败",
+			wantLogReject: "可开始升级",
+		},
+		{
+			name:          "flint 查询失败",
+			lspciOutput:   lspciFound,
+			flintQueryErr: errors.New("flint 打不开设备"),
+			wantState:     firmwareJobFailed,
+			wantLogMatch:  "网卡探测失败",
+			wantLogReject: "可开始升级",
+		},
+		{
+			name:          "无网卡",
+			lspciOutput:   "0000:00:1f.0 ISA bridge: Intel\n",
+			wantState:     firmwareJobSuccess,
+			wantLogMatch:  "未检测到 Mellanox 网卡",
+			wantLogReject: "可开始升级",
+		},
+		{
+			name:           "全部成功",
+			lspciOutput:    lspciFound,
+			flintQueryText: "FW Version: 14.28.1000\nPSID: MT_2420110034\n",
+			wantState:      firmwareJobSuccess,
+			wantLogMatch:   "可开始升级网卡固件",
+			wantLogReject:  "暂不能升级",
+		},
+	}
+	for _, scenario := range scenarios {
+		t.Run(scenario.name, func(t *testing.T) {
+			root := t.TempDir()
+			manager := &Manager{
+				StatePath:     filepath.Join(root, "state.json"),
+				firmwareFlint: firmwareToolAbsent, // 显式「未安装」：开发机上的 WinMFT 不得干扰
+				firmwareMST:   firmwareToolAbsent,
+			}
+			injectFakeInhibitor(manager)
+			// 安装前 MFT 不存在：不触发「已安装」短路，会走 installMFT。
+			firmwareDownloadHook = func(ctx context.Context, address string) ([]byte, error) {
+				return []byte("fake-mft-tgz"), nil
+			}
+			defer func() { firmwareDownloadHook = nil }()
+			manager.firmwareExec = func(ctx context.Context, dir, name string, args []string) (string, error) {
+				joined := strings.Join(args, " ")
+				switch {
+				case name == "tar":
+					// 解压桩：installMFT 随后要在解包目录找 install.sh，这里模拟落盘。
+					//（该桩在任务 goroutine 内执行，失败只能返回 error，不能 t.Fatal）
+					extractDir := filepath.Join(manager.firmwareDataDir(), "mft")
+					if err := os.WriteFile(filepath.Join(extractDir, "install.sh"), []byte("#!/bin/bash\n"), 0o755); err != nil {
+						return "", err
+					}
+					return "ok", nil
+				case name == "bash":
+					// 模拟 install.sh 完成后工具可查：安装后置入路径字段。
+					manager.firmwareFlint = "flint"
+					manager.firmwareMST = "mst"
+					return "installed", nil
+				case name == "mst":
+					return "", scenario.mstStartErr
+				case name == "lspci":
+					if scenario.lspciErr != nil {
+						return "", scenario.lspciErr
+					}
+					return scenario.lspciOutput, nil
+				case name == "flint" && strings.Contains(joined, " q"):
+					if scenario.flintQueryErr != nil {
+						return "", scenario.flintQueryErr
+					}
+					return scenario.flintQueryText, nil
+				}
+				return "ok", nil
+			}
+			if err := manager.StartNICMFTInstall(); err != nil {
+				t.Fatalf("启动 MFT 安装任务失败: %v", err)
+			}
+			waitFirmwareJob(t, manager)
+			status := manager.FirmwareStatus()
+			if status.Job.State != scenario.wantState {
+				t.Fatalf("任务状态应为 %s，实际 %s（%s）", scenario.wantState, status.Job.State, status.Job.Error)
+			}
+			logs := strings.Join(status.Job.Logs, "\n")
+			if scenario.wantLogMatch != "" && !strings.Contains(logs+status.Job.Error, scenario.wantLogMatch) {
+				t.Fatalf("日志/错误应包含 %q，实际:\n%s\nerr=%s", scenario.wantLogMatch, logs, status.Job.Error)
+			}
+			if scenario.wantLogReject != "" {
+				if strings.Contains(logs, scenario.wantLogReject) || strings.Contains(status.Job.Error, scenario.wantLogReject) {
+					t.Fatalf("日志/错误不得包含 %q，实际:\n%s\nerr=%s", scenario.wantLogReject, logs, status.Job.Error)
+				}
+			}
+		})
 	}
 }
 

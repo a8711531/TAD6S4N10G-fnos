@@ -162,8 +162,10 @@ async function request(path, options = {}) {
     headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
     ...options,
   });
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
+  const body = await response.json().catch(() => null);
+  if (!response.ok) throw new Error((body && body.error) || `HTTP ${response.status}`);
+  // 2xx 但响应体不是合法 JSON（截断/网关改写等）：结果不确定，不得当成成功
+  if (body === null) throw new Error(`响应体解析失败（HTTP ${response.status}）`);
   return body;
 }
 
@@ -257,7 +259,8 @@ function storageHealthLabel(slot = {}) {
   // 健康状态行优先级：高温 > SMART / RM / purpose 等告警 > 后端 health 字段
   if (isStorageHot(slot)) return '高温';
   if (slot.warning || slot.state === 'warning') return '告警';
-  return slot.health || '正常';
+  // 后端没给健康结果（如 smartctl 缺失）时如实显示未读取，不能推断成正常
+  return slot.health || '未读取';
 }
 
 function storageHealthDetail(slot = {}) {
@@ -316,15 +319,16 @@ function storageSlotStatusLabel(slot = {}, tone = '') {
   // 活动行规则：
   // - empty → 空置
   // - present → 未使用（已插未挂，确实没负载）
-  // - warning/unknown/hot → 未使用（异常状态也不应该显示"空闲"这种会和正常盘混淆的词，
-  //   健康行独占告警展示，活动行统一显示"未使用"占位，表示没在干活）
   // - used → 活动词（空闲/休眠/轻载/繁忙等真实负载）
+  // - warning/hot → 告警不等于没在干活：后端先记录真实活动再叠加告警，
+  //   有活动读数时透传真实活动词，读数缺失才显示「未读取」
+  // - unknown → 未读取（状态未知不能推导出未使用）
   if (tone === 'empty') return '空置';
   if (slot.state === 'used') {
     return STORAGE_ACTIVITY_LABELS[slot.activity] || '';
   }
-  // present / warning / unknown / hot 统一走这里：都不是正常"在用"状态
-  return '未使用';
+  if (slot.state === 'present') return '未使用';
+  return STORAGE_ACTIVITY_LABELS[slot.activity] || '未读取';
 }
 
 function connectedFans(fanStatus = {}, limit = 0) {
@@ -2861,8 +2865,10 @@ let stressPollTimer = null;
 async function postForm(path, formData) {
   // multipart 不能手动设 Content-Type：浏览器需要自己带 boundary
   const response = await fetch(baseUrl(path), { method: 'POST', cache: 'no-store', body: formData });
-  const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
+  const body = await response.json().catch(() => null);
+  if (!response.ok) throw new Error((body && body.error) || `HTTP ${response.status}`);
+  // 2xx 但响应体损坏时结果不确定（刷写类操作尤其不能当成成功）
+  if (body === null) throw new Error(`响应体解析失败（HTTP ${response.status}）`);
   return body;
 }
 
@@ -3609,7 +3615,15 @@ async function startStressRun() {
       secondaryText: '恢复关停前状态并开始',
     });
     if (!result) return;
-    if (result.secondary && !(await restoreFanOffState({ skipConfirm: true }))) return;
+    if (result.secondary) {
+      // 「恢复并开始」：恢复后必须回读权威服务端状态，确认确实退出关停档才继续；
+      // 回读失败 / 响应损坏 / 仍是关停档都按不确定处理——保留提示并停止启动。
+      if (!(await restoreFanOffState({ skipConfirm: true }))) return;
+      if (!(await confirmFanOffModeReleased())) return;
+    } else {
+      // 用户明确承担风险直接压测：告知服务端跳过关停档门槛
+      options.ack_off_mode = true;
+    }
   }
   const button = $('stress-start');
   if (button) button.disabled = true;
@@ -4241,6 +4255,32 @@ async function applyFullSpeed() {
   backupTempCurves();
   await applyModeCurves('full', flatCurveSet(100), '已把三条曲线全部拉到 100%；风扇进入全速。');
   if (result.secondary) await saveFanConfig();
+}
+
+// 恢复关停后回读权威服务端状态：只有服务端明确报告已退出关停档才返回 true。
+// 回读失败、响应损坏（request 已对坏 JSON 抛错）或 fan 段缺失/仍是关停档，
+// 一律按不确定处理——保留未知提示并停止后续压测启动。
+async function confirmFanOffModeReleased() {
+  const text = $('stress-status-text');
+  let status;
+  try {
+    status = await request('api/status');
+  } catch (error) {
+    if (text) {
+      text.textContent = `恢复结果未知：无法回读服务端状态（${error.message}），已取消压测启动。`;
+      text.className = 'message error';
+    }
+    return false;
+  }
+  const fan = status && status.fan_control;
+  // off_mode === true 时服务端明确上报关停；false/缺省即未处于关停档。
+  // 整个 fan_control 段缺失说明状态不可信，同样按不确定处理。
+  if (fan && typeof fan === 'object' && fan.off_mode !== true) return true;
+  if (text) {
+    text.textContent = '恢复结果未知：服务端仍报告风扇处于关停档，已取消压测启动。';
+    text.className = 'message error';
+  }
+  return false;
 }
 
 // 恢复关停前记录的三条曲线并保存：压测拦截与再次点击「关停」共用这一条路。

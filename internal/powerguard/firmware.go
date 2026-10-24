@@ -41,6 +41,7 @@ const (
 
 var (
 	errFirmwareBusy     = errors.New("已有固件任务正在进行，请等待完成")
+	errShutdownPending  = errors.New("系统正在关机，已拒绝启动固件刷写")
 	errNotLinuxELF      = errors.New("不是 Linux ELF 可执行文件：BIOS 刷写需要 Linux 版 FPT（Fpt.efi 无法在 Linux 下运行）")
 	errNICNotDetected   = errors.New("未检测到 Mellanox ConnectX 网卡")
 	errPSIDMismatch     = errors.New("网卡 PSID 与目标固件不一致，已停止刷写（跨型号强刷可能变砖）")
@@ -181,11 +182,22 @@ func (m *Manager) flashromPath() string {
 		return path
 	}
 	if path := m.downloadedFlashromPath(); path != "" {
-		if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() {
+		// 已下载副本必须过摘要校验才被选中：半成品/被改动的坏缓存不可复用。
+		if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() && flashromCacheVerified(path) {
 			return path
 		}
 	}
 	return ""
+}
+
+// flashromCacheVerified 校验数据目录里已下载 flashrom 的摘要，只信任与分发值
+// 一致的副本；旧版本可能留下写了一半的坏缓存，不能凭「文件存在」就选中。
+func flashromCacheVerified(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(sha256Hex(data), flashromExpectedSHA256)
 }
 
 // downloadedFlashromPath 是自动下载的 flashrom 存放路径（数据目录下）。
@@ -215,7 +227,16 @@ func flashromToolURL() string {
 
 // ensureFlashrom 保证有可用 flashrom：系统未安装时从 ky.mi-d.cn 下载一份到数据目录。
 // 部分用户主机没装 flashrom（只有刷写/读取 BIOS 才需要），自动下载省去手动装包的步骤。
+// 缓存原子发布：先写同目录临时文件，SHA256 校验与 --version 试跑都通过后才 rename
+// 到正式路径；正式路径要么不存在、要么是完整可用的副本，任何失败都不留可选缓存。
+// 并发获取由 flashromMu 串行化，等锁后复查一次，避免重复下载。
 func (m *Manager) ensureFlashrom(ctx context.Context) (string, error) {
+	if path := m.flashromPath(); path != "" {
+		return path, nil
+	}
+	m.flashromMu.Lock()
+	defer m.flashromMu.Unlock()
+	// 等锁期间并发调用可能已完成下载，复查一次再决定是否走网络
 	if path := m.flashromPath(); path != "" {
 		return path, nil
 	}
@@ -233,17 +254,28 @@ func (m *Manager) ensureFlashrom(ctx context.Context) (string, error) {
 	if hash := sha256Hex(data); !strings.EqualFold(hash, flashromExpectedSHA256) {
 		return "", fmt.Errorf("下载的 flashrom 校验和不匹配（期望 %s，实际 %s）", flashromExpectedSHA256, hash)
 	}
-	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+	dir := filepath.Dir(target)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(target, data, 0o755); err != nil {
-		return "", fmt.Errorf("保存 flashrom 失败: %w", err)
+	tmpPath := target + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0o755); err != nil {
+		return "", fmt.Errorf("保存 flashrom 临时文件失败: %w", err)
 	}
-	// 落盘后跑一次 --version 确认依赖库齐全（目标主机缺 libftdi/libjaylink 时直接报错，
-	// 不留一个跑不起来的坏副本）。
-	if output, err := m.runFirmwareCommand(ctx, filepath.Dir(target), target, []string{"--version"}); err != nil {
-		_ = os.Remove(target)
+	// 落盘前最后一步在临时文件上跑 --version 确认依赖库齐全（目标主机缺
+	// libftdi/libjaylink 时直接报错），试跑不过只删临时文件，不碰正式路径。
+	if output, err := m.runFirmwareCommand(ctx, dir, tmpPath, []string{"--version"}); err != nil {
+		_ = os.Remove(tmpPath)
 		return "", fmt.Errorf("下载的 flashrom 无法运行（可能缺依赖库）: %v %s", err, trimCommandOutput(output))
+	}
+	if err := os.Rename(tmpPath, target); err != nil {
+		// Windows 上目标已存在时 Rename 失败：删除旧副本后重试
+		//（Linux 上 rename 本来就原子覆盖，不会走到这里）。
+		_ = os.Remove(target)
+		if retryErr := os.Rename(tmpPath, target); retryErr != nil {
+			_ = os.Remove(tmpPath)
+			return "", fmt.Errorf("发布 flashrom 缓存失败: %v", retryErr)
+		}
 	}
 	return target, nil
 }
@@ -260,12 +292,28 @@ func (m *Manager) activeBIOSBackend() (string, string) {
 	return "", ""
 }
 
-// firmwareJobActive 报告当前是否有固件刷写任务在跑。计划关机必须避开刷写窗口：
-// BIOS/网卡写到一半断电有变砖风险。
-func (m *Manager) firmwareJobActive() bool {
+// tryAcquireShutdownSlot 计划关机触发前调用（power_schedule.go）：在同一把
+// firmwareMu 内原子完成「确认无刷写任务 + 标记关机进行中」，与
+// beginFirmwareJob 的刷写启动检查互斥，堵死「检查通过到关机提交」窗口内
+// 另一请求开始刷写的交错（反向交错同样被 shutdownPending 占位挡住）。
+// 返回 false 表示刷写进行中，本次关机必须让路。拿到 slot 后若最终放弃关机
+// （关机保护窗口跳过/关机命令失败），必须调 releaseShutdownSlot 释放占位；
+// 关机命令成功发出后保留占位，直到进程随系统关机退出，期间不得开始刷写。
+func (m *Manager) tryAcquireShutdownSlot() bool {
 	m.firmwareMu.Lock()
 	defer m.firmwareMu.Unlock()
-	return m.firmwareJob.state == firmwareJobRunning
+	if m.firmwareJob.state == firmwareJobRunning {
+		return false
+	}
+	m.shutdownPending = true
+	return true
+}
+
+// releaseShutdownSlot 放弃已占位的计划关机（未真正关机时调用），恢复允许刷写。
+func (m *Manager) releaseShutdownSlot() {
+	m.firmwareMu.Lock()
+	m.shutdownPending = false
+	m.firmwareMu.Unlock()
 }
 
 // FirmwareStatus 只返回缓存状态，不在轮询路径上执行外部命令。
@@ -364,7 +412,14 @@ func (m *Manager) mftInstalled() bool {
 	return m.flintPath() != "" && m.mstPath() != ""
 }
 
+// firmwareToolAbsent 是测试注入字段的哨兵值：显式表示「工具未安装」，
+// 避免开发机上真实安装的同名工具（如 Windows 版 WinMFT）被 findTool 命中。
+const firmwareToolAbsent = "-"
+
 func (m *Manager) flintPath() string {
+	if m.firmwareFlint == firmwareToolAbsent {
+		return ""
+	}
 	if m.firmwareFlint != "" {
 		return m.firmwareFlint
 	}
@@ -376,6 +431,9 @@ func (m *Manager) flintPath() string {
 }
 
 func (m *Manager) mstPath() string {
+	if m.firmwareMST == firmwareToolAbsent {
+		return ""
+	}
 	if m.firmwareMST != "" {
 		return m.firmwareMST
 	}
@@ -499,15 +557,48 @@ func (m *Manager) runMFTInstall() {
 		return
 	}
 	m.firmwareSetStep("启动 MST", 80)
+	var mstErr error
 	if output, err := m.runFirmwareCommand(ctx, "", m.mstPath(), []string{"start"}); err != nil {
-		m.firmwareLog("mst start: %v %s", err, trimCommandOutput(output))
+		mstErr = fmt.Errorf("mst start 报错: %v %s", err, trimCommandOutput(output))
+		m.firmwareLog("%v", mstErr)
 	}
 	// 安装后刷新网卡缓存，页面立刻能看到 MFT 已安装与固件版本。
 	info := m.detectNIC(ctx)
 	m.firmwareMu.Lock()
 	m.firmwareNIC = info
 	m.firmwareMu.Unlock()
-	m.firmwareFinish(nil, "MFT 工具安装完成，可开始升级网卡固件。")
+	// 分级上报（评审要求）：安装文件成功、MST 启动成功、网卡已就绪必须分别表达，
+	// 不得把「mst 启动失败 / 探测失败 / 无网卡」混成「可开始升级」。
+	switch {
+	case info.err != "":
+		// 探测/查询失败：工具已装上但读不到网卡信息，不能宣称可升级。
+		detail := info.err
+		if mstErr != nil {
+			detail = fmt.Sprintf("%s；%v", detail, mstErr)
+		}
+		m.firmwareFinish(fmt.Errorf("MFT 工具已安装，但网卡探测失败: %s", detail), "")
+	case !info.present:
+		// 无网卡是合理结果（可能用户尚未插入网卡），按成功结束但明确「不可升级」。
+		msg := "MFT 工具安装完成，但未检测到 Mellanox 网卡：请接入网卡后重新检测，暂不能升级固件。"
+		if mstErr != nil {
+			msg = fmt.Sprintf("MFT 工具安装完成，但 %v，且未检测到 Mellanox 网卡：请接入网卡后重新检测，暂不能升级固件。", mstErr)
+		}
+		m.firmwareFinish(nil, msg)
+	case info.fwVersion == "":
+		// 找到网卡但没读到固件版本（flint 输出解析失败），视为部分成功，不引导升级。
+		detail := "网卡固件版本读取失败"
+		if mstErr != nil {
+			detail = fmt.Sprintf("%s；%v", detail, mstErr)
+		}
+		m.firmwareFinish(fmt.Errorf("MFT 工具已安装并检测到网卡，但%s：请检查 mst/flint 状态后重试，暂不能升级固件", detail), "")
+	default:
+		msg := fmt.Sprintf("MFT 工具安装完成，检测到 %s（当前固件 %s），可开始升级网卡固件。", info.model, info.fwVersion)
+		if mstErr != nil {
+			// mst start 失败但探测链路仍走通（flint 直读 PCI）：保留部分成功注记。
+			msg = fmt.Sprintf("MFT 工具安装完成（%v），检测到 %s（当前固件 %s），可开始升级网卡固件。", mstErr, info.model, info.fwVersion)
+		}
+		m.firmwareFinish(nil, msg)
+	}
 }
 
 func (m *Manager) beginFirmwareJob(kind string) error {
@@ -515,6 +606,10 @@ func (m *Manager) beginFirmwareJob(kind string) error {
 	if m.firmwareJob.state == firmwareJobRunning {
 		m.firmwareMu.Unlock()
 		return errFirmwareBusy
+	}
+	if m.shutdownPending {
+		m.firmwareMu.Unlock()
+		return errShutdownPending
 	}
 	m.firmwareJob = firmwareJobState{
 		kind:      kind,
@@ -524,8 +619,15 @@ func (m *Manager) beginFirmwareJob(kind string) error {
 	}
 	m.firmwareMu.Unlock()
 	// 刷写窗口内持有系统关机 inhibitor：外部关机/休眠请求会被推迟到刷写结束，
-	// 避免写一半断电变砖（本模块自己的计划关机另行跳过，见 PowerScheduleTick）。
-	m.holdSystemInhibitor("固件刷写中，禁止关机")
+	// 避免写一半断电变砖（本模块自己的计划关机由 shutdownPending 互斥跳过）。
+	// 启动子进程不等于拿到锁：获取失败必须回滚任务状态并向上传播，
+	// 不得在未确认受保护的情况下进入写入。
+	if err := m.holdSystemInhibitor("固件刷写中，禁止关机"); err != nil {
+		m.firmwareMu.Lock()
+		m.firmwareJob = firmwareJobState{}
+		m.firmwareMu.Unlock()
+		return fmt.Errorf("无法持有系统关机保护，已取消刷写: %w", err)
+	}
 	return nil
 }
 
@@ -551,22 +653,24 @@ func (m *Manager) firmwareLog(format string, args ...any) {
 
 func (m *Manager) firmwareFinish(err error, success string) {
 	m.firmwareMu.Lock()
-	defer m.firmwareMu.Unlock()
-	// 任务无论成功失败都要释放系统关机 inhibitor，否则用户关机被永久挡住。
-	defer m.releaseSystemInhibitor()
 	m.firmwareJob.finishedAt = time.Now()
 	if err != nil {
 		m.firmwareJob.state = firmwareJobFailed
 		m.firmwareJob.err = err.Error()
 		m.firmwareJob.logs = append(m.firmwareJob.logs, "失败: "+err.Error())
-		return
+	} else {
+		m.firmwareJob.state = firmwareJobSuccess
+		m.firmwareJob.step = "完成"
+		m.firmwareJob.progress = 100
+		if success != "" {
+			m.firmwareJob.logs = append(m.firmwareJob.logs, success)
+		}
 	}
-	m.firmwareJob.state = firmwareJobSuccess
-	m.firmwareJob.step = "完成"
-	m.firmwareJob.progress = 100
-	if success != "" {
-		m.firmwareJob.logs = append(m.firmwareJob.logs, success)
-	}
+	m.firmwareMu.Unlock()
+	// 任务无论成功失败都要释放系统关机 inhibitor，否则用户关机被永久挡住。
+	// 释放在 firmwareMu 外进行：真实句柄的 Release 要等子进程收尸，持锁等待
+	// 会把状态接口一起卡住。
+	m.releaseSystemInhibitor()
 }
 
 func (m *Manager) runBIOSFlash(image []byte) {
@@ -856,13 +960,19 @@ func firmwareHTTPTransport() *http.Transport {
 			return dialer.DialContext(ctx, network, address)
 		},
 	}
-	return &http.Transport{
-		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-			Resolver:  resolver,
-		}).DialContext,
+	// 克隆默认 Transport 再定向替换拨号/解析：保留 ProxyFromEnvironment 等
+	// 环境代理支持，只能经 HTTPS_PROXY 出网的环境不会被改成直连。
+	transport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		transport = &http.Transport{}
 	}
+	clone := transport.Clone()
+	clone.DialContext = (&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Resolver:  resolver,
+	}).DialContext
+	return clone
 }
 
 func firmwareMFTURL() string {

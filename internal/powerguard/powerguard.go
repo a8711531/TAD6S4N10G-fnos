@@ -8,7 +8,6 @@ import (
 	"io/fs"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -347,7 +346,12 @@ type Manager struct {
 	firmwareFlint    string                // 测试注入的 flint 路径，空则按 PATH/常见路径查找
 	firmwareMST      string                // 测试注入的 mst 路径，空则按 PATH/常见路径查找
 	firmwareFlashrom string                // 测试注入的 flashrom 路径，空则按 PATH/常见路径查找
+	flashromMu       sync.Mutex            // flashrom 自动下载串行化：并发获取只下载一次，且半成品不对外可见
 	biosOnline       biosOnlineCache       // BIOS 在线检查的缓存（bios_online.go），随 firmwareMu 保护
+	// shutdownPending 计划关机已提交占位（随 firmwareMu 保护）：与刷写启动共用
+	// 同一把锁做原子互斥，占位期间 beginFirmwareJob 一律拒绝，见
+	// tryAcquireShutdownSlot / power_schedule.go。
+	shutdownPending bool
 
 	// 压力测试（stress.go）：CPU/内存工作协程与采样状态，全部在内存中。
 	stressMu sync.Mutex
@@ -361,10 +365,12 @@ type Manager struct {
 	powerScheduleTestUntil time.Time
 
 	// firmwareInhibitor 固件刷写期间持有的系统关机 inhibitor（systemd-inhibit
-	// 子进程，见 firmware_inhibit_linux.go），随 inhibitMu 保护。非 Linux 平台
-	// 为空实现，字段本身不参与逻辑。
+	// 子进程，见 firmware_inhibit.go / firmware_inhibit_linux.go），随 inhibitMu
+	// 保护。inhibitorAcquire 为测试注入的获取实现，nil 时走平台默认（Linux 用
+	// systemd-inhibit，其他平台为 no-op 句柄）。
 	inhibitMu         sync.Mutex
-	firmwareInhibitor *exec.Cmd
+	firmwareInhibitor inhibitorHandle
+	inhibitorAcquire  func(reason string) (inhibitorHandle, error)
 }
 
 // SetLogger 注入运行日志器（main 启动时调用）。

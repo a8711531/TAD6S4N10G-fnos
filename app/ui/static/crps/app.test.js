@@ -14,6 +14,18 @@ const vm = require('node:vm');
 // 可记录事件监听的元素桩：value/textContent 等按元素持久保存，供交互用例读回断言
 function listeningStub() {
   const store = { checked: false, value: '', textContent: '' };
+  // Set 实现的 classList：显隐类切换可被断言（.hidden 回归用）
+  const classes = new Set();
+  store.classList = {
+    add: (...names) => names.forEach((n) => classes.add(n)),
+    remove: (...names) => names.forEach((n) => classes.delete(n)),
+    contains: (name) => classes.has(name),
+    toggle: (name, force) => {
+      const want = force === undefined ? !classes.has(name) : !!force;
+      if (want) { classes.add(name); } else { classes.delete(name); }
+      return want;
+    },
+  };
   const listeners = new Map();
   const stub = new Proxy(function stub() {}, {
     get(_target, prop) {
@@ -240,6 +252,28 @@ test('写盘失败告警优先: 轮询状态刷新不得覆盖告警文字', asy
   assert.match(app.element('gpio-msg').textContent, /写盘失败/, '轮询状态刷新不得覆盖写盘告警');
 });
 
+test('手动/自动切换同步增删 manual-ctl 的 hidden 类（.hidden 带 !important 的回归）', async () => {
+  const { fetch } = recordingFetch((href, init = {}) => {
+    if (href.includes('api/crps/fan') && init.method === 'POST') return { ok: true, mode: JSON.parse(init.body).mode || 'manual' };
+    if (href.includes('api/crps/config')) return { pins: ['Pin19', 'Pin20', 'Pin21', 'Pin22'], scl_pin: 'Pin19', sda_pin: 'Pin21', configured: true, readable: true };
+    if (href.includes('api/crps/status')) return { ok: true, ts: 1700000000, bus: 'gpio', addr: '0x5b', fan: 2600, fan_mode: 'auto' };
+    return {};
+  });
+  const app = loadCrpsContext({ fetch });
+  await tick();
+  // 真实 HTML 中 manual-ctl 初始带 hidden
+  app.element('manual-ctl').classList.add('hidden');
+
+  app.click('mode-manual');
+  await tick();
+  assert.equal(app.element('manual-ctl').classList.contains('hidden'), false,
+    '切手动必须移除 hidden 类（仅写行内 display 压不过 !important）');
+
+  app.click('mode-auto');
+  await tick();
+  assert.equal(app.element('manual-ctl').classList.contains('hidden'), true, '切回自动应重新隐藏');
+});
+
 test('手动模式钳制 pct≥11: 滑条 10 (固件回自动触发值) 不再原样发送', async () => {
   const { requests, fetch } = recordingFetch((href, init = {}) => {
     if (href.includes('api/crps/fan') && init.method === 'POST') return { ok: true, mode: 'manual', pct: JSON.parse(init.body).pct };
@@ -267,4 +301,122 @@ test('手动模式钳制 pct≥11: 滑条 10 (固件回自动触发值) 不再�
   const fanPosts2 = requests.filter((q) => q.url.includes('api/crps/fan') && q.init.method === 'POST');
   assert.equal(fanPosts2.length, 2, 'change 应补发一次');
   assert.equal(JSON.parse(fanPosts2[1].init.body).pct, 11, 'change 的 pct=10 同样钳制为 11');
+});
+
+test('cleanup_failed 告警独立存活: 连续轮询不覆盖, 服务端确认清理后才解除', async () => {
+  let detectRound = 0;
+  let statusSeq = 0;
+  const { fetch } = recordingFetch((href, init = {}) => {
+    if (href.includes('api/crps/detect')) {
+      detectRound++;
+      // 第一次: 未命中+清理失败; 第二次: 未命中但服务端确认清理完成
+      return detectRound === 1
+        ? { ok: false, found: false, cleanup_failed: true, msg: '探测未命中, 且清理 GPIO 失败, 请重试' }
+        : { ok: false, found: false, msg: '未探测到电源接线, 请检查线缆后重试' };
+    }
+    if (href.includes('api/crps/config')) {
+      return { pins: ['Pin19', 'Pin20', 'Pin21', 'Pin22'], scl_pin: 'Pin19', sda_pin: 'Pin21', configured: true, readable: true };
+    }
+    if (href.includes('api/crps/status')) {
+      statusSeq++;
+      return statusSeq % 2 === 1
+        ? { ok: true, ts: 1700000000, bus: 'gpio', addr: '0x5b', fan: 2600, fan_mode: 'auto' }
+        : { ok: false, status_raw: '0008', ts: 1700000000, bus: 'gpio', addr: '0x5b', fan: 4200, fan_mode: 'auto' };
+    }
+    return {};
+  });
+  const app = loadCrpsContext({ fetch });
+  await tick();
+  assert.match(app.element('gpio-msg').textContent, /当前接线可读/, '初始可读 → 绿字');
+
+  app.click('gpio-detect');
+  await tick();
+  assert.match(app.element('gpio-msg').textContent, /清理 GPIO 失败/, 'cleanup_failed 应显示清理失败告警');
+
+  // 连续多轮 ok=true / ok=false 轮询均不得覆盖告警
+  for (let round = 0; round < 3; round++) {
+    for (const fn of [...app.timers]) fn();
+    await tick();
+    assert.match(app.element('gpio-msg').textContent, /清理 GPIO 失败/, `第 ${round + 1} 轮轮询不得覆盖清理告警`);
+  }
+
+  // 明确重试且服务端确认清理完成 (无 cleanup_failed) → 告警解除, 恢复固定引导文案
+  app.click('gpio-detect');
+  await tick();
+  const msg = app.element('gpio-msg').textContent;
+  assert.doesNotMatch(msg, /清理 GPIO 失败/, '确认清理完成后告警应解除');
+  assert.match(msg, /检测信号失败/, '恢复普通未命中引导文案');
+
+  // 解除后轮询恢复正常连接状态表达
+  for (const fn of [...app.timers]) fn();
+  await tick();
+  assert.match(app.element('gpio-msg').textContent, /当前接线可读|状态字异常/, '解除后轮询恢复普通连接状态');
+});
+
+test('cleanup_failed 后识别成功: 告警解除且写盘失败告警仍优先 (优先级回归)', async () => {
+  let detectRound = 0;
+  const { fetch } = recordingFetch((href, init = {}) => {
+    if (href.includes('api/crps/detect')) {
+      detectRound++;
+      return detectRound === 1
+        ? { ok: false, found: false, cleanup_failed: true, msg: '探测未命中, 且清理 GPIO 失败, 请重试' }
+        : { ok: true, found: true, saved: false, scl_pin: 'Pin19', sda_pin: 'Pin21', msg: '已识别, 但配置保存失败' };
+    }
+    if (href.includes('api/crps/config')) {
+      return { pins: ['Pin19', 'Pin20', 'Pin21', 'Pin22'], scl_pin: 'Pin19', sda_pin: 'Pin21', configured: true, readable: true };
+    }
+    if (href.includes('api/crps/status')) {
+      return { ok: true, ts: 1700000000, bus: 'gpio', addr: '0x5b', fan: 2600, fan_mode: 'auto' };
+    }
+    return {};
+  });
+  const app = loadCrpsContext({ fetch });
+  await tick();
+
+  app.click('gpio-detect');
+  await tick();
+  assert.match(app.element('gpio-msg').textContent, /清理 GPIO 失败/, '前置: 清理告警已置位');
+
+  // 重试识别成功但写盘失败: 清理告警解除, 写盘失败告警接管并优先于轮询
+  app.click('gpio-detect');
+  await tick();
+  assert.match(app.element('gpio-msg').textContent, /配置保存失败/, '识别成功后写盘失败告警应显示');
+  for (const fn of [...app.timers]) fn();
+  await tick();
+  assert.match(app.element('gpio-msg').textContent, /配置保存失败/, '写盘失败告警不被轮询覆盖 (优先级仍有效)');
+});
+
+test('cleanup_failed 后手动保存成功: 针脚被明确接管, 告警解除', async () => {
+  const { fetch } = recordingFetch((href, init = {}) => {
+    if (href.includes('api/crps/detect')) {
+      return { ok: false, found: false, cleanup_failed: true, msg: '探测未命中, 且清理 GPIO 失败, 请重试' };
+    }
+    if (href.includes('api/crps/config')) {
+      if (init.method === 'POST') return { ok: true, scl_pin: 'Pin19', sda_pin: 'Pin21', msg: 'ok' };
+      return { pins: ['Pin19', 'Pin20', 'Pin21', 'Pin22'], scl_pin: 'Pin19', sda_pin: 'Pin21', configured: true, readable: true };
+    }
+    if (href.includes('api/crps/status')) {
+      return { ok: true, ts: 1700000000, bus: 'gpio', addr: '0x5b', fan: 2600, fan_mode: 'auto' };
+    }
+    return {};
+  });
+  const app = loadCrpsContext({ fetch });
+  await tick();
+
+  app.click('gpio-detect');
+  await tick();
+  assert.match(app.element('gpio-msg').textContent, /清理 GPIO 失败/, '前置: 清理告警已置位');
+
+  app.element('scl-pin').value = 'Pin19';
+  app.element('sda-pin').value = 'Pin21';
+  app.click('gpio-save');
+  await tick();
+  // 保存成功且持久化正常 (msg=='ok') 时, loadGpioConfig 回读会把提示刷成普通
+  // 连接状态——这恰好证明清理告警已解除: 若未解除, 回读会优先恢复告警文本
+  assert.match(app.element('gpio-msg').textContent, /当前接线可读/, '保存成功后回读显示普通连接状态 (告警已解除)');
+
+  // 告警已解除: 轮询恢复普通连接状态表达
+  for (const fn of [...app.timers]) fn();
+  await tick();
+  assert.match(app.element('gpio-msg').textContent, /当前接线可读/, '手动保存成功后轮询恢复绿字');
 });

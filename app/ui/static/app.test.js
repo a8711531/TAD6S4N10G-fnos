@@ -189,7 +189,50 @@ function recordingFetch(responseFor) {
 
 const { resolve } = loadAppContext();
 
-test('盘位覆盖层标签：活动词只给 used，其余状态统一占位', () => {
+// request/postForm 助手契约：响应体损坏（截断 JSON、网关改写、空响应）时结果不确定，
+// 必须抛错，不得静默当成成功空对象（评审：不确定时不得当成功）。
+test('request 助手：2xx 但响应体不是合法 JSON 时抛错，不得当成成功', async () => {
+  const fetchImpl = async (url) => {
+    if (String(url).includes('api/probe-bad-json')) {
+      return { ok: true, status: 200, json: () => Promise.reject(new SyntaxError('Unexpected end of JSON input')) };
+    }
+    return new Promise(() => {}); // 其余初始请求挂起，不干扰断言
+  };
+  const ctx = loadAppContext({ fetch: fetchImpl });
+  const requestFn = ctx.resolve('request');
+  await assert.rejects(() => requestFn('api/probe-bad-json'), /响应体解析失败.*200/);
+});
+
+test('request 助手：HTTP 失败透传 body.error，响应体损坏回退状态码', async () => {
+  const fetchImpl = async (url) => {
+    const href = String(url);
+    if (href.includes('api/probe-err-bad')) {
+      return { ok: false, status: 502, json: () => Promise.reject(new SyntaxError('bad gateway')) };
+    }
+    if (href.includes('api/probe-err')) {
+      return { ok: false, status: 500, json: async () => ({ error: '磁盘不可用' }) };
+    }
+    return new Promise(() => {});
+  };
+  const ctx = loadAppContext({ fetch: fetchImpl });
+  const requestFn = ctx.resolve('request');
+  await assert.rejects(() => requestFn('api/probe-err'), /磁盘不可用/);
+  await assert.rejects(() => requestFn('api/probe-err-bad'), /HTTP 502/);
+});
+
+test('postForm 助手：2xx 但响应体损坏时抛错（刷写类入口不得误判成功）', async () => {
+  const fetchImpl = async (url) => {
+    if (String(url).includes('api/probe-form')) {
+      return { ok: true, status: 200, json: () => Promise.reject(new SyntaxError('truncated')) };
+    }
+    return new Promise(() => {});
+  };
+  const ctx = loadAppContext({ fetch: fetchImpl });
+  const postFormFn = ctx.resolve('postForm');
+  await assert.rejects(() => postFormFn('api/probe-form', {}), /响应体解析失败.*200/);
+});
+
+test('盘位覆盖层标签：告警/未知透传真实活动，读数缺失如实报未读取', () => {
   const storageSlotStatusLabel = resolve('storageSlotStatusLabel');
   assert.equal(storageSlotStatusLabel({ state: 'empty' }, 'empty'), '空置');
   assert.equal(storageSlotStatusLabel({ state: 'present' }), '未使用');
@@ -200,9 +243,12 @@ test('盘位覆盖层标签：活动词只给 used，其余状态统一占位', 
   assert.equal(storageSlotStatusLabel({ state: 'used', activity: 'busy' }), '繁忙');
   assert.equal(storageSlotStatusLabel({ state: 'used', activity: 'full' }), '满载');
   assert.equal(storageSlotStatusLabel({ state: 'used', activity: 'sleeping' }), '休眠');
-  // warning/unknown/高温都不是正常"在用"，活动行统一「未使用」占位，告警由健康行独占展示
-  assert.equal(storageSlotStatusLabel({ state: 'warning' }), '未使用');
-  assert.equal(storageSlotStatusLabel({ state: 'unknown' }), '未使用');
+  // 告警且繁忙/休眠是可达组合（后端先记录活动再叠加告警），不得伪装成「未使用」
+  assert.equal(storageSlotStatusLabel({ state: 'warning', activity: 'busy' }), '繁忙');
+  assert.equal(storageSlotStatusLabel({ state: 'warning', activity: 'sleeping' }), '休眠');
+  // 告警/未知但没有活动读数：不能推导成未使用，如实显示未读取
+  assert.equal(storageSlotStatusLabel({ state: 'warning' }), '未读取');
+  assert.equal(storageSlotStatusLabel({ state: 'unknown' }), '未读取');
   assert.equal(storageSlotStatusLabel({ state: 'used', kind: 'front', temperature_c: 56, activity: 'idle' }), '空闲');
 });
 
@@ -218,6 +264,25 @@ test('盘位高温阈值：前置 55°C、M.2 70°C 各自生效', () => {
   assert.equal(isStorageHot({ kind: 'm2', temperature_c: 70 }), true);
   assert.equal(isStorageHot({ kind: 'front', temperature_c: 54.9 }), false);
   assert.equal(isStorageHot({ kind: 'm2', temperature_c: 69.9 }), false);
+});
+
+test('盘位健康行：缺失 health 如实报未读取，高温 > 告警 > health 优先级正确', () => {
+  const storageHealthLabel = resolve('storageHealthLabel');
+  // 后端没给健康结果（smartctl 缺失等）：不得推断成正常
+  assert.equal(storageHealthLabel({ state: 'used' }), '未读取');
+  assert.equal(storageHealthLabel({ state: 'used', health: '' }), '未读取');
+  // 明确正常 / 明确告警文本透传
+  assert.equal(storageHealthLabel({ state: 'used', health: '正常' }), '正常');
+  assert.equal(storageHealthLabel({ state: 'used', health: '坏道告警' }), '坏道告警');
+  // warning / state=warning 优先于 health 字段
+  assert.equal(storageHealthLabel({ state: 'warning', health: '正常' }), '告警');
+  assert.equal(storageHealthLabel({ state: 'used', warning: 'SMART 告警', health: '正常' }), '告警');
+  // 高温最高优先：压过告警与 health
+  assert.equal(storageHealthLabel({ kind: 'front', temperature_c: 55, warning: 'x', health: '正常' }), '高温');
+  assert.equal(storageHealthLabel({ kind: 'm2', temperature_c: 70, health: '正常' }), '高温');
+  // 未达阈值不误报高温，回落到 health 字段
+  assert.equal(storageHealthLabel({ kind: 'front', temperature_c: 54.9, health: '正常' }), '正常');
+  assert.equal(storageHealthLabel({ kind: 'm2', temperature_c: 69.9, health: '正常' }), '正常');
 });
 
 test('风扇 1200→0→1200：选择器签名不变，未保存的勾选不触发重建', () => {
@@ -2625,9 +2690,14 @@ test('压力测试启动：关停档先拦截，取消不启动，运行中显�
   assert.equal(app.element('stress-off-warning').hidden, true, '未运行时不提示关停档');
 });
 
-test('压力测试启动：选择恢复关停前状态后先保存风扇配置再启动', async () => {
-  const { requests, fetch } = recordingFetch(() => ({}));
+test('压力测试启动：选择恢复关停前状态后先保存风扇配置、回读确认非关停再启动', async () => {
+  const { requests, fetch } = recordingFetch((href) => {
+    // 回读（含首屏刷新）返回权威状态：未处于关停档
+    if (href.includes('api/status')) return { fan_control: { fans: [] }, config: { fan: {} } };
+    return {};
+  });
   const app = loadAppContext({ fetch });
+  await nextTick(); // 首屏 refresh 落定，避免覆盖后续输入
   app.element('fan-min').value = '40';
   app.element('fan-emergency').value = '85';
   const status = gpioStatus({});
@@ -2643,7 +2713,165 @@ test('压力测试启动：选择恢复关停前状态后先保存风扇配置�
   const fanPost = requests.find((item) => item.url.includes('api/config/fan'));
   assert.ok(fanPost, '恢复关停要先保存风扇配置');
   assert.equal(JSON.parse(fanPost.init.body).off_mode, false, '恢复后不再是关停档');
-  assert.ok(requests.some((item) => /api\/stress\/start$/.test(item.url)), '恢复后要继续启动压测');
+  const startPost = requests.find((item) => /api\/stress\/start$/.test(item.url));
+  assert.ok(startPost, '回读确认非关停后要继续启动压测');
+  assert.notEqual(JSON.parse(startPost.init.body).ack_off_mode, true, '恢复路径不带 ack，服务端门槛兜底竞态');
+});
+
+// 关停档压测拦截的公共前置：输入合法风扇参数并 render 一份关停档状态，
+// 让 startStressRun 进入拦截弹窗分支。
+function prepareStressOffMode(app) {
+  app.element('fan-min').value = '40';
+  app.element('fan-emergency').value = '85';
+  const status = gpioStatus({});
+  status.config.fan = { off_mode: true };
+  app.resolve('render')(status, true);
+  app.element('stress-cpu').checked = true;
+}
+
+const stressStartCount = (requests) => requests.filter((item) => /api\/stress\/start$/.test(item.url)).length;
+
+test('压测恢复并开始：保存响应 JSON 截断 / 空响应时不得发起压测', async () => {
+  // 截断：HTTP 200 但 json() 抛 SyntaxError
+  const truncated = async (url, init = {}) => {
+    const href = String(url);
+    if (href.includes('api/config/fan') && init.method === 'POST') {
+      return { ok: true, status: 200, json: () => Promise.reject(new SyntaxError('Unexpected end of JSON input')) };
+    }
+    return { ok: true, status: 200, json: async () => ({}) };
+  };
+  const requestsA = [];
+  const appA = loadAppContext({
+    fetch: async (url, init = {}) => {
+      requestsA.push({ url: String(url), init });
+      return truncated(url, init);
+    },
+  });
+  await nextTick();
+  prepareStressOffMode(appA);
+  const pendingA = appA.resolve('startStressRun')();
+  await nextTick();
+  await appA.click('confirm-secondary');
+  await pendingA;
+  assert.equal(stressStartCount(requestsA), 0, '保存响应截断时不得启动压测');
+  assert.match(appA.element('message-fan').textContent, /保存失败/, '保存失败原因要展示在风扇区');
+
+  // 空响应：HTTP 200 但响应体为空（json() 同样抛错）
+  const requestsB = [];
+  const appB = loadAppContext({
+    fetch: async (url, init = {}) => {
+      const href = String(url);
+      requestsB.push({ url: href, init });
+      if (href.includes('api/config/fan') && init.method === 'POST') {
+        return { ok: true, status: 200, json: () => Promise.reject(new SyntaxError('Unexpected end of input')) };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    },
+  });
+  await nextTick();
+  prepareStressOffMode(appB);
+  const pendingB = appB.resolve('startStressRun')();
+  await nextTick();
+  await appB.click('confirm-secondary');
+  await pendingB;
+  assert.equal(stressStartCount(requestsB), 0, '保存响应为空时不得启动压测');
+});
+
+test('压测恢复并开始：保存被后端明确拒绝时不得发起压测', async () => {
+  const { requests, fetch } = recordingFetch((href) => {
+    if (href.includes('api/config/fan')) return { ok: false, error: '设备只读，配置未落盘' };
+    return {};
+  });
+  const app = loadAppContext({ fetch });
+  await nextTick();
+  prepareStressOffMode(app);
+  const pending = app.resolve('startStressRun')();
+  await nextTick();
+  await app.click('confirm-secondary');
+  await pending;
+  assert.equal(stressStartCount(requests), 0, '保存明确失败时不得启动压测');
+  assert.match(app.element('message-fan').textContent, /保存失败/, '风扇区要显示保存失败原因');
+});
+
+test('压测恢复并开始：回读失败或回读仍是关停档时不得发起压测', async () => {
+  // 回读失败：api/status 第 2 次（恢复后的回读）返回 500
+  let statusCallsA = 0;
+  const requestsA = [];
+  const appA = loadAppContext({
+    fetch: async (url, init = {}) => {
+      const href = String(url);
+      requestsA.push({ url: href, init });
+      if (href.includes('api/status') && !init.method) {
+        statusCallsA += 1;
+        if (statusCallsA >= 2) return { ok: false, status: 500, json: async () => ({ error: '内部错误' }) };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    },
+  });
+  await nextTick();
+  prepareStressOffMode(appA);
+  const pendingA = appA.resolve('startStressRun')();
+  await nextTick();
+  await appA.click('confirm-secondary');
+  await pendingA;
+  assert.ok(statusCallsA >= 2, '恢复后必须发起回读');
+  assert.equal(stressStartCount(requestsA), 0, '回读失败时不得启动压测');
+  assert.match(appA.element('stress-status-text').textContent, /无法回读服务端状态/, '要提示恢复结果未知');
+
+  // 回读仍是关停档
+  const requestsB = [];
+  const appB = loadAppContext({
+    fetch: async (url, init = {}) => {
+      const href = String(url);
+      requestsB.push({ url: href, init });
+      if (href.includes('api/status') && !init.method) {
+        return { ok: true, status: 200, json: async () => ({ fan_control: { off_mode: true, fans: [] }, config: { fan: { off_mode: true } } }) };
+      }
+      return { ok: true, status: 200, json: async () => ({}) };
+    },
+  });
+  await nextTick();
+  prepareStressOffMode(appB);
+  const pendingB = appB.resolve('startStressRun')();
+  await nextTick();
+  await appB.click('confirm-secondary');
+  await pendingB;
+  assert.equal(stressStartCount(requestsB), 0, '回读仍是关停档时不得启动压测');
+  assert.match(appB.element('stress-status-text').textContent, /仍报告风扇处于关停档/, '要提示仍在关停档');
+});
+
+test('压测恢复并开始：回读与启动之间被切回关停时，服务端门槛错误要如实展示', async () => {
+  // 回读说已退出关停，但 stress/start 被服务端门槛拒绝（另一客户端又切回关停）
+  const { requests, fetch } = recordingFetch((href) => {
+    if (/api\/stress\/start$/.test(href)) return { ok: false, error: '风扇处于「关停」档：压测会持续升温但风扇不会起转，请先恢复风扇曲线，或确认风险后重试' };
+    if (href.includes('api/status')) return { fan_control: { fans: [] }, config: { fan: {} } };
+    return {};
+  });
+  const app = loadAppContext({ fetch });
+  await nextTick();
+  prepareStressOffMode(app);
+  const pending = app.resolve('startStressRun')();
+  await nextTick();
+  await app.click('confirm-secondary');
+  await pending;
+  assert.equal(stressStartCount(requests), 1, '回读确认非关停后允许发起启动');
+  assert.match(app.element('stress-status-text').textContent, /启动失败.*关停/, '服务端门槛拒绝要展示给用户');
+  assert.equal(app.element('stress-start').disabled, false, '启动被拒后按钮要恢复可点');
+});
+
+test('压测仍然开始：明确风险确认后带 ack_off_mode 直接启动，不触发恢复', async () => {
+  const { requests, fetch } = recordingFetch(() => ({}));
+  const app = loadAppContext({ fetch });
+  await nextTick();
+  prepareStressOffMode(app);
+  const pending = app.resolve('startStressRun')();
+  await nextTick();
+  await app.click('confirm-ok'); // 红色主按钮「仍然开始压测」
+  await pending;
+  assert.equal(requests.filter((item) => item.url.includes('api/config/fan')).length, 0, '危险直启不得先改风扇配置');
+  const startPost = requests.find((item) => /api\/stress\/start$/.test(item.url));
+  assert.ok(startPost, '明确确认后要发起启动');
+  assert.equal(JSON.parse(startPost.init.body).ack_off_mode, true, '必须带 ack_off_mode 让服务端门槛放行');
 });
 
 test('手动升级 BIOS：默认折叠，开关可展开，在线刷写运行中自动展开', async () => {

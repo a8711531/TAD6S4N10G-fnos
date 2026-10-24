@@ -29,7 +29,14 @@ type StressOptions struct {
 	// MemoryAuto 自动预留：按当前可用内存扣除 256 MB 系统预留后拉满，
 	// 此时 MemoryMB 由后端计算并回填进状态，前端传入值被忽略。
 	MemoryAuto bool `json:"memory_auto"`
+	// AckOffMode 用户已明确知晓风扇处于「关停」档仍要压测（前端红色确认入口）。
+	// 缺省时关停档会拒绝启动，兜底「恢复并开始」回读与启动之间被切回关停的竞态。
+	AckOffMode bool `json:"ack_off_mode"`
 }
+
+// errStressFanOffMode 关停档（维修/检修）下未明确确认风险时拒绝压测：
+// 风扇保持 0 转，压测热量散不出去。
+var errStressFanOffMode = errors.New("风扇处于「关停」档：压测会持续升温但风扇不会起转，请先恢复风扇曲线，或确认风险后重试")
 
 type StressStatus struct {
 	Running          bool          `json:"running"`
@@ -66,11 +73,30 @@ type stressState struct {
 	err          string
 }
 
+// stressStartPrecheck 启动前提校验：关停档（维修/检修）下风扇保持 0 转，
+// 压测产生的热量散不出去；只有请求显式带 ack_off_mode（前端红色确认入口）才放行。
+// 这道服务端门槛兜底「恢复并开始」回读与启动之间被其他客户端切回关停的竞态。
+func (m *Manager) stressStartPrecheck(options StressOptions) error {
+	if options.AckOffMode {
+		return nil
+	}
+	m.mu.Lock()
+	offMode := m.fanOffModeActiveLocked()
+	m.mu.Unlock()
+	if offMode {
+		return errStressFanOffMode
+	}
+	return nil
+}
+
 // StartStress 启动压力测试；CPU、内存与 GPU 工作协程在后台运行，超时自动停止。
 // duration 为 0 表示永久运行，只有调用 StopStress 才会结束。
 func (m *Manager) StartStress(options StressOptions) error {
 	normalized, err := m.normalizeStressOptions(options)
 	if err != nil {
+		return err
+	}
+	if err := m.stressStartPrecheck(normalized); err != nil {
 		return err
 	}
 	m.stressMu.Lock()

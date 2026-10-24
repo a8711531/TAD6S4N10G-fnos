@@ -281,6 +281,7 @@ func TestRunBIOSOnlineFlashVerifiesSHA256(t *testing.T) {
 	}
 	defer func() { firmwareDownloadHook = nil }()
 
+	injectFakeInhibitor(manager)
 	if err := manager.beginFirmwareJob(firmwareJobKindBIOS); err != nil {
 		t.Fatal(err)
 	}

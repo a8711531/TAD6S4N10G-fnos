@@ -185,8 +185,9 @@
     $("ts").textContent = "更新于 " + (new Date(data.ts * 1000).toLocaleTimeString());
     // GPIO 提示跟随最新连接状态: 已配置但读不到电源数据(断电/拔线/总线异常)时同步红字,
     // 恢复后回到绿字——否则 loadGpioConfig 的旧快照会在断线后一直显示"当前接线可读"。
-    // 未配置态由 loadGpioConfig 引导, 不在此覆盖; 写盘失败告警 (gpioSaveWarn) 优先保留。
-    if (!gpioSaveWarn && data.error !== "gpio-not-configured") {
+    // 未配置态由 loadGpioConfig 引导, 不在此覆盖; 写盘失败告警 (gpioSaveWarn) 与
+    // 探测清理失败告警 (gpioCleanupWarn) 优先保留, 轮询不得覆盖。
+    if (!gpioSaveWarn && !gpioCleanupWarn && data.error !== "gpio-not-configured") {
       if (data.ok === true) {
         gpioMsgShow(true, "当前接线可读（已读到电源数据）");
       } else if (data.ok === false && data.status_raw) {
@@ -240,6 +241,8 @@
   function applyModeUI(mode) {
     modeAuto.classList.toggle("active", mode === "auto");
     modeManual.classList.toggle("active", mode === "manual");
+    // .hidden 带 !important，只写行内 display 压不过，必须同步增删类
+    manualCtl.classList.toggle("hidden", mode !== "manual");
     manualCtl.style.display = mode === "manual" ? "flex" : "none";
   }
 
@@ -347,6 +350,12 @@
   var gpioMsg = $("gpio-msg");
   var gpioPins = [];
   var gpioSaveWarn = false; // 写盘失败告警存活标志: 置位期间 render 的轮询状态刷新不得覆盖告警
+  // gpioCleanupWarn 探测清理失败告警（独立保存，优先于普通连接状态）:
+  // cleanup_failed 表示扫描未命中且收尾清理失败, 针脚可能仍为输出——一次正常
+  // 轮询/配置回读只能说明当前接线可读, 不能证明扫描期间所有输出针脚已释放。
+  // 仅再次识别/手动保存成功、或服务端确认清理完成（未命中且无 cleanup_failed）
+  // 后才清除; 识别请求失败/应用失败等不确定结果一律保留。
+  var gpioCleanupWarn = "";
 
   // gpioMsgShow 显示 GPIO 配置区的提示消息 (ok/err 样式)
   function gpioMsgShow(ok, text) {
@@ -380,8 +389,11 @@
         });
         if (d.scl_pin && gpioPins.indexOf(d.scl_pin) >= 0) sclSel.value = d.scl_pin;
         if (d.sda_pin && gpioPins.indexOf(d.sda_pin) >= 0) sdaSel.value = d.sda_pin;
-        // 保存后刷新: 写盘失败的告警须保留, 不被连接状态覆盖
-        if (preserveWarn) {
+        // 保存后刷新: 清理失败告警最优先 (针脚可能仍为输出, 普通连接状态不能
+        // 证明已释放), 其次写盘失败告警, 均不被连接状态覆盖
+        if (gpioCleanupWarn) {
+          gpioMsgShow(false, gpioCleanupWarn);
+        } else if (preserveWarn) {
           gpioMsgShow(false, preserveWarn);
         } else if (d.configured === false) {
           gpioMsgShow(false, "尚未设置 GPIO 引脚：选择 PSCL/PSDA 后点“保存并应用”开始读取");
@@ -410,6 +422,8 @@
       .then(function (r) { return r.json(); })
       .then(function (d) {
         if (d && d.ok) {
+          // 手动保存成功即 reconfigure 成功: 针脚已被明确接管, 清理告警解除
+          gpioCleanupWarn = "";
           // msg !== "ok" 表示已应用但写盘失败 (重启后配置丢失), 刷新下拉后仍须保留该告警
           var saveWarn = (d.msg && d.msg !== "ok") ? d.msg : "";
           gpioMsgShow(true, "已应用 PSCL=" + d.scl_pin + " PSDA=" + d.sda_pin + (saveWarn ? "（" + saveWarn + "）" : "（已持久化）") + "，连接状态见上方");
@@ -435,6 +449,8 @@
       .then(function (d) {
         gpioDetect.disabled = false;
         if (d && d.found && d.ok) {
+          // 识别+应用成功: 服务端已接管针脚, 清理告警解除
+          gpioCleanupWarn = "";
           // 后端已自动应用+保存: found/applied/saved 分离, 直接展示结果
           if (sclSel && d.scl_pin) sclSel.value = d.scl_pin;
           if (sdaSel && d.sda_pin) sdaSel.value = d.sda_pin;
@@ -442,8 +458,16 @@
           loadGpioConfig(d.saved ? "" : d.msg); // 写盘失败告警在刷新后保留
           setTimeout(poll, 300);
         } else if (d && d.found) {
+          // 已找到接线但应用失败: 结果不确定, 不触碰清理告警 (保留)
           gpioMsgShow(false, (d && d.msg) || "已找到接线但应用失败，请重试。");
+        } else if (d && d.cleanup_failed) {
+          // 未命中且收尾清理失败: 针脚可能仍为输出。告警独立保存, 优先于普通
+          // 连接状态, 仅再次识别/保存成功或服务端确认清理完成后才清除。
+          gpioCleanupWarn = (d && d.msg) || "探测未命中, 且清理 GPIO 失败, 请重试";
+          gpioMsgShow(false, gpioCleanupWarn);
         } else {
+          // 未命中但服务端确认清理完成 (无 cleanup_failed): 告警解除
+          gpioCleanupWarn = "";
           // 保留固定引导文案, 末尾附带后端 msg 便于排查 (如 I2C 超时/总线忙等细节)
           gpioMsgShow(false, "检测信号失败，请重新接线保证正确连接信号线。" + ((d && d.msg) ? "（" + d.msg + "）" : ""));
         }

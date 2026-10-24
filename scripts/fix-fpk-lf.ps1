@@ -1,18 +1,30 @@
-#requires -Version 5.1
-# fix-fpk-lf.ps1 —— fnpack 出包后解包，把包内文本文件 CRLF→LF，再重新打包为 tad-module-lf.fpk
+﻿#requires -Version 5.1
+# fix-fpk-lf.ps1 —— fnpack 出包后解包，把包内文本文件 CRLF→LF，再重新打包
 # 必须在 fnpack build 之后运行：fnpack 会重排 manifest 并写回 CRLF，只改源文件没用。
+#
+# 输出命名契约（评审要求）：
+#   - 默认输出名以「输入 FPK 内」的 manifest 版本为准: tad-module-lf-<包内版本>.fpk
+#     ——不是工作区 manifest: 输入包可能是早前构建的旧版本, 标新版本会误发旧包
+#   - 包内 manifest 缺失/版本非法: 直接失败, 不猜测
+#   - 显式 -Out: 原样使用该文件名, 不做版本推断; 文件名不是内容版本的证据,
+#     完成后会打印包内实际版本供核对
+#   - 发布流程加 -RequireWorkspaceMatch: 包内版本必须等于工作区 manifest 版本,
+#     不一致直接失败而非继续
 param(
   [string]$Fpk = "tad-module.fpk",
-  # 默认从源 manifest 读版本号生成 tad-module-lf-<version>.fpk，避免交付时拿错版本
-  [string]$Out = ""
+  [string]$Out = "",
+  [switch]$RequireWorkspaceMatch
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-if (-not $Out) {
-  $m = Select-String -Path (Join-Path $root "manifest") -Pattern '^version\s*=\s*(\S+)'
-  $ver = if ($m) { $m.Matches[0].Groups[1].Value } else { "unknown" }
-  $Out = "tad-module-lf-$ver.fpk"
+
+function Read-ManifestVersion([string]$Path) {
+  if (-not (Test-Path $Path)) { return "" }
+  $m = Select-String -Path $Path -Pattern '^version\s*=\s*(\S+)'
+  if ($m) { return $m.Matches[0].Groups[1].Value }
+  return ""
 }
+
 Push-Location $root
 try {
   $tmp = Join-Path $root ".cache\fpk-lf"
@@ -24,6 +36,22 @@ try {
   if ($LASTEXITCODE -ne 0) { throw "解包外层 fpk 失败" }
   tar -xzf (Join-Path $tmp "app.tgz") -C (Join-Path $tmp "app")
   if ($LASTEXITCODE -ne 0) { throw "解包 app.tgz 失败" }
+
+  # 版本以输入包内 manifest 为准：缺失或非法直接拒绝，不猜测、不回退工作区版本
+  $pkgVer = Read-ManifestVersion (Join-Path $tmp "manifest")
+  if (-not $pkgVer) { throw "输入包内 manifest 缺失 version 字段，无法确定内容版本，拒绝继续" }
+  if ($pkgVer -notmatch '^\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?$') { throw "输入包内版本号格式非法: $pkgVer" }
+
+  if ($RequireWorkspaceMatch) {
+    $wsVer = Read-ManifestVersion (Join-Path $root "manifest")
+    if (-not $wsVer) { throw "工作区 manifest 缺失 version 字段，无法校验一致性" }
+    if ($wsVer -ne $pkgVer) {
+      throw "版本不一致: 输入包内为 $pkgVer，工作区为 $wsVer。发布流程要求二者一致，已拒绝继续（不要用旧包标新版本发出）"
+    }
+  }
+
+  $explicitOut = $PSBoundParameters.ContainsKey('Out') -and $Out
+  if (-not $Out) { $Out = "tad-module-lf-$pkgVer.fpk" }
 
   function Convert-ToLF([string]$Path) {
     $bytes = [System.IO.File]::ReadAllBytes($Path)
@@ -66,7 +94,10 @@ try {
     tar -czf (Join-Path $root $Out) $entries
     if ($LASTEXITCODE -ne 0) { throw "重打包外层 fpk 失败" }
   } finally { Pop-Location }
-  Write-Host "已生成 $Out"
+  Write-Host "已生成 $Out（包内版本 $pkgVer）"
+  if ($explicitOut) {
+    Write-Host "注意: -Out 只决定文件名；包内容版本以包内 manifest 为准（$pkgVer），不要把文件名当作版本证据"
+  }
 } finally {
   Pop-Location
 }

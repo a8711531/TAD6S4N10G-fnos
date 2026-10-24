@@ -2,6 +2,7 @@ package powerguard
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -252,10 +253,12 @@ func TestPowerScheduleTickSkipsShutdownDuringFirmwareJob(t *testing.T) {
 	powerScheduleShutdownHook = func(ctx context.Context) error { calls++; return nil }
 	defer func() { powerScheduleShutdownHook = old }()
 
-	// 刷写任务运行中：计划关机必须让路，且不得占用同分钟去重键
-	m.firmwareMu.Lock()
-	m.firmwareJob.state = firmwareJobRunning
-	m.firmwareMu.Unlock()
+	// 刷写任务运行中（真实 beginFirmwareJob 路径）：计划关机必须让路，
+	// 且不得占用同分钟去重键
+	injectFakeInhibitor(m)
+	if err := m.beginFirmwareJob(firmwareJobKindBIOS); err != nil {
+		t.Fatalf("启动刷写失败: %v", err)
+	}
 	m.PowerScheduleTick(context.Background())
 	if calls != 0 {
 		t.Fatalf("固件刷写期间不得关机，实际 %d 次", calls)
@@ -268,9 +271,7 @@ func TestPowerScheduleTickSkipsShutdownDuringFirmwareJob(t *testing.T) {
 	}
 
 	// 刷写结束，同一分钟内下一 tick 补触发一次
-	m.firmwareMu.Lock()
-	m.firmwareJob.state = firmwareJobIdle
-	m.firmwareMu.Unlock()
+	m.firmwareFinish(nil, "")
 	m.PowerScheduleTick(context.Background())
 	if calls != 1 {
 		t.Fatalf("刷写结束后同一分钟应补触发一次，实际 %d 次", calls)
@@ -390,4 +391,68 @@ func TestTestPowerSchedule(t *testing.T) {
 	if _, err := m.TestPowerSchedule(31); err == nil {
 		t.Fatalf("31 分钟必须拒绝")
 	}
+}
+
+// 关机/刷写原子互斥（barrier/channel 并发桩）：hook 卡住模拟「关机命令已发出、
+// 系统尚未断电」窗口，窗口内及关机成功后请求刷写都必须被 shutdownPending
+// 占位拒绝，二者绝不能同时获准执行。
+func TestPowerScheduleShutdownBlocksFirmwareStart(t *testing.T) {
+	now := time.Date(2026, 10, 23, 1, 0, 20, 0, powerScheduleTestZone) // 周五 01:00:20
+	m := newPowerScheduleTestManager(t, &now)
+	cfg := PowerScheduleConfig{Entries: []PowerScheduleEntry{
+		{Enabled: true, Days: "weekday", Time: "01:00", Action: "poweroff"},
+	}}
+	if err := m.SavePowerScheduleConfig(cfg); err != nil {
+		t.Fatalf("保存失败: %v", err)
+	}
+	injectFakeInhibitor(m)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	old := powerScheduleShutdownHook
+	powerScheduleShutdownHook = func(ctx context.Context) error {
+		close(entered) // 关机已提交，卡在「命令已发出、尚未断电」窗口
+		<-release
+		return nil
+	}
+	defer func() { powerScheduleShutdownHook = old }()
+
+	done := make(chan struct{})
+	go func() {
+		m.PowerScheduleTick(context.Background())
+		close(done)
+	}()
+	<-entered // 等关机 hook 真正进入，确保占位已置位
+
+	if err := m.beginFirmwareJob(firmwareJobKindBIOS); !errors.Is(err, errShutdownPending) {
+		t.Fatalf("关机窗口内不得开始刷写，实际 %v", err)
+	}
+	close(release)
+	<-done
+	// 关机命令成功发出后占位保留：真实场景进程即将随系统退出，期间一律拒绝刷写
+	if err := m.beginFirmwareJob(firmwareJobKindBIOS); !errors.Is(err, errShutdownPending) {
+		t.Fatalf("关机成功后占位必须保留，实际 %v", err)
+	}
+}
+
+// 关机命令失败：系统不会关机，必须释放占位恢复允许刷写，不得把刷写永久挡死。
+func TestPowerScheduleShutdownFailureReleasesSlot(t *testing.T) {
+	now := time.Date(2026, 10, 23, 1, 0, 20, 0, powerScheduleTestZone)
+	m := newPowerScheduleTestManager(t, &now)
+	cfg := PowerScheduleConfig{Entries: []PowerScheduleEntry{
+		{Enabled: true, Days: "weekday", Time: "01:00", Action: "poweroff"},
+	}}
+	if err := m.SavePowerScheduleConfig(cfg); err != nil {
+		t.Fatalf("保存失败: %v", err)
+	}
+	injectFakeInhibitor(m)
+	old := powerScheduleShutdownHook
+	powerScheduleShutdownHook = func(ctx context.Context) error { return errors.New("shutdown 命令失败") }
+	defer func() { powerScheduleShutdownHook = old }()
+
+	m.PowerScheduleTick(context.Background())
+	if err := m.beginFirmwareJob(firmwareJobKindBIOS); err != nil {
+		t.Fatalf("关机失败后应恢复允许刷写: %v", err)
+	}
+	m.firmwareFinish(nil, "")
 }

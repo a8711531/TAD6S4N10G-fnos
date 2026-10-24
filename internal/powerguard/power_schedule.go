@@ -378,9 +378,12 @@ func (m *Manager) PowerScheduleTick(ctx context.Context) {
 	m.mu.Unlock()
 
 	if firedKey != "" {
-		// 固件刷写期间禁止计划关机：写到一半断电有变砖风险。此刻不占用同分钟
-		// 去重键，刷写结束后同一分钟内仍能补触发，不必等到下次计划时间。
-		if m.firmwareJobActive() {
+		// 固件刷写期间禁止计划关机：写到一半断电有变砖风险。占位与刷写状态
+		// 检查在同一把 firmwareMu 内原子完成（tryAcquireShutdownSlot），堵死
+		// 「检查通过到关机提交」窗口内另一请求开始刷写的交错；占位期间
+		// beginFirmwareJob 一律拒绝。此刻不占用同分钟去重键，刷写结束后同一
+		// 分钟内仍能补触发，不必等到下次计划时间。
+		if !m.tryAcquireShutdownSlot() {
 			m.logf("power schedule: 固件刷写进行中，跳过计划关机（%s）", firedKey)
 			return
 		}
@@ -392,6 +395,7 @@ func (m *Manager) PowerScheduleTick(ctx context.Context) {
 			m.logf("power schedule: 距下次开机（%s）不足 %d 分钟，跳过计划关机（%s）",
 				next.Format("2006-01-02 15:04"), int(powerScheduleShutdownGuard.Minutes()), firedKey)
 			m.mu.Unlock()
+			m.releaseShutdownSlot() // 本次不关，释放占位恢复刷写
 			return
 		}
 		// 触发关机前先把开机唤醒写好，保证关机后能按计划自动上电
@@ -403,10 +407,14 @@ func (m *Manager) PowerScheduleTick(ctx context.Context) {
 		m.mu.Unlock()
 
 		if err := powerScheduleShutdownHook(ctx); err != nil {
+			// 关机命令没发出去：系统不会关机，释放占位，允许刷写。
+			m.releaseShutdownSlot()
 			m.mu.Lock()
 			m.logf("power schedule: shutdown failed: %v", err)
 			m.mu.Unlock()
 		}
+		// 关机命令已成功发出：保留 shutdownPending 占位，进程随系统关机退出前
+		// 一律拒绝新刷写，堵住「关机已提交、尚未断电」窗口内的刷写启动。
 		return // 正在关机，本 tick 不再做唤醒同步
 	}
 

@@ -1,6 +1,8 @@
 package powerguard
 
 import (
+	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -79,6 +81,49 @@ func TestNormalizeStressMemoryAuto(t *testing.T) {
 	}
 	if _, err := manager.normalizeStressOptions(StressOptions{Memory: true, MemoryAuto: true}); err == nil {
 		t.Fatal("可用内存不足时自动预留应拒绝")
+	}
+}
+
+// writeStressTestConfig 落一份只含风扇段的配置，供关停档门槛测试使用。
+func writeStressTestConfig(t *testing.T, offMode bool) *Manager {
+	t.Helper()
+	root := t.TempDir()
+	cfg := DefaultConfig(Profile{})
+	cfg.Fan.Enabled = true
+	cfg.Fan.OffMode = offMode
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(root, "config.json")
+	if err := os.WriteFile(configPath, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return &Manager{Root: root, ConfigPath: configPath}
+}
+
+// 服务端独立门槛：关停档下未显式确认风险的压测请求必须被拒绝，
+// 兜底「恢复并开始」回读与启动之间被其他客户端切回关停的竞态。
+func TestStartStressRejectsOffModeWithoutAck(t *testing.T) {
+	manager := writeStressTestConfig(t, true)
+	err := manager.StartStress(StressOptions{CPU: true, DurationSeconds: 1})
+	if !errors.Is(err, errStressFanOffMode) {
+		t.Fatalf("关停档未确认风险必须拒绝启动，实际: %v", err)
+	}
+	if manager.StressStatus().Running {
+		t.Fatal("被拒绝的启动不得留下运行中的压测")
+	}
+}
+
+// 明确带 ack_off_mode（前端红色「仍然开始压测」）或非关停档时，前提校验放行。
+func TestStressStartPrecheckAllowsAckAndNormalMode(t *testing.T) {
+	offManager := writeStressTestConfig(t, true)
+	if err := offManager.stressStartPrecheck(StressOptions{CPU: true, AckOffMode: true}); err != nil {
+		t.Fatalf("显式确认风险后应放行: %v", err)
+	}
+	normalManager := writeStressTestConfig(t, false)
+	if err := normalManager.stressStartPrecheck(StressOptions{CPU: true}); err != nil {
+		t.Fatalf("非关停档不应被门槛拦截: %v", err)
 	}
 }
 
