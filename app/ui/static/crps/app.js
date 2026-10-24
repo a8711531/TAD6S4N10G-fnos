@@ -445,10 +445,14 @@
     gpioMsgShow(true, "正在自动识别 Pin19-22…（约几秒，请稍候）");
     gpioDetect.disabled = true;
     fetch("../api/crps/detect", { method: "POST" })
-      .then(function (r) { return r.json(); })
+      .then(function (r) {
+        // HTTP 非 2xx 不得当作有效结果: 抛错走 catch, 清理告警保持原状
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      })
       .then(function (d) {
         gpioDetect.disabled = false;
-        if (d && d.found && d.ok) {
+        if (d && d.ok === true && d.found === true) {
           // 识别+应用成功: 服务端已接管针脚, 清理告警解除
           gpioCleanupWarn = "";
           // 后端已自动应用+保存: found/applied/saved 分离, 直接展示结果
@@ -457,24 +461,29 @@
           gpioMsgShow(!!d.saved, d.msg || ("已识别 PSCL=" + d.scl_pin + " PSDA=" + d.sda_pin + "，已应用"));
           loadGpioConfig(d.saved ? "" : d.msg); // 写盘失败告警在刷新后保留
           setTimeout(poll, 300);
-        } else if (d && d.found) {
+        } else if (d && d.found === true) {
           // 已找到接线但应用失败: 结果不确定, 不触碰清理告警 (保留)
           gpioMsgShow(false, (d && d.msg) || "已找到接线但应用失败，请重试。");
-        } else if (d && d.cleanup_failed) {
+        } else if (d && d.cleanup_failed === true) {
           // 未命中且收尾清理失败: 针脚可能仍为输出。告警独立保存, 优先于普通
-          // 连接状态, 仅再次识别/保存成功或服务端确认清理完成后才清除。
+          // 连接状态, 仅再次识别/保存成功或服务端明确确认清理完成后才清除。
           gpioCleanupWarn = (d && d.msg) || "探测未命中, 且清理 GPIO 失败, 请重试";
           gpioMsgShow(false, gpioCleanupWarn);
-        } else {
-          // 未命中但服务端确认清理完成 (无 cleanup_failed): 告警解除
+        } else if (d && d.ok === false && d.found === false && d.cleanup_ok === true) {
+          // 服务端明确确认清理完成 (cleanup_ok:true) 才可解除告警
           gpioCleanupWarn = "";
           // 保留固定引导文案, 末尾附带后端 msg 便于排查 (如 I2C 超时/总线忙等细节)
           gpioMsgShow(false, "检测信号失败，请重新接线保证正确连接信号线。" + ((d && d.msg) ? "（" + d.msg + "）" : ""));
+        } else {
+          // 响应契约不完整 (null / {} / 缺 found 与 cleanup_ok 确认字段): 结果未知,
+          // 不得据此认定清理完成, 清理告警保持原状并提示重试。
+          gpioMsgShow(false, gpioCleanupWarn || "识别结果未知，请重试");
         }
       })
       .catch(function (e) {
         gpioDetect.disabled = false;
-        gpioMsgShow(false, "识别失败: " + e.message);
+        // 网络/HTTP/解析失败同样属于未知结果: 保留清理告警, 不得静默解除
+        gpioMsgShow(false, gpioCleanupWarn || ("识别失败: " + e.message));
       });
   });
 

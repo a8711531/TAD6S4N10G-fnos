@@ -69,10 +69,18 @@ func TestSaveFPTBinaryRejectsNonELF(t *testing.T) {
 }
 
 func TestStartBIOSFlashRequiresFPT(t *testing.T) {
-	manager := &Manager{StatePath: filepath.Join(t.TempDir(), "original-state.json")}
+	manager := &Manager{
+		StatePath:        filepath.Join(t.TempDir(), "original-state.json"),
+		firmwareFlashrom: firmwareToolAbsent, // 显式「未安装」：宿主 flashrom 不得绕过下载失败桩
+		firmwareFPT:      firmwareToolAbsent,
+	}
 	// 测试隔离（评审要求）：显式模拟工具「不可用」——下载失败、inhibitor 全桩，
-	// 绝不触碰真实网络或启动宿主 systemd-inhibit。
+	// 绝不触碰真实网络或启动宿主 systemd-inhibit；任何命令执行都是测试缺陷。
 	injectFakeInhibitor(manager)
+	manager.firmwareExec = func(ctx context.Context, dir, name string, args []string) (string, error) {
+		t.Fatalf("拒绝启动的请求不得执行任何命令: %s %v", name, args)
+		return "", errors.New("不应执行命令")
+	}
 	firmwareDownloadHook = func(ctx context.Context, address string) ([]byte, error) {
 		return nil, errors.New("模拟下载不可用")
 	}
@@ -85,7 +93,10 @@ func TestStartBIOSFlashRequiresFPT(t *testing.T) {
 
 func TestBIOSFlashRunsFPTCommands(t *testing.T) {
 	root := t.TempDir()
-	manager := &Manager{StatePath: filepath.Join(root, "original-state.json")}
+	manager := &Manager{
+		StatePath:        filepath.Join(root, "original-state.json"),
+		firmwareFlashrom: firmwareToolAbsent, // 必须走 FPT：宿主 flashrom 不得干扰
+	}
 	injectFakeInhibitor(manager)
 	elf := append([]byte{0x7f, 'E', 'L', 'F'}, make([]byte, 64)...)
 	if err := manager.SaveFPTBinary(elf); err != nil {
@@ -94,6 +105,12 @@ func TestBIOSFlashRunsFPTCommands(t *testing.T) {
 	var commands []string
 	manager.firmwareExec = func(ctx context.Context, dir, name string, args []string) (string, error) {
 		commands = append(commands, name+" "+strings.Join(args, " "))
+		// 备份命令必须真正落盘产物，否则任务会因「无完整备份」终止（防变砖门槛）。
+		if len(args) == 3 && args[0] == "-bios" && args[1] == "-d" {
+			if err := os.WriteFile(args[2], []byte("backup"), 0o600); err != nil {
+				return "", err
+			}
+		}
 		return "ok", nil
 	}
 	image := make([]byte, 1<<20+1)
@@ -128,11 +145,21 @@ func TestBIOSFlashUsesFlashrom(t *testing.T) {
 	if err := os.WriteFile(flashrom, []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatalf("准备 flashrom 失败: %v", err)
 	}
-	manager := &Manager{StatePath: filepath.Join(root, "original-state.json"), firmwareFlashrom: flashrom}
+	manager := &Manager{
+		StatePath:        filepath.Join(root, "original-state.json"),
+		firmwareFlashrom: flashrom,
+		firmwareFPT:      firmwareToolAbsent,
+	}
 	injectFakeInhibitor(manager)
 	var commands []string
 	manager.firmwareExec = func(ctx context.Context, dir, name string, args []string) (string, error) {
 		commands = append(commands, name+" "+strings.Join(args, " "))
+		// flashrom 的备份产物必须真正落盘（-r <backup> 为最后两个参数）。
+		if len(args) >= 2 && args[len(args)-2] == "-r" {
+			if err := os.WriteFile(args[len(args)-1], []byte("backup"), 0o600); err != nil {
+				return "", err
+			}
+		}
 		return "ok", nil
 	}
 	image := make([]byte, 1<<20+1)
@@ -164,6 +191,107 @@ func TestBIOSFlashUsesFlashrom(t *testing.T) {
 	}
 	if writeCommand == "" || !strings.Contains(writeCommand, "bios-") || !strings.HasSuffix(writeCommand, ".bin") {
 		t.Fatalf("未执行 flashrom 写入，实际命令: %v", commands)
+	}
+}
+
+// newFlashromManager 构造只走 flashrom 的刷写管理器（FPT 显式不可用），
+// 并注入全模拟 inhibitor，绝不触碰宿主机工具与系统关机保护。
+func newFlashromManager(t *testing.T) *Manager {
+	t.Helper()
+	root := t.TempDir()
+	flashrom := filepath.Join(root, "flashrom")
+	if err := os.WriteFile(flashrom, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("准备 flashrom 失败: %v", err)
+	}
+	manager := &Manager{
+		StatePath:        filepath.Join(root, "original-state.json"),
+		firmwareFlashrom: flashrom,
+		firmwareFPT:      firmwareToolAbsent,
+	}
+	injectFakeInhibitor(manager)
+	return manager
+}
+
+// 备份失败必须终止任务：没有完整备份就写入，刷坏后无法恢复。
+func TestBIOSFlashStopsWhenBackupFails(t *testing.T) {
+	manager := newFlashromManager(t)
+	writeCalled := false
+	manager.firmwareExec = func(ctx context.Context, dir, name string, args []string) (string, error) {
+		if len(args) >= 2 && args[len(args)-2] == "-r" {
+			return "", errors.New("flash 读取失败")
+		}
+		if len(args) >= 2 && args[len(args)-2] == "-w" {
+			writeCalled = true
+		}
+		return "ok", nil
+	}
+	if err := manager.StartBIOSFlash(make([]byte, 1<<20+1)); err != nil {
+		t.Fatalf("启动失败: %v", err)
+	}
+	waitFirmwareJob(t, manager)
+	status := manager.FirmwareStatus()
+	if status.Job.State != firmwareJobFailed || !strings.Contains(status.Job.Error, "备份") {
+		t.Fatalf("备份失败应终止任务，实际 %s（%s）", status.Job.State, status.Job.Error)
+	}
+	if writeCalled {
+		t.Fatal("备份失败后不得执行写入")
+	}
+}
+
+// 备份命令返回成功但产物缺失/为空：仍不得写入。
+func TestBIOSFlashStopsWhenBackupMissing(t *testing.T) {
+	manager := newFlashromManager(t)
+	writeCalled := false
+	manager.firmwareExec = func(ctx context.Context, dir, name string, args []string) (string, error) {
+		if len(args) >= 2 && args[len(args)-2] == "-w" {
+			writeCalled = true
+		}
+		return "ok", nil // 备份命令不落盘产物
+	}
+	if err := manager.StartBIOSFlash(make([]byte, 1<<20+1)); err != nil {
+		t.Fatalf("启动失败: %v", err)
+	}
+	waitFirmwareJob(t, manager)
+	status := manager.FirmwareStatus()
+	if status.Job.State != firmwareJobFailed || !strings.Contains(status.Job.Error, "备份产物") {
+		t.Fatalf("备份产物缺失应终止任务，实际 %s（%s）", status.Job.State, status.Job.Error)
+	}
+	if writeCalled {
+		t.Fatal("备份产物缺失时不得执行写入")
+	}
+}
+
+// 备份完成后 inhibitor 提前退出：写入前复查必须终止任务，不得继续写。
+func TestBIOSFlashStopsWhenProtectionLostAfterBackup(t *testing.T) {
+	manager := newFlashromManager(t)
+	fake := injectFakeInhibitor(manager) // 复用桩的句柄列表，模拟提前退出
+	writeCalled := false
+	manager.firmwareExec = func(ctx context.Context, dir, name string, args []string) (string, error) {
+		if len(args) >= 2 && args[len(args)-2] == "-r" {
+			if err := os.WriteFile(args[len(args)-1], []byte("backup"), 0o600); err != nil {
+				return "", err
+			}
+			fake.mu.Lock()
+			current := fake.handles[len(fake.handles)-1]
+			fake.mu.Unlock()
+			current.exit() // 备份期间 inhibitor 提前退出
+			return "ok", nil
+		}
+		if len(args) >= 2 && args[len(args)-2] == "-w" {
+			writeCalled = true
+		}
+		return "ok", nil
+	}
+	if err := manager.StartBIOSFlash(make([]byte, 1<<20+1)); err != nil {
+		t.Fatalf("启动失败: %v", err)
+	}
+	waitFirmwareJob(t, manager)
+	status := manager.FirmwareStatus()
+	if status.Job.State != firmwareJobFailed || !strings.Contains(status.Job.Error, "关机保护已失效") {
+		t.Fatalf("保护失效应终止任务，实际 %s（%s）", status.Job.State, status.Job.Error)
+	}
+	if writeCalled {
+		t.Fatal("关机保护失效后不得执行写入")
 	}
 }
 
@@ -210,6 +338,95 @@ func TestNICFlashPSIDMismatchStopsBeforeBurn(t *testing.T) {
 	}
 	if !status.NIC.Present || status.NIC.PCIAddress != "01:00.0" {
 		t.Fatalf("网卡探测结果异常: %+v", status.NIC)
+	}
+}
+
+// PSID 未知（当前固件读不到 PSID）时不得放行：无法判断是否跨型号。
+func TestNICFlashUnknownPSIDStopsBeforeBurn(t *testing.T) {
+	root := t.TempDir()
+	manager := &Manager{
+		StatePath:     filepath.Join(root, "original-state.json"),
+		firmwareFlint: "flint",
+		firmwareMST:   "mst",
+	}
+	injectFakeInhibitor(manager)
+	lspci := "0000:01:00.0 网络控制器 [0200]: Mellanox Technologies MT27710 Family [ConnectX-4 Lx] [15b3:1015]\n"
+	burned := false
+	manager.firmwareExec = func(ctx context.Context, dir, name string, args []string) (string, error) {
+		joined := strings.Join(args, " ")
+		switch {
+		case name == "lspci":
+			return lspci, nil
+		case name == "mst":
+			return "mst started", nil
+		case name == "flint" && strings.HasPrefix(joined, "-d 01:00.0 q"):
+			return "FW Version: 14.28.1000\n", nil // 当前固件读不到 PSID
+		case name == "flint" && strings.HasPrefix(joined, "-i ") && strings.HasSuffix(joined, " q"):
+			return "FW Version: 14.32.1900\nPSID: MT_BBB\n", nil
+		case name == "flint" && strings.Contains(joined, "burn"):
+			burned = true
+			return "burning", nil
+		}
+		return "ok", nil
+	}
+	if err := manager.StartNICFlash([]byte("firmware")); err != nil {
+		t.Fatalf("启动网卡刷写失败: %v", err)
+	}
+	waitFirmwareJob(t, manager)
+	status := manager.FirmwareStatus()
+	if status.Job.State != firmwareJobFailed || !strings.Contains(status.Job.Error, "PSID") {
+		t.Fatalf("PSID 未知应失败，实际 %s（%s）", status.Job.State, status.Job.Error)
+	}
+	if burned {
+		t.Fatal("PSID 未知时不得执行 flint burn")
+	}
+}
+
+// 备份期间 inhibitor 提前退出：烧写前复查必须终止任务，不得执行 burn。
+func TestNICFlashStopsWhenProtectionLostBeforeBurn(t *testing.T) {
+	root := t.TempDir()
+	manager := &Manager{
+		StatePath:     filepath.Join(root, "original-state.json"),
+		firmwareFlint: "flint",
+		firmwareMST:   "mst",
+	}
+	fake := injectFakeInhibitor(manager)
+	lspci := "0000:01:00.0 网络控制器 [0200]: Mellanox Technologies MT27710 Family [ConnectX-4 Lx] [15b3:1015]\n"
+	burned := false
+	manager.firmwareExec = func(ctx context.Context, dir, name string, args []string) (string, error) {
+		joined := strings.Join(args, " ")
+		switch {
+		case name == "lspci":
+			return lspci, nil
+		case name == "mst":
+			return "mst started", nil
+		case name == "flint" && strings.HasPrefix(joined, "-d 01:00.0 q"):
+			return "FW Version: 14.28.1000\nPSID: MT_AAA\n", nil
+		case name == "flint" && strings.HasPrefix(joined, "-i ") && strings.HasSuffix(joined, " q"):
+			return "FW Version: 14.32.1900\nPSID: MT_AAA\n", nil
+		case name == "flint" && strings.HasPrefix(joined, "-d 01:00.0 ri"):
+			// 备份原固件时 inhibitor 提前退出（模拟 logind 掉锁）
+			fake.mu.Lock()
+			current := fake.handles[len(fake.handles)-1]
+			fake.mu.Unlock()
+			current.exit()
+			return "ok", nil
+		case name == "flint" && strings.Contains(joined, "burn"):
+			burned = true
+			return "burning", nil
+		}
+		return "ok", nil
+	}
+	if err := manager.StartNICFlash([]byte("firmware")); err != nil {
+		t.Fatalf("启动网卡刷写失败: %v", err)
+	}
+	waitFirmwareJob(t, manager)
+	status := manager.FirmwareStatus()
+	if status.Job.State != firmwareJobFailed || !strings.Contains(status.Job.Error, "关机保护已失效") {
+		t.Fatalf("保护失效应终止任务，实际 %s（%s）", status.Job.State, status.Job.Error)
+	}
+	if burned {
+		t.Fatal("关机保护失效后不得执行 flint burn")
 	}
 }
 
@@ -456,12 +673,12 @@ func TestRunMFTInstallGradedOutcomes(t *testing.T) {
 			wantLogReject:  "",
 		},
 		{
-			name:           "安装成功但 mst start 失败且无网卡",
-			mstStartErr:    errors.New("mst 模块加载失败"),
-			lspciOutput:    "0000:00:1f.0 ISA bridge: Intel\n",
-			wantState:      firmwareJobSuccess,
-			wantLogMatch:   "暂不能升级固件",
-			wantLogReject:  "可开始升级",
+			name:          "安装成功但 mst start 失败且无网卡",
+			mstStartErr:   errors.New("mst 模块加载失败"),
+			lspciOutput:   "0000:00:1f.0 ISA bridge: Intel\n",
+			wantState:     firmwareJobSuccess,
+			wantLogMatch:  "暂不能升级固件",
+			wantLogReject: "可开始升级",
 		},
 		{
 			name:          "lspci 失败",

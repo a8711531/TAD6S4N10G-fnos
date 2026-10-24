@@ -355,6 +355,90 @@ func TestPowerScheduleTickSyncsWakeAlarm(t *testing.T) {
 	}
 }
 
+// writeWakeAlarmFileRaw 模拟「别的软件」直接写 RTC 唤醒（绕过本模块的写入口，
+// 不登记所有权）。用于验证无开机计划时的清理不会误伤外部闹钟。
+func writeWakeAlarmFileRaw(t *testing.T, m *Manager, at time.Time) {
+	t.Helper()
+	if err := os.WriteFile(m.rtcWakealarmPath(), []byte(strconv.FormatInt(at.Unix(), 10)), 0o600); err != nil {
+		t.Fatalf("模拟外部写入 wakealarm 失败: %v", err)
+	}
+}
+
+// TestPowerScheduleWakeAlarmOwnership RTC 闹钟所有权：无开机计划时只能清理
+// 本模块写入且当前仍匹配的闹钟，外部软件设置的唤醒必须原样保留。
+func TestPowerScheduleWakeAlarmOwnership(t *testing.T) {
+	now := time.Date(2026, 10, 23, 9, 0, 0, 0, powerScheduleTestZone) // 周五 09:00
+	external := time.Date(2027, 1, 1, 8, 0, 0, 0, time.UTC)
+	onCfg := PowerScheduleConfig{Entries: []PowerScheduleEntry{
+		{Enabled: true, Days: "daily", Time: "10:00", Action: "poweron"},
+	}}
+	planned := time.Date(2026, 10, 23, 10, 0, 0, 0, powerScheduleTestZone)
+
+	t.Run("空配置且闹钟为空：同步无动作也不得报错", func(t *testing.T) {
+		m := newPowerScheduleTestManager(t, &now)
+		m.PowerScheduleTick(context.Background())
+		if got := readWakeAlarmFile(t, m); got != "0" {
+			t.Fatalf("空配置空闹钟应保持为空，实际 %q", got)
+		}
+		if _, err := m.ApplyPowerSchedule(); err != nil {
+			t.Fatalf("无开机计划的应用不应报错: %v", err)
+		}
+		if got := readWakeAlarmFile(t, m); got != "0" {
+			t.Fatalf("应用后仍应为空，实际 %q", got)
+		}
+	})
+
+	t.Run("外部闹钟且无开机计划：不得清空", func(t *testing.T) {
+		m := newPowerScheduleTestManager(t, &now)
+		writeWakeAlarmFileRaw(t, m, external)
+		m.PowerScheduleTick(context.Background())
+		if got := readWakeAlarmFile(t, m); got != strconv.FormatInt(external.Unix(), 10) {
+			t.Fatalf("外部闹钟被误清空，实际 %q", got)
+		}
+		if _, err := m.ApplyPowerSchedule(); err != nil {
+			t.Fatalf("应用失败: %v", err)
+		}
+		if got := readWakeAlarmFile(t, m); got != strconv.FormatInt(external.Unix(), 10) {
+			t.Fatalf("手动应用也不得清外部闹钟，实际 %q", got)
+		}
+	})
+
+	t.Run("停用自己写的开机计划：清空自己的闹钟", func(t *testing.T) {
+		m := newPowerScheduleTestManager(t, &now)
+		if err := m.SavePowerScheduleConfig(onCfg); err != nil {
+			t.Fatalf("保存失败: %v", err)
+		}
+		if got := readWakeAlarmFile(t, m); got != strconv.FormatInt(planned.Unix(), 10) {
+			t.Fatalf("计划闹钟未写入，实际 %q", got)
+		}
+		if err := m.SavePowerScheduleConfig(PowerScheduleConfig{}); err != nil {
+			t.Fatalf("停用计划失败: %v", err)
+		}
+		if got := readWakeAlarmFile(t, m); got != "0" {
+			t.Fatalf("停用自己的计划应清空自己写入的闹钟，实际 %q", got)
+		}
+	})
+
+	t.Run("自己的闹钟被外部改写后停用计划：不得清空", func(t *testing.T) {
+		m := newPowerScheduleTestManager(t, &now)
+		if err := m.SavePowerScheduleConfig(onCfg); err != nil {
+			t.Fatalf("保存失败: %v", err)
+		}
+		// 别的软件后来改写 wakealarm：所有权已失效，停用计划不得按旧值清空
+		writeWakeAlarmFileRaw(t, m, external)
+		if err := m.SavePowerScheduleConfig(PowerScheduleConfig{}); err != nil {
+			t.Fatalf("停用计划失败: %v", err)
+		}
+		if got := readWakeAlarmFile(t, m); got != strconv.FormatInt(external.Unix(), 10) {
+			t.Fatalf("外部改写后的闹钟被误清空，实际 %q", got)
+		}
+		m.PowerScheduleTick(context.Background())
+		if got := readWakeAlarmFile(t, m); got != strconv.FormatInt(external.Unix(), 10) {
+			t.Fatalf("tick 也不得清外部改写后的闹钟，实际 %q", got)
+		}
+	})
+}
+
 func TestTestPowerSchedule(t *testing.T) {
 	now := time.Date(2026, 10, 23, 9, 0, 0, 0, powerScheduleTestZone)
 	m := newPowerScheduleTestManager(t, &now)

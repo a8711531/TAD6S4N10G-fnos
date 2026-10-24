@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -150,8 +151,25 @@ func TestCPUSampleAndUtilization(t *testing.T) {
 	}
 }
 
+// stubStressWorkers 把 CPU/内存/采样工作协程替换为等待停止信号的空转桩：
+// 状态机测试不得真的打满宿主 CPU 或占用内存。
+func stubStressWorkers(manager *Manager) {
+	manager.stressCPUWorker = func(stop <-chan struct{}, workers *sync.WaitGroup) {
+		defer workers.Done()
+		<-stop
+	}
+	manager.stressMemoryWorker = func(stop <-chan struct{}, workers *sync.WaitGroup, total int64) {
+		defer workers.Done()
+		<-stop
+	}
+	manager.stressSampleFn = func(stop <-chan struct{}, duration time.Duration) {
+		<-stop
+	}
+}
+
 func TestStressStartStop(t *testing.T) {
 	manager := &Manager{Root: t.TempDir()}
+	stubStressWorkers(manager)
 	if err := manager.StartStress(StressOptions{CPU: true, DurationSeconds: 10}); err != nil {
 		t.Fatalf("启动压力测试失败: %v", err)
 	}
@@ -176,6 +194,7 @@ func TestStressStartStop(t *testing.T) {
 
 func TestStressStatusReportsOptions(t *testing.T) {
 	manager := &Manager{Root: t.TempDir()}
+	stubStressWorkers(manager)
 	if err := manager.StartStress(StressOptions{Memory: true, MemoryMB: 64, DurationSeconds: 20}); err != nil {
 		t.Fatalf("启动失败: %v", err)
 	}

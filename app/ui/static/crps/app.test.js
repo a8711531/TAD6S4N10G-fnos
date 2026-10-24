@@ -150,7 +150,7 @@ test('未配置页面：首次渲染与 60 秒轮询均不自动发 detect POST'
 test('「自动识别保存」显式点击才发一次 detect POST；失败文案附带后端 msg', async () => {
   const { requests, fetch } = recordingFetch((href) => {
     if (href.includes('api/crps/detect')) {
-      return { ok: false, found: false, msg: '未探测到电源接线，请检查线缆后重试' };
+      return { ok: false, found: false, cleanup_ok: true, msg: '未探测到电源接线，请检查线缆后重试' };
     }
     return unconfiguredResponses(href);
   });
@@ -309,10 +309,10 @@ test('cleanup_failed 告警独立存活: 连续轮询不覆盖, 服务端确认�
   const { fetch } = recordingFetch((href, init = {}) => {
     if (href.includes('api/crps/detect')) {
       detectRound++;
-      // 第一次: 未命中+清理失败; 第二次: 未命中但服务端确认清理完成
+      // 第一次: 未命中+清理失败; 第二次: 未命中但服务端明确确认清理完成
       return detectRound === 1
         ? { ok: false, found: false, cleanup_failed: true, msg: '探测未命中, 且清理 GPIO 失败, 请重试' }
-        : { ok: false, found: false, msg: '未探测到电源接线, 请检查线缆后重试' };
+        : { ok: false, found: false, cleanup_ok: true, msg: '未探测到电源接线, 请检查线缆后重试' };
     }
     if (href.includes('api/crps/config')) {
       return { pins: ['Pin19', 'Pin20', 'Pin21', 'Pin22'], scl_pin: 'Pin19', sda_pin: 'Pin21', configured: true, readable: true };
@@ -351,6 +351,74 @@ test('cleanup_failed 告警独立存活: 连续轮询不覆盖, 服务端确认�
   for (const fn of [...app.timers]) fn();
   await tick();
   assert.match(app.element('gpio-msg').textContent, /当前接线可读|状态字异常/, '解除后轮询恢复普通连接状态');
+});
+
+test('cleanup_failed 锁存: null/{}/缺确认字段/HTTP 错误都不得解除, 连续轮询保持告警', async () => {
+  // 只有服务端明确返回 found:false + ok:false + cleanup_ok:true 才算清理完成。
+  const unknown = [
+    () => null,
+    () => ({}),
+    () => ({ ok: false, found: false, msg: '未探测到电源接线' }), // 缺 cleanup_ok 确认字段
+  ];
+  let detectCalls = 0;
+  let unknownIndex = 0;
+  const fetch = async (url) => {
+    const href = String(url);
+    if (href.includes('/api/crps/detect')) {
+      detectCalls++;
+      if (detectCalls === 1) {
+        return { ok: true, status: 200, json: async () => ({ ok: false, found: false, cleanup_failed: true, msg: '探测未命中, 且清理 GPIO 失败, 请重试' }) };
+      }
+      if (detectCalls === 5) {
+        // HTTP 500: 错误响应不得当作清理完成
+        return { ok: false, status: 500, json: async () => ({ error: 'internal' }) };
+      }
+      if (detectCalls === 6) {
+        return { ok: true, status: 200, json: async () => ({ ok: false, found: false, cleanup_ok: true, msg: '未探测到电源接线' }) };
+      }
+      const body = unknown[unknownIndex % unknown.length]();
+      unknownIndex++;
+      return { ok: true, status: 200, json: async () => body };
+    }
+    if (href.includes('api/crps/config')) {
+      return { ok: true, status: 200, json: async () => ({ pins: ['Pin19', 'Pin20', 'Pin21', 'Pin22'], scl_pin: 'Pin19', sda_pin: 'Pin21', configured: true, readable: true }) };
+    }
+    if (href.includes('api/crps/status')) {
+      return { ok: true, status: 200, json: async () => ({ ok: true, ts: 1700000000, bus: 'gpio', addr: '0x5b', fan: 2600, fan_mode: 'auto' }) };
+    }
+    return { ok: true, status: 200, json: async () => ({}) };
+  };
+  const app = loadCrpsContext({ fetch });
+  await tick();
+
+  app.click('gpio-detect');
+  await tick();
+  assert.match(app.element('gpio-msg').textContent, /清理 GPIO 失败/, '前置: 清理告警已置位');
+
+  // null / {} / 缺 cleanup_ok 三种未知结果: 告警必须保持
+  for (let round = 0; round < 3; round++) {
+    app.click('gpio-detect');
+    await tick();
+    assert.match(app.element('gpio-msg').textContent, /清理 GPIO 失败/, `未知结果 (第 ${round + 1} 种) 不得解除告警`);
+  }
+  // HTTP 500 错误响应: 同样不得解除
+  app.click('gpio-detect');
+  await tick();
+  assert.match(app.element('gpio-msg').textContent, /清理 GPIO 失败/, 'HTTP 错误不得解除告警');
+
+  // 未知结果后连续轮询始终保留告警
+  for (let round = 0; round < 3; round++) {
+    for (const fn of [...app.timers]) fn();
+    await tick();
+    assert.match(app.element('gpio-msg').textContent, /清理 GPIO 失败/, `第 ${round + 1} 轮轮询不得覆盖告警`);
+  }
+
+  // 服务端明确 cleanup_ok:true 才解除
+  app.click('gpio-detect');
+  await tick();
+  const msg = app.element('gpio-msg').textContent;
+  assert.doesNotMatch(msg, /清理 GPIO 失败/, '明确确认清理完成后告警应解除');
+  assert.match(msg, /检测信号失败/, '恢复普通未命中引导文案');
 });
 
 test('cleanup_failed 后识别成功: 告警解除且写盘失败告警仍优先 (优先级回归)', async () => {

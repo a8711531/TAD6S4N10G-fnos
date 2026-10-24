@@ -1,6 +1,7 @@
 package powerguard
 
 import (
+	"context"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -19,17 +20,28 @@ type fakeInhibitor struct {
 }
 
 // fakeInhibitorHandle 模拟一次已持有的关机保护。Release 与真实句柄行为一致：
-// 主动释放后 done 关闭（对应子进程被 Kill 后 Wait 返回）。
+// 主动释放后 done 关闭（对应子进程被 Kill 后 Wait 返回）。releaseGate 非 nil
+// 时先阻塞到其关闭，用于固定「A 完成任务 → B 获取 → A 释放」的交错窗口。
 type fakeInhibitorHandle struct {
-	done     chan struct{}
-	released atomic.Int32
+	done        chan struct{}
+	closeOnce   sync.Once
+	released    atomic.Int32
+	releaseGate chan struct{}
 }
 
 func (h *fakeInhibitorHandle) Done() <-chan struct{} { return h.done }
 
+// exit 模拟子进程异常退出（inhibitor 提前失效）：与 Release 竞争时只关闭一次。
+func (h *fakeInhibitorHandle) exit() {
+	h.closeOnce.Do(func() { close(h.done) })
+}
+
 func (h *fakeInhibitorHandle) Release() error {
 	if h.released.Add(1) == 1 {
-		close(h.done)
+		if h.releaseGate != nil {
+			<-h.releaseGate
+		}
+		h.exit()
 	}
 	return nil
 }
@@ -139,7 +151,7 @@ func TestInhibitorEarlyExitReported(t *testing.T) {
 	if handle == nil {
 		t.Fatal("应已获取 inhibitor")
 	}
-	close(handle.done) // 模拟刷写中子进程异常退出（logind 掉锁）
+	handle.exit() // 模拟刷写中子进程异常退出（logind 掉锁）
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		status := manager.FirmwareStatus()
@@ -154,6 +166,113 @@ func TestInhibitorEarlyExitReported(t *testing.T) {
 	manager.firmwareFinish(nil, "")
 	if got := handle.released.Load(); got != 0 {
 		t.Fatalf("提前退出的句柄不得再被主动释放，实际 %d 次", got)
+	}
+}
+
+// 完成任务 A 与释放 A 的句柄之间不得留出「下一个任务继承旧句柄」的窗口：
+// A 的完成状态转换内摘除 A 的句柄，B 启动时必须拿到自己的新句柄。
+func TestFinishReleasesOnlyOwnInhibitor(t *testing.T) {
+	manager := &Manager{StatePath: filepath.Join(t.TempDir(), "state.json")}
+	fake := injectFakeInhibitor(manager)
+	if err := manager.beginFirmwareJob(firmwareJobKindBIOS); err != nil {
+		t.Fatal(err)
+	}
+	fake.mu.Lock()
+	handleA := fake.handles[0]
+	handleA.releaseGate = make(chan struct{})
+	fake.mu.Unlock()
+
+	finished := make(chan struct{})
+	go func() {
+		manager.firmwareFinish(nil, "")
+		close(finished)
+	}()
+	// 等待 A 的任务状态转换完成（此时 A 的句柄已在同一临界区内摘除），
+	// 且 A 的 Release 已进入并阻塞在 gate 上。
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if manager.FirmwareStatus().Job.State != firmwareJobRunning && handleA.released.Load() == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("A 的完成转换或释放未按预期推进")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// B 在 A 释放之前启动：必须获取自己的句柄，保护有效。
+	if err := manager.beginFirmwareJob(firmwareJobKindBIOS); err != nil {
+		t.Fatalf("A 完成后 B 应能启动: %v", err)
+	}
+	if got := fake.count(); got != 2 {
+		t.Fatalf("B 必须获取自己的 inhibitor，实际句柄数 %d", got)
+	}
+	handleB := fake.last()
+	if handleB == handleA {
+		t.Fatal("B 不得继承 A 的旧句柄")
+	}
+	if manager.firmwareProtectionLost() {
+		t.Fatal("B 必须拥有自己的有效保护")
+	}
+
+	// 放行 A 的释放：不得误释放 B 的句柄，B 的保护仍需存活。
+	close(handleA.releaseGate)
+	<-finished
+	if got := handleB.released.Load(); got != 0 {
+		t.Fatalf("A 的释放不得碰 B 的句柄，实际释放 %d 次", got)
+	}
+	if manager.firmwareProtectionLost() {
+		t.Fatal("A 释放后 B 的保护必须仍然有效")
+	}
+	manager.firmwareFinish(nil, "")
+	if got := handleB.released.Load(); got != 1 {
+		t.Fatalf("B 结束时自己的句柄应恰好释放一次，实际 %d", got)
+	}
+}
+
+// 仅「子进程存活」不构成拿锁确认：获取实现返回未登记错误时任务必须失败，
+// 且不得执行任何写入命令。
+func TestBeginFirmwareJobRejectsUnregisteredInhibitor(t *testing.T) {
+	manager := &Manager{StatePath: filepath.Join(t.TempDir(), "state.json")}
+	execCalled := false
+	manager.firmwareExec = func(ctx context.Context, dir, name string, args []string) (string, error) {
+		execCalled = true
+		return "ok", nil
+	}
+	fake := newFakeInhibitor()
+	fake.acquireErr = errors.New("systemd-inhibit 已启动但未登记有效关机锁（--list 未命中），未能持有关机锁")
+	manager.inhibitorAcquire = fake.acquire
+	err := manager.beginFirmwareJob(firmwareJobKindBIOS)
+	if err == nil || !strings.Contains(err.Error(), "关机保护") {
+		t.Fatalf("未登记关机锁必须拒绝启动，实际 %v", err)
+	}
+	if execCalled {
+		t.Fatal("未确认保护时不得执行任何命令")
+	}
+	if state := manager.FirmwareStatus().Job.State; state == firmwareJobRunning {
+		t.Fatalf("被拒绝的任务不得留下运行状态，实际 %s", state)
+	}
+}
+
+// --list 解析：必须同时命中 WHO、PID 与 WHY，不能靠整表里出现关键词就放行。
+func TestInhibitorListShowsLock(t *testing.T) {
+	output := "WHO             UID USER PID  COMM  WHAT           WHY                    MODE\n" +
+		"fnos-powerguard 0   root 4242 sleep shutdown:sleep 固件刷写中，禁止关机   block\n" +
+		"unrelated       0   root 9999 sleep shutdown:sleep 其他任务               block\n"
+	if !inhibitorListShowsLock(output, "fnos-powerguard", "固件刷写中，禁止关机", 4242) {
+		t.Fatal("who/PID/why 全部匹配时应确认已登记")
+	}
+	if inhibitorListShowsLock(output, "fnos-powerguard", "固件刷写中，禁止关机", 4243) {
+		t.Fatal("PID 不匹配不得确认")
+	}
+	if inhibitorListShowsLock(output, "other", "固件刷写中，禁止关机", 4242) {
+		t.Fatal("WHO 不匹配不得确认")
+	}
+	if inhibitorListShowsLock(output, "fnos-powerguard", "其他原因", 4242) {
+		t.Fatal("WHY 不匹配不得确认")
+	}
+	if inhibitorListShowsLock("WHO UID USER PID COMM WHAT WHY MODE\n", "fnos-powerguard", "固件刷写中，禁止关机", 4242) {
+		t.Fatal("只有表头时不得确认")
 	}
 }
 

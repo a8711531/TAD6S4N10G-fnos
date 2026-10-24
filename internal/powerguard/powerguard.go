@@ -249,6 +249,10 @@ type Manager struct {
 	nowFn func() time.Time
 	// fanOffModeSince 关停档的进入时刻，用于 5 分钟上限后自动恢复原曲线并起转。
 	fanOffModeSince time.Time
+	// fanOffGen 关停档的进入代次：每次从普通档切到关停档（且生效）就 +1。
+	// 标定采样开始时记下代次，入特性表时核对——期间进入过关停档（风扇被写成
+	// 0 转）的读数不是可靠的全速基准，即使采样结束时已经退出关停也要作废。
+	fanOffGen uint64
 
 	// fanOffAlarmChimeAt 关停档维修安全报警（errOffModeAlarm）的上次蜂鸣时刻，
 	// 按 fanOffAlarmChimeInterval 节流，避免报警期间蜂鸣器连响不停。
@@ -345,6 +349,7 @@ type Manager struct {
 	firmwareExec     firmwareCommandRunner // 测试注入，nil 时执行真实命令
 	firmwareFlint    string                // 测试注入的 flint 路径，空则按 PATH/常见路径查找
 	firmwareMST      string                // 测试注入的 mst 路径，空则按 PATH/常见路径查找
+	firmwareFPT      string                // 测试注入的 FPT 路径，空则按数据目录/内置路径查找
 	firmwareFlashrom string                // 测试注入的 flashrom 路径，空则按 PATH/常见路径查找
 	flashromMu       sync.Mutex            // flashrom 自动下载串行化：并发获取只下载一次，且半成品不对外可见
 	biosOnline       biosOnlineCache       // BIOS 在线检查的缓存（bios_online.go），随 firmwareMu 保护
@@ -356,6 +361,11 @@ type Manager struct {
 	// 压力测试（stress.go）：CPU/内存工作协程与采样状态，全部在内存中。
 	stressMu sync.Mutex
 	stress   stressState
+	// stressCPUWorker / stressMemoryWorker / stressSampleFn 为测试注入的工作协程
+	// 实现（nil 走真实负载）：状态机单测不得真的打满宿主 CPU 或占用内存。
+	stressCPUWorker    func(stop <-chan struct{}, workers *sync.WaitGroup)
+	stressMemoryWorker func(stop <-chan struct{}, workers *sync.WaitGroup, total int64)
+	stressSampleFn     func(stop <-chan struct{}, duration time.Duration)
 
 	// 开关机计划（power_schedule.go）：关机触发去重键（日期+时间，同一分钟
 	// 只触发一次），随 m.mu 保护。
@@ -363,6 +373,11 @@ type Manager struct {
 	// powerScheduleTestUntil 测试唤醒的保护窗口：TestPowerSchedule 写入的
 	// 临时闹钟在窗口内不被 tick 的计划同步覆盖，给用户留出手动关机的时间。
 	powerScheduleTestUntil time.Time
+	// powerScheduleOwnedWake 本模块最后一次写入 wakealarm 的时刻（所有权凭证）：
+	// 只有当前 wakealarm 仍等于该值时才允许清空。别的软件（BIOS 工具、其他守护
+	// 进程）后来写入的唤醒闹钟不得被「无开机计划」的同步逻辑抹掉。进程重启后
+	// 视为无主，宁可留下一个旧闹钟也不误清外部设置。
+	powerScheduleOwnedWake time.Time
 
 	// firmwareInhibitor 固件刷写期间持有的系统关机 inhibitor（systemd-inhibit
 	// 子进程，见 firmware_inhibit.go / firmware_inhibit_linux.go），随 inhibitMu
@@ -371,6 +386,9 @@ type Manager struct {
 	inhibitMu         sync.Mutex
 	firmwareInhibitor inhibitorHandle
 	inhibitorAcquire  func(reason string) (inhibitorHandle, error)
+	// firmwareJobInhibitor 本任务启动时获取的 inhibitor 句柄（随 firmwareMu
+	// 保护）：破坏性写入前用它确认保护仍属于本任务，提前退出后不得继续写入。
+	firmwareJobInhibitor inhibitorHandle
 }
 
 // SetLogger 注入运行日志器（main 启动时调用）。
@@ -792,6 +810,12 @@ func (m *Manager) SaveFanConfig(fan FanConfig) error {
 	if err := m.saveConfigLocked(cfg); err != nil {
 		m.lastError = err.Error()
 		return err
+	}
+	// 关停档真正生效（此前未生效、本次已启用）就作废进行中的标定采样：
+	// 标定开始时记下这个代次，入表前核对。必须在落盘成功后递增——保存失败
+	// 没有真的停转，不该白白丢掉一次有效标定。
+	if cfg.Fan.Enabled && cfg.Fan.OffMode && !(previous.Enabled && previous.OffMode) {
+		m.fanOffGen++
 	}
 	if previous.Enabled && !cfg.Fan.Enabled {
 		err = m.restoreFansLocked()

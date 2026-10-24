@@ -88,6 +88,9 @@ func TestValidateGPIOAutoBackup(t *testing.T) {
 		{"卷内子目录不能是 .", func(r *GPIOAutoBackup) { r.VolumeSub = "." }},
 		{"卷内子目录不能是 ./", func(r *GPIOAutoBackup) { r.VolumeSub = "./" }},
 		{"卷内子目录不能是 ././", func(r *GPIOAutoBackup) { r.VolumeSub = "././" }},
+		// 校验按去空白后的值判断，执行若沿用原始字符串就会写到另一个目录上
+		// （「 backup」可以是指向卷根的链接），所以带空白的写法直接拒绝。
+		{"卷内子目录前后不能有空白", func(r *GPIOAutoBackup) { r.VolumeSub = " backup" }},
 		{"同步到打标卷必须指定子目录", func(r *GPIOAutoBackup) {
 			r.Direction = BackupDirectionToVolume
 			r.Mode = BackupModeSync
@@ -242,6 +245,15 @@ func TestAutoBackupJobForVolume(t *testing.T) {
 		}
 	}
 
+	// 前后带空白同样指向另一个目录：执行入口必须按与校验一致的规范化结果拒绝，
+	// 不能把「 backup」悄悄改成「backup」继续跑。
+	blankSub := toVolume
+	blankSub.Mode = BackupModeSync
+	blankSub.VolumeSub = " backup"
+	if _, err := autoBackupJobForVolume(blankSub, volume); err == nil || !strings.Contains(err.Error(), "空白") {
+		t.Fatalf("前后带空白的卷内子目录应当被拒绝: %v", err)
+	}
+
 	// 正常子目录照常可用，目标落在子目录里而不是卷根。
 	toVolume.Mode = BackupModeSync
 	toVolume.VolumeSub = "backup/照片"
@@ -336,6 +348,62 @@ func TestAutoBackupRejectsSymlinkedVolumeSubBeforeRsync(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(manager.Root, "media", "usb0", "DCIM", "keep.txt")); statErr != nil {
 		t.Fatalf("无关文件不应被同步删除: %v", statErr)
+	}
+}
+
+// 「 backup」（前导空格）绕过卷根保护：规则校验按 TrimSpace 后的值判断，执行
+// 若沿用原始字符串，rsync 就会写到另一个目录上（那个目录可以是指向卷根的链接）。
+// 不论去空白后的目录存不存在、是不是真实目录，都必须在启动 rsync 之前拒绝。
+func TestAutoBackupRejectsWhitespaceVolumeSubBeforeRsync(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		makeDir bool
+	}{
+		{"去空白后目录不存在", false},
+		{"去空白后是真实目录", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			manager := autoBackupFakeManager(t)
+			if _, err := manager.MarkAutoBackupVolume("/media/usb0", ""); err != nil {
+				t.Fatalf("打标失败: %v", err)
+			}
+			mountRoot := filepath.Join(manager.Root, "media", "usb0")
+			if test.makeDir {
+				if err := os.MkdirAll(filepath.Join(mountRoot, "backup"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			// rsync 指向一个不存在的文件：一旦被执行，错误里就会带出这个路径。
+			// 断言错误里没有它，等于断言根本没有启动 rsync。
+			origPath, origErr, origDone := backupRsyncOnce.path, backupRsyncOnce.err, backupRsyncOnce.done
+			backupRsyncOnce.path, backupRsyncOnce.err, backupRsyncOnce.done = filepath.Join(manager.Root, "rsync-not-called"), nil, true
+			defer func() { backupRsyncOnce.path, backupRsyncOnce.err, backupRsyncOnce.done = origPath, origErr, origDone }()
+
+			rule := GPIOAutoBackup{
+				ID: "photos", Name: "照片", Direction: BackupDirectionToVolume,
+				Fixed: BackupLocation{Kind: "path", Path: "/vol1/1000/照片"},
+				Mode:  BackupModeSync, VolumeSub: " backup",
+			}
+			result, err := manager.RunAutoBackupJob(context.Background(), rule, false)
+			if err == nil {
+				t.Fatal("前后带空白的卷内子目录应当被拒绝")
+			}
+			if !strings.Contains(err.Error(), "空白") {
+				t.Fatalf("错误应说明空白字符被拒绝（而不是走到 rsync）：%v", err)
+			}
+			if strings.Contains(err.Error(), "rsync-not-called") {
+				t.Fatalf("拒绝时不得启动 rsync: %v", err)
+			}
+			if result.Files != 0 {
+				t.Fatalf("拒绝时不应传输任何文件: %+v", result)
+			}
+			if !test.makeDir {
+				if _, statErr := os.Stat(filepath.Join(mountRoot, "backup")); !os.IsNotExist(statErr) {
+					t.Fatalf("拒绝时不应创建去空白后的目标目录: %v", statErr)
+				}
+			}
+		})
 	}
 }
 

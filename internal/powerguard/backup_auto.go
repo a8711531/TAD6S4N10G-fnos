@@ -295,6 +295,12 @@ func validateGPIOAutoBackup(rule GPIOAutoBackup) error {
 		return err
 	}
 	sub := strings.TrimSpace(rule.VolumeSub)
+	// 校验、目录复核与执行必须看同一个路径：校验按去空白后的值判断，执行若还用
+	// 原始字符串，「 backup」就会落到另一个目录上（可被做成指向卷根的链接），
+	// 两道闸都看不见。前后带空白的写法直接拒绝，而不是悄悄改写成另一个目录。
+	if sub != rule.VolumeSub {
+		return fmt.Errorf("自动备份规则 %q 的卷内子目录 %q 前后不能有空白字符", rule.ID, rule.VolumeSub)
+	}
 	slashSub := filepath.ToSlash(sub)
 	if len(sub) > backupLocationMaxLen {
 		return fmt.Errorf("自动备份规则 %q 的卷内子目录过长", rule.ID)
@@ -1037,9 +1043,16 @@ func backupDeviceFSType(fsType string) bool {
 // autoBackupJobForVolume 把规则落到一块具体的打标卷上，生成与普通备份任务
 // 同构的执行单元，复用同一套 rsync 通道与安全闸。
 func autoBackupJobForVolume(rule GPIOAutoBackup, volume AutoBackupVolume) (GPIOBackupJob, error) {
+	// 卷内子目录只接受与规则校验同一个规范化结果（去空白）。若执行时沿用原始
+	// 字符串，「 backup」会被写到一个校验与目录复核都没检查过的目录上——那个目录
+	// 可以是指向卷根的链接，同步模式于是清空整块盘。
+	sub := strings.TrimSpace(rule.VolumeSub)
+	if sub != rule.VolumeSub {
+		return GPIOBackupJob{}, fmt.Errorf("打标卷内的子目录 %q 前后不能有空白字符（请填写 %q）", rule.VolumeSub, sub)
+	}
 	mount := filepath.ToSlash(filepath.Clean(volume.MountPoint))
 	volumeLocation := func(sub string) BackupLocation {
-		if strings.TrimSpace(sub) == "" {
+		if sub == "" {
 			return BackupLocation{Kind: "path", Path: mount}
 		}
 		return BackupLocation{Kind: "path", Path: filepath.ToSlash(filepath.Join(mount, filepath.Clean("/"+sub)))}
@@ -1055,20 +1068,20 @@ func autoBackupJobForVolume(rule GPIOAutoBackup, volume AutoBackupVolume) (GPIOB
 		// 这里按「清理后的路径」判断，而不是原始字符串是否为空：`.`、`./`、`././`
 		// 清理后同样落在卷根，只判空串会被绕过（规则校验已有同一道闸，这里是执行
 		// 入口的最后一道，老配置里残留的点目录也拦得住）。
-		if autoBackupSubIsVolumeRoot(rule.VolumeSub) {
+		if autoBackupSubIsVolumeRoot(sub) {
 			if rule.Mode == BackupModeSync {
 				return GPIOBackupJob{}, fmt.Errorf("同步模式不能以整块打标卷的根目录为目标（会清空整块盘），请在卷内指定一个子目录")
 			}
-			if strings.TrimSpace(rule.VolumeSub) != "" {
+			if sub != "" {
 				return GPIOBackupJob{}, fmt.Errorf("打标卷内的目标子目录不能指向卷根本身（. 或 ./ 等同于整块卷），请填写一个子目录")
 			}
 		}
-		job.Source, job.Target = rule.Fixed, volumeLocation(rule.VolumeSub)
+		job.Source, job.Target = rule.Fixed, volumeLocation(sub)
 	case BackupDirectionFromVolume:
 		// 卷侧是源。老配置里手填的卷内子目录优先，并且保持老语义：不加尾斜杠，
 		// 把该子目录里的内容铺进 NAS 目标——升级前后用同一条规则结果必须一样。
-		if legacy := strings.TrimSpace(rule.VolumeSub); legacy != "" {
-			job.Source, job.Target = volumeLocation(legacy), rule.Fixed
+		if sub != "" {
+			job.Source, job.Target = volumeLocation(sub), rule.Fixed
 			return job, nil
 		}
 		// 打标时标记的子目录（可以多个）：每个子目录一个源、保留目录名

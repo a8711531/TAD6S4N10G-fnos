@@ -132,16 +132,28 @@ func (m *Manager) StartStress(options StressOptions) error {
 	}
 
 	var workers sync.WaitGroup
+	cpuWorker := m.stressCPUWorker
+	if cpuWorker == nil {
+		cpuWorker = cpuStressWorker
+	}
+	memWorker := m.stressMemoryWorker
+	if memWorker == nil {
+		memWorker = memoryStressWorker
+	}
+	sampleWorker := m.stressSampleFn
+	if sampleWorker == nil {
+		sampleWorker = m.stressSampleLoop
+	}
 	if normalized.CPU {
 		// 物理核显之外，N305 有 8 个线程：默认全部打满，负载才接近 AIDA64 的 CPU 压测。
 		for index := 0; index < runtime.NumCPU(); index++ {
 			workers.Add(1)
-			go cpuStressWorker(stop, &workers)
+			go cpuWorker(stop, &workers)
 		}
 	}
 	if normalized.Memory {
 		workers.Add(1)
-		go memoryStressWorker(stop, &workers, int64(normalized.MemoryMB)<<20)
+		go memWorker(stop, &workers, int64(normalized.MemoryMB)<<20)
 	}
 	if gpu != nil {
 		workers.Add(1)
@@ -153,7 +165,7 @@ func (m *Manager) StartStress(options StressOptions) error {
 	workers.Add(1)
 	go func() {
 		defer workers.Done()
-		m.stressSampleLoop(stop, time.Duration(normalized.DurationSeconds)*time.Second)
+		sampleWorker(stop, time.Duration(normalized.DurationSeconds)*time.Second)
 	}()
 	go func() {
 		workers.Wait()

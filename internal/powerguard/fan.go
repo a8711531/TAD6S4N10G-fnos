@@ -1035,7 +1035,7 @@ func (m *Manager) processFanRPMSample(id string, rpm, pwm int) {
 	if (hi-lo)*100 > median*fanRPMSlotSpreadPct {
 		return // 升速中或读数抖动，未稳态
 	}
-	m.recordFanRPMData(id, slot, median, false)
+	m.recordFanRPMData(id, slot, median, false, nil)
 }
 
 // recordFanRPMData 稳态中位数入特性表（高档位同时维护满转基准）；与现值差
@@ -1048,9 +1048,15 @@ func (m *Manager) processFanRPMSample(id string, rpm, pwm int) {
 // 结果必须当场持久化,不能被 30 秒节流吞掉重启丢失）。fanRPMDirty 标记
 // 被节流的更新,下一个采样点补落盘——相同读数会在 2% 判定处早退,不补
 // 这次更新就永远悬在内存里。
-func (m *Manager) recordFanRPMData(id string, slot, rpm int, force bool) {
+// expectedOffGen 非 nil 时按关停档代次把关：只有采样开始后一次都没进入过关停档
+// （且此刻也没处在关停档）才允许入表。检查与写入在同一把锁内完成，避免
+// 「刚核对完就被切进关停档」的窗口。
+func (m *Manager) recordFanRPMData(id string, slot, rpm int, force bool, expectedOffGen *uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if expectedOffGen != nil && (*expectedOffGen != m.fanOffGen || m.fanOffModeActiveLocked()) {
+		return
+	}
 	if m.fanRPMDirty && !force && !m.fanRPMLastSave.IsZero() &&
 		time.Since(m.fanRPMLastSave) >= fanRPMSaveMinInterval {
 		m.persistFanRPMDataLocked()
@@ -2756,16 +2762,15 @@ func (m *Manager) CalibrateFanRPM(id string) (int, error) {
 		m.mu.Unlock()
 		return 0, fmt.Errorf("全速写入失败: %w", writeErr)
 	}
+	// 记下采样开始时的关停档代次：期间若切进关停档（PWM 被写成 0），读数作废。
+	offGen := m.fanOffGen
 	m.mu.Unlock()
 
 	median, samples, calibErr := m.sampleFanRPMSteady(id)
-	// 校准期间另一个 goroutine 可能启用了关停档。此时采样可能被 ApplyFanCurrent
-	// 中途打断(fanPWM 从 255 被写成 0),记录的全速基准不可信,不能落盘。
-	m.mu.Lock()
-	wasOff := m.fanOffModeActiveLocked()
-	m.mu.Unlock()
-	if calibErr == nil && !wasOff {
-		m.recordFanRPMData(id, 240, median, true) // 主动标定:绕过节流立即落盘 // 入特性表最高档并维护满转基准（自带加锁）
+	// 关停档可能在采样期间被开启又关闭，结束时再看状态会漏掉。入表时在同一把
+	// 锁内核对代次：期间进入过关停档的全速基准不可信，不能落盘。
+	if calibErr == nil {
+		m.recordFanRPMData(id, 240, median, true, &offGen) // 主动标定:绕过节流立即落盘 // 入特性表最高档并维护满转基准（自带加锁）
 	}
 	m.mu.Lock()
 	m.restoreAfterCalibrateLocked(id, wasTaken, originalValue, originalUnit, originalPWM)

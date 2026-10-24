@@ -9,9 +9,11 @@ import (
 	"time"
 )
 
+const inhibitorWho = "fnos-powerguard"
+
 // inhibitorReadyDelay 就绪确认窗口：systemd-inhibit 若因 logind/D-Bus 错误
-// 拿不到锁，会在启动后立即退出；窗口内未退出才认为保护已生效。启动子进程
-// 不等于拿到锁，确认不了就视为获取失败，调用方不得进入刷写。
+// 拿不到锁，会在启动后立即退出；窗口内未退出后还要用 --list 确认登记，
+// 仅「子进程还活着」不构成拿锁确认。确认不了就视为获取失败，调用方不得进入刷写。
 const inhibitorReadyDelay = 200 * time.Millisecond
 
 // processInhibitor 真实 systemd-inhibit 子进程句柄：Done 在子进程退出
@@ -42,7 +44,7 @@ func (m *Manager) defaultAcquireInhibitor(reason string) (inhibitorHandle, error
 	cmd := exec.Command("systemd-inhibit",
 		"--what=shutdown:sleep",
 		"--mode=block",
-		"--who=fnos-powerguard",
+		"--who="+inhibitorWho,
 		"--why="+reason,
 		"sleep", "infinity")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
@@ -59,5 +61,24 @@ func (m *Manager) defaultAcquireInhibitor(reason string) (inhibitorHandle, error
 		return nil, errors.New("systemd-inhibit 启动后立即退出，未能持有关机锁")
 	case <-time.After(inhibitorReadyDelay):
 	}
+	// 子进程存活不等于 logind 已登记抑制锁：再查一次活跃 inhibitor 列表，
+	// 必须命中 who + 本进程 PID + why。查询失败（无 systemd/无权限）同样
+	// 按无法确认处理（fail closed）。
+	if !m.inhibitorRegistered(inhibitorWho, reason, cmd.Process.Pid) {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		<-done
+		return nil, errors.New("systemd-inhibit 已启动但未登记有效关机锁（--list 未命中），未能持有关机锁")
+	}
 	return &processInhibitor{cmd: cmd, done: done}, nil
+}
+
+// inhibitorRegistered 查询当前活跃 inhibitor，确认指定 PID 的登记存在。
+func (m *Manager) inhibitorRegistered(who, why string, pid int) bool {
+	output, err := exec.Command("systemd-inhibit", "--list", "--no-pager").Output()
+	if err != nil {
+		return false
+	}
+	return inhibitorListShowsLock(string(output), who, why, pid)
 }

@@ -45,6 +45,7 @@ var (
 	errNotLinuxELF      = errors.New("不是 Linux ELF 可执行文件：BIOS 刷写需要 Linux 版 FPT（Fpt.efi 无法在 Linux 下运行）")
 	errNICNotDetected   = errors.New("未检测到 Mellanox ConnectX 网卡")
 	errPSIDMismatch     = errors.New("网卡 PSID 与目标固件不一致，已停止刷写（跨型号强刷可能变砖）")
+	errPSIDUnknown      = errors.New("无法确认网卡 PSID（当前或目标固件 PSID 为空），已停止刷写（跨型号强刷可能变砖）")
 	firmwareFWVersionRe = regexp.MustCompile(`(?m)^\s*FW Version:\s*(\S+)`)
 	firmwarePSIDRe      = regexp.MustCompile(`(?m)^\s*PSID:\s*(\S+)`)
 )
@@ -162,6 +163,13 @@ func (m *Manager) builtinFPTPath() string {
 
 // activeFPTPath 选择实际使用的 FPT：用户上传优先，其次内置版本。
 func (m *Manager) activeFPTPath() string {
+	// 哨兵值显式表示「工具不存在」：宿主机真实安装的 fpt 不得绕过测试桩。
+	if m.firmwareFPT == firmwareToolAbsent {
+		return ""
+	}
+	if m.firmwareFPT != "" {
+		return m.firmwareFPT
+	}
 	if path := m.fptBinaryPath(); path != "" {
 		if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() {
 			return path
@@ -173,6 +181,10 @@ func (m *Manager) activeFPTPath() string {
 // flashromPath 返回可用的 flashrom：Linux 下刷写 BIOS 区域的首选工具。
 // 依次查找：自定义配置路径、系统安装、之前自动下载到数据目录的副本。
 func (m *Manager) flashromPath() string {
+	// 哨兵值显式表示「工具不存在」：宿主机真实安装的 flashrom 不得绕过测试桩。
+	if m.firmwareFlashrom == firmwareToolAbsent {
+		return ""
+	}
 	if m.firmwareFlashrom != "" {
 		if info, err := os.Stat(m.firmwareFlashrom); err == nil && info.Mode().IsRegular() {
 			return m.firmwareFlashrom
@@ -625,9 +637,14 @@ func (m *Manager) beginFirmwareJob(kind string) error {
 	if err := m.holdSystemInhibitor("固件刷写中，禁止关机"); err != nil {
 		m.firmwareMu.Lock()
 		m.firmwareJob = firmwareJobState{}
+		m.firmwareJobInhibitor = nil
 		m.firmwareMu.Unlock()
 		return fmt.Errorf("无法持有系统关机保护，已取消刷写: %w", err)
 	}
+	// 记录本任务自己的句柄：后续破坏性写入前据此确认保护仍属于本任务。
+	m.firmwareMu.Lock()
+	m.firmwareJobInhibitor = m.currentInhibitor()
+	m.firmwareMu.Unlock()
 	return nil
 }
 
@@ -666,11 +683,19 @@ func (m *Manager) firmwareFinish(err error, success string) {
 			m.firmwareJob.logs = append(m.firmwareJob.logs, success)
 		}
 	}
-	m.firmwareMu.Unlock()
 	// 任务无论成功失败都要释放系统关机 inhibitor，否则用户关机被永久挡住。
+	// 摘除句柄与「任务结束」在同一临界区内完成：下一个任务必须在本次解锁之后
+	// 才能 begin，因此不会拿到本任务即将释放的旧句柄、误以为已受保护。
+	m.firmwareJobInhibitor = nil
+	handle := m.releaseSystemInhibitor()
+	m.firmwareMu.Unlock()
 	// 释放在 firmwareMu 外进行：真实句柄的 Release 要等子进程收尸，持锁等待
-	// 会把状态接口一起卡住。
-	m.releaseSystemInhibitor()
+	// 会把状态接口一起卡住。只释放刚才摘出的那个句柄，不碰任何后续任务。
+	if handle == nil {
+		return
+	}
+	_ = handle.Release()
+	m.logfSafe("firmware: 已释放系统关机 inhibitor")
 }
 
 func (m *Manager) runBIOSFlash(image []byte) {
@@ -704,11 +729,22 @@ func (m *Manager) runBIOSFlash(image []byte) {
 		writeArgs = []string{"-bios", "-f", imagePath}
 	}
 	m.firmwareSetStep("备份当前 BIOS", 15)
-	if output, err := m.runFirmwareCommand(context.Background(), dir, tool, backupArgs); err != nil {
-		// 备份失败不阻断刷写，但必须在日志里明确提示，交给用户决定是否继续。
-		m.firmwareLog("备份当前 BIOS 失败（继续刷写）: %v %s", err, trimCommandOutput(output))
-	} else {
-		m.firmwareLog("已备份当前 BIOS: %s", backup)
+	output, backupErr := m.runFirmwareCommand(context.Background(), dir, tool, backupArgs)
+	if backupErr != nil {
+		// 没有完整备份就写入，一旦刷坏无法恢复：必须终止任务。
+		m.firmwareFinish(fmt.Errorf("备份当前 BIOS 失败（未执行写入，防变砖）: %v %s", backupErr, trimCommandOutput(output)), "")
+		return
+	}
+	backupInfo, statErr := os.Stat(backup)
+	if statErr != nil || backupInfo.Size() == 0 {
+		m.firmwareFinish(fmt.Errorf("BIOS 备份产物缺失或不完整（%s，%v），未执行写入", backup, statErr), "")
+		return
+	}
+	m.firmwareLog("已备份当前 BIOS: %s（%d 字节）", backup, backupInfo.Size())
+	// 破坏性写入前复查关机保护：inhibitor 已提前退出时停止任务，不重复写入。
+	if m.firmwareProtectionLost() {
+		m.firmwareFinish(errors.New("系统关机保护已失效（inhibitor 提前退出），已停止 BIOS 刷写：未执行写入"), "")
+		return
 	}
 	m.firmwareSetStep("刷写 BIOS（约 1–3 分钟，请勿断电）", 40)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
@@ -794,7 +830,12 @@ func (m *Manager) runNICFlash(firmware []byte) {
 	targetPSID := firstRegexpGroup(firmwarePSIDRe, target)
 	targetFW := firstRegexpGroup(firmwareFWVersionRe, target)
 	m.firmwareLog("目标 FW %s，PSID %s", orDash(targetFW), orDash(targetPSID))
-	if currentPSID != "" && targetPSID != "" && currentPSID != targetPSID {
+	// PSID 未知时不能判断是否跨型号：宁可停止也不放行。
+	if currentPSID == "" || targetPSID == "" {
+		m.firmwareFinish(fmt.Errorf("%w：当前 PSID=%q，目标 PSID=%q", errPSIDUnknown, currentPSID, targetPSID), "")
+		return
+	}
+	if currentPSID != targetPSID {
 		m.firmwareFinish(fmt.Errorf("%w：当前 %s，目标 %s", errPSIDMismatch, currentPSID, targetPSID), "")
 		return
 	}
@@ -815,6 +856,11 @@ func (m *Manager) runNICFlash(firmware []byte) {
 	}
 	m.firmwareLog("已备份到 %s", backupDir)
 
+	// 破坏性写入前复查关机保护：备份期间 inhibitor 提前退出时停止任务。
+	if m.firmwareProtectionLost() {
+		m.firmwareFinish(errors.New("系统关机保护已失效（inhibitor 提前退出），已停止网卡固件烧写：未执行 burn"), "")
+		return
+	}
 	m.firmwareSetStep("烧写固件（请勿断电）", 85)
 	output, err := m.runFirmwareCommand(ctx, "", m.flintPath(), []string{"-d", dev, "-i", fwPath, "burn"})
 	m.firmwareLog("flint burn 输出: %s", trimCommandOutput(output))

@@ -454,7 +454,7 @@ func (s *AppServer) doPost(w http.ResponseWriter, r *http.Request, p string) {
 				return
 			}
 			s.send(w, 200, map[string]any{
-				"ok": false, "found": false,
+				"ok": false, "found": false, "cleanup_ok": true,
 				"msg": "未探测到电源接线, 请检查线缆后重试",
 			}, "application/json")
 			return

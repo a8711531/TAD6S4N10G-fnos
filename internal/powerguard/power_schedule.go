@@ -200,7 +200,8 @@ func (m *Manager) readWakeAlarm() (time.Time, error) {
 	return time.Unix(epoch, 0).UTC(), nil
 }
 
-// writeWakeAlarm 把触发时刻写入 wakealarm：先清零再写新值（内核要求的两步）。
+// writeWakeAlarm 把触发时刻写入 wakealarm：先清零再写新值（内核要求的两步），
+// 成功后登记所有权（powerScheduleOwnedWake）。调用方须持 m.mu。
 func (m *Manager) writeWakeAlarm(at time.Time) error {
 	path := m.rtcWakealarmPath()
 	if _, err := os.Stat(path); err != nil {
@@ -212,7 +213,31 @@ func (m *Manager) writeWakeAlarm(at time.Time) error {
 	if err := os.WriteFile(path, []byte(strconv.FormatInt(at.Unix(), 10)), 0o600); err != nil {
 		return fmt.Errorf("写入 RTC 唤醒失败: %w", err)
 	}
+	m.powerScheduleOwnedWake = at.UTC()
 	return nil
+}
+
+// clearOwnedWakeAlarmLocked 只清空本模块写入且当前仍匹配的 wakealarm，返回是否
+// 真的清空。当前闹钟为空时顺手清掉所有权记录；读到的是外部软件写入的闹钟
+// （或进程重启后无主）则原样保留——「没有开机计划」只代表本模块不再需要闹钟，
+// 无权替别的软件做主。调用方须持 m.mu。
+func (m *Manager) clearOwnedWakeAlarmLocked() (bool, error) {
+	wake, err := m.readWakeAlarm()
+	if err != nil {
+		return false, errPowerScheduleNoRTC
+	}
+	if wake.IsZero() {
+		m.powerScheduleOwnedWake = time.Time{}
+		return false, nil
+	}
+	if m.powerScheduleOwnedWake.IsZero() || !wake.Equal(m.powerScheduleOwnedWake) {
+		return false, nil
+	}
+	if err := os.WriteFile(m.rtcWakealarmPath(), []byte("0"), 0o600); err != nil {
+		return false, fmt.Errorf("清空 RTC 唤醒失败: %w", err)
+	}
+	m.powerScheduleOwnedWake = time.Time{}
+	return true, nil
 }
 
 // nextPowerOnAt 返回下一次开机计划时刻；没有启用的开机计划返回 false。
@@ -225,19 +250,22 @@ func (m *Manager) nextPowerOnAt(from time.Time) (time.Time, bool) {
 	return at, ok
 }
 
-// applyPowerScheduleLocked 把下一次开机计划写进 RTC；没有开机计划时清空唤醒。
-// 返回写入的时刻（清空返回零值）。调用方须持 m.mu。
+// applyPowerScheduleLocked 把下一次开机计划写进 RTC；没有开机计划时只清空
+// 本模块自己写入的唤醒（外部软件的闹钟不动）。返回写入的时刻（清空返回零值）。
+// 调用方须持 m.mu。
 func (m *Manager) applyPowerScheduleLocked() (time.Time, error) {
 	now := m.now()
 	next, ok := m.nextPowerOnAt(now)
 	if !ok {
-		if err := os.WriteFile(m.rtcWakealarmPath(), []byte("0"), 0o600); err != nil {
-			if _, statErr := os.Stat(m.rtcWakealarmPath()); statErr != nil {
-				return time.Time{}, errPowerScheduleNoRTC
-			}
-			return time.Time{}, fmt.Errorf("清空 RTC 唤醒失败: %w", err)
+		// 无开机计划只清理本模块自己写的闹钟，外部闹钟原样保留（见
+		// clearOwnedWakeAlarmLocked）。RTC 缺失仍按原语义报 NoRTC。
+		cleared, err := m.clearOwnedWakeAlarmLocked()
+		if err != nil {
+			return time.Time{}, err
 		}
-		m.logf("power schedule: RTC wake alarm cleared (no enabled power-on entry)")
+		if cleared {
+			m.logf("power schedule: RTC wake alarm cleared (no enabled power-on entry)")
+		}
 		return time.Time{}, nil
 	}
 	if err := m.writeWakeAlarm(next); err != nil {

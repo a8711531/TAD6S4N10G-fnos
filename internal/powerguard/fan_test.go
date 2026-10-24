@@ -2155,6 +2155,54 @@ func TestOffModeMidCalibrationRestoresZeroPWM(t *testing.T) {
 	}
 }
 
+// 关停档在采样期间被开启又关闭：采样结束时的状态已回到普通档，只看结束状态
+// 会漏判，被 0 转打断过的读数仍然入表。按进入代次作废——期间进入过关停档
+// （哪怕已经退出）的全速基准一律不落盘。
+func TestOffModeEnteredAndExitedMidCalibrationDoesNotRecord(t *testing.T) {
+	m := newFanDebugTestManager(t)
+	const id = "it8613:hwmon3:fan1"
+
+	cfg := DefaultFanConfig()
+	cfg.Enabled = true
+	cfg.CPUFanIDs = []string{id}
+	if err := m.SaveFanConfig(cfg); err != nil {
+		t.Fatalf("save baseline: %v", err)
+	}
+
+	// 采样开始后（标定已释放锁）先切进关停档，再切回普通档：结束时 fanOffModeActiveLocked
+	// 为 false，只能靠代次发现「期间进入过」。
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		time.Sleep(100 * time.Millisecond)
+		if err := m.SaveFanConfig(offModeZeroCurveConfig(id)); err != nil {
+			t.Errorf("进入关停档失败: %v", err)
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+		if err := m.SaveFanConfig(cfg); err != nil {
+			t.Errorf("退出关停档失败: %v", err)
+		}
+	}()
+
+	_, calibErr := m.CalibrateFanRPM(id)
+	<-done
+	if calibErr != nil {
+		t.Fatalf("校准不应报错：%v", calibErr)
+	}
+
+	m.mu.Lock()
+	gen := m.fanOffGen
+	table := m.fanRPMLearned[id]
+	m.mu.Unlock()
+	if gen == 0 {
+		t.Fatal("期间进入过关停档，代次必须递增")
+	}
+	if table != nil && table[240] != 0 {
+		t.Fatalf("关停档期间被 0 转打断的标定不得落盘，实际 slot240=%d", table[240])
+	}
+}
+
 // curve40to90 测试用 CPU 曲线：20°C→40%, 80°C→90%。
 func curve40to90() []FanPoint {
 	return []FanPoint{

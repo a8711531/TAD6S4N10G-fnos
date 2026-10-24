@@ -91,7 +91,7 @@ cleanup() {
       rm -rf "$APPMETA/cmd" "$APPMETA/wizard" 2>/dev/null || true
       cp -a "$METABAK/cmd" "$APPMETA/cmd" || restored=0
       cp -a "$METABAK/wizard" "$APPMETA/wizard" || restored=0
-      cp -a "$METABAK/manifest" "$METABAK/ICON.PNG" "$METABAK/ICON_256.PNG" "$APPMETA/" 2>/dev/null || true
+      cp -a "$METABAK/manifest" "$METABAK/ICON.PNG" "$METABAK/ICON_256.PNG" "$APPMETA/" || restored=0
     fi
     if [ "$restored" != "1" ]; then
       echo "回滚失败！程序目录备份在 $BAK，平台记录备份在 $METABAK，请手动恢复：" >&2
@@ -183,7 +183,15 @@ METABAK_TMP="$APPMETA.bak-meta-$(date +%Y%m%d%H%M%S)"
 mkdir -p "$METABAK_TMP"
 cp -a "$APPMETA/cmd" "$APPMETA/wizard" "$METABAK_TMP/" || true
 if [ -d "$METABAK_TMP/cmd" ] && [ -f "$METABAK_TMP/cmd/main" ] && [ -d "$METABAK_TMP/wizard" ]; then
+  # manifest 与图标同样是回滚要原样盖回去的平台记录：复制失败若被忽略，
+  # 回滚就会拿残缺备份替换原件，还照样报「已回滚」。这里就地校验，
+  # 缺任何一个都中止（此刻还没动过 $APPMETA 里的任何文件）。
   cp -a "$APPMETA/manifest" "$APPMETA/ICON.PNG" "$APPMETA/ICON_256.PNG" "$METABAK_TMP/" 2>/dev/null || true
+  if [ ! -f "$METABAK_TMP/manifest" ] || [ ! -f "$METABAK_TMP/ICON.PNG" ] || [ ! -f "$METABAK_TMP/ICON_256.PNG" ]; then
+    rm -rf "$METABAK_TMP"
+    echo "备份平台记录（manifest / 图标）失败，已中止升级（程序目录未替换，服务将原样拉回）" >&2
+    exit 1
+  fi
   METABAK=$METABAK_TMP
 else
   rm -rf "$METABAK_TMP"
